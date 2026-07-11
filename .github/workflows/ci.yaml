@@ -20,6 +20,15 @@ jobs:
             cargo test --release
           fi
 
+  # Explicit multisig filter (experimental module) for fast signal on PRs.
+  multisig-unit:
+    name: Multisig unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: cargo test multisig
+        run: cargo test -p grin_wallet_libwallet multisig --release
+
   macos-tests:
     name: macOS Tests
     runs-on: macos-latest

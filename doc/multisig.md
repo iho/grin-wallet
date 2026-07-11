@@ -12,7 +12,7 @@ This is the first implementation slice of RFC-0023 style multisig:
 | Done | Not done |
 | --- | --- |
 | Joint Feldman DKG + DKG session (index & address roster) | Multi-process soak on real wallets |
-| PoP on coefficient commitments | Networked cross-epoch session path |
+| PoP on coefficient commitments | Real multi-wallet soak / 30-day |
 | Share verify against public poly | External crypto audit |
 | Lagrange partial keys + reconstruction | Real multi-wallet soak |
 | Coin id derivation (number + value) | Continuous fuzz CI |
@@ -360,7 +360,9 @@ let res = build_cross_epoch_spend(
 // res.tx validates; outputs open under new_poly
 ```
 
-CLI inventory remains `plan-epoch-sweep`; networked cross-epoch FROST session is residual.
+CLI inventory: `plan-epoch-sweep`. Networked path: `SessionKind::CrossEpoch` via
+`create_cross_epoch` / `session_create_cross_epoch_raw` (RP under new poly, FROST
+dual-poly excess).
 
 ## Wire format freeze (v1, experimental)
 
@@ -375,6 +377,7 @@ layer); consensus rules are unchanged.
 | Auth | ed25519 over transcript (ceremony, session, sender, body hash) — C-04 |
 | Caps | `MAX_ENVELOPE_JSON_BYTES` (256 KiB), list/hex field limits — C-12 |
 | Session bind | optional `session_id_hex` on every post-DKG message |
+| Sequence | optional `seq` (u64) bound into signature transcript; per-sender high-water on apply |
 | Replay | body content hash set per durable session |
 | Body types | `DkgContribution`, `DkgPartialShare`, `DkgPublicPoly`, `RpRound1/2/Final`, `KernelSigningCommit`, `KernelPartialSig`, `KernelFinal` |
 | Transport | plain JSON files and/or age-encrypted armored Slatepack |

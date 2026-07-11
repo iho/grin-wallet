@@ -166,6 +166,8 @@ pub enum SessionKind {
 	Dkg,
 	/// Full multiparty transaction: rangeproof each new output, then FROST kernel.
 	MultiTx,
+	/// Cross-epoch spend: RP under **new** poly, FROST excess with old inputs + new outputs.
+	CrossEpoch,
 }
 
 /// One proven MultiTx output stored mid-session after its RP completes.
@@ -352,6 +354,18 @@ pub struct SessionRecord {
 	/// MultiTx: index into `outputs` currently being rangeproofed.
 	#[serde(default)]
 	pub multitx_rp_index: usize,
+	/// CrossEpoch: target (new) ceremony id.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub new_ceremony_id: Option<CeremonyId>,
+	/// CrossEpoch: new public poly coefficients (compressed hex list).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub new_public_poly_hexes: Option<Vec<String>>,
+	/// Highest accepted envelope `seq` per sender actor index (session replay hygiene).
+	#[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+	pub peer_seq: BTreeMap<usize, u64>,
+	/// Local outbound sequence counter (incremented on create/emit).
+	#[serde(default)]
+	pub next_out_seq: u64,
 }
 
 impl SessionRecord {
@@ -528,10 +542,14 @@ pub fn list_session_ids(wallet_data_dir: &str) -> Result<Vec<String>, Error> {
 pub struct Negotiator {
 	/// Durable record.
 	pub record: SessionRecord,
-	/// Public polynomial for the ceremony.
+	/// Public polynomial for the ceremony (old poly for CrossEpoch).
 	public_poly: PublicPoly,
-	/// Canonical quorum (includes this actor's y shares).
+	/// New-epoch public poly (CrossEpoch only).
+	new_public_poly: Option<PublicPoly>,
+	/// Canonical quorum (includes this actor's y shares; old y for CrossEpoch).
 	quorum: Vec<ActorPoint>,
+	/// New-epoch quorum shares (CrossEpoch only; same x-coords as `quorum`).
+	new_quorum: Option<Vec<ActorPoint>>,
 	/// Secp context.
 	secp: Secp256k1,
 }
@@ -641,6 +659,10 @@ impl Negotiator {
 			dkg: None,
 			multitx_output_proofs: Vec::new(),
 			multitx_rp_index: 0,
+			new_ceremony_id: None,
+			new_public_poly_hexes: None,
+			peer_seq: BTreeMap::new(),
+			next_out_seq: 1,
 		};
 		// Record our own round-1 contribution.
 		record.rp_r1.insert(
@@ -665,7 +687,9 @@ impl Negotiator {
 		let neg = Self {
 			record,
 			public_poly: public_poly.clone(),
+			new_public_poly: None,
 			quorum,
+			new_quorum: None,
 			secp: clone_secp(secp),
 		};
 		Ok((neg, env))
@@ -757,6 +781,10 @@ impl Negotiator {
 			dkg: None,
 			multitx_output_proofs: Vec::new(),
 			multitx_rp_index: 0,
+			new_ceremony_id: None,
+			new_public_poly_hexes: None,
+			peer_seq: BTreeMap::new(),
+			next_out_seq: 1,
 		};
 		record.kern_commits.insert(
 			my_index,
@@ -780,7 +808,9 @@ impl Negotiator {
 			Self {
 				record,
 				public_poly: public_poly.clone(),
+				new_public_poly: None,
 				quorum,
+				new_quorum: None,
 				secp: clone_secp(secp),
 			},
 			env,
@@ -875,6 +905,10 @@ impl Negotiator {
 			dkg: None,
 			multitx_output_proofs: Vec::new(),
 			multitx_rp_index: 0,
+			new_ceremony_id: None,
+			new_public_poly_hexes: None,
+			peer_seq: BTreeMap::new(),
+			next_out_seq: 1,
 		};
 		record.rp_r1.insert(
 			my_index,
@@ -899,7 +933,9 @@ impl Negotiator {
 			Self {
 				record,
 				public_poly: public_poly.clone(),
+				new_public_poly: None,
 				quorum,
+				new_quorum: None,
 				secp: clone_secp(secp),
 			},
 			env,
@@ -930,7 +966,9 @@ impl Negotiator {
 		Ok(Self {
 			record,
 			public_poly: public_poly.clone(),
+			new_public_poly: None,
 			quorum,
+			new_quorum: None,
 			secp: clone_secp(secp),
 		})
 	}
@@ -954,7 +992,9 @@ impl Negotiator {
 			public_poly: PublicPoly {
 				coefficients: Vec::new(),
 			},
+			new_public_poly: None,
 			quorum,
+			new_quorum: None,
 			secp: clone_secp(secp),
 		})
 	}
@@ -1061,6 +1101,10 @@ impl Negotiator {
 			dkg: Some(dkg),
 			multitx_output_proofs: Vec::new(),
 			multitx_rp_index: 0,
+			new_ceremony_id: None,
+			new_public_poly_hexes: None,
+			peer_seq: BTreeMap::new(),
+			next_out_seq: 1,
 		};
 
 		let env = build_dkg_contribution(secp, ceremony_id, my_actor, params, &contrib)?
@@ -1071,7 +1115,9 @@ impl Negotiator {
 				public_poly: PublicPoly {
 					coefficients: Vec::new(),
 				},
+				new_public_poly: None,
 				quorum,
+				new_quorum: None,
 				secp: clone_secp(secp),
 			},
 			env,
@@ -1191,6 +1237,20 @@ impl Negotiator {
 		if self.record.seen_body_hashes.contains(&body_hash) {
 			return Ok(Vec::new());
 		}
+		// Optional per-sender seq: reject strictly lower seq (legacy seq=0 always ok).
+		if env.seq > 0 {
+			if let Ok(idx) = find_my_index(&self.secp, &self.quorum, &env.sender) {
+				if let Some(&prev) = self.record.peer_seq.get(&idx) {
+					if env.seq < prev {
+						return Err(Error::Multisig(format!(
+							"envelope seq {} < last {} for actor {}",
+							env.seq, prev, idx
+						)));
+					}
+				}
+				self.record.peer_seq.insert(idx, env.seq);
+			}
+		}
 
 		// Final messages may complete a peer who has not finished locally yet.
 		if self.record.phase == SessionPhase::Complete {
@@ -1238,7 +1298,7 @@ impl Negotiator {
 			SessionKind::CreateOutput => self.tick_create_output(),
 			SessionKind::Spend => self.tick_spend(),
 			SessionKind::Dkg => self.tick_dkg(),
-			SessionKind::MultiTx => {
+			SessionKind::MultiTx | SessionKind::CrossEpoch => {
 				// RP phase for successive outputs, then kernel.
 				if matches!(
 					self.record.phase,
@@ -1249,6 +1309,27 @@ impl Negotiator {
 					self.tick_spend()
 				}
 			}
+		}
+	}
+
+	fn rp_poly(&self) -> &PublicPoly {
+		if matches!(self.record.kind, SessionKind::CrossEpoch) {
+			self.new_public_poly
+				.as_ref()
+				.unwrap_or(&self.public_poly)
+		} else {
+			&self.public_poly
+		}
+	}
+
+	fn rp_quorum(&self) -> &[ActorPoint] {
+		if matches!(self.record.kind, SessionKind::CrossEpoch) {
+			self.new_quorum
+				.as_ref()
+				.map(|q| q.as_slice())
+				.unwrap_or(&self.quorum)
+		} else {
+			&self.quorum
 		}
 	}
 
@@ -1297,14 +1378,14 @@ impl Negotiator {
 	fn allows_rp(&self) -> bool {
 		matches!(
 			self.record.kind,
-			SessionKind::CreateOutput | SessionKind::MultiTx
+			SessionKind::CreateOutput | SessionKind::MultiTx | SessionKind::CrossEpoch
 		)
 	}
 
 	fn allows_kernel(&self) -> bool {
 		matches!(
 			self.record.kind,
-			SessionKind::Spend | SessionKind::MultiTx
+			SessionKind::Spend | SessionKind::MultiTx | SessionKind::CrossEpoch
 		)
 	}
 
@@ -1384,12 +1465,14 @@ impl Negotiator {
 		if !self.allows_rp() {
 			return Err(Error::Multisig("RpFinal not valid for this session kind".into()));
 		}
-		// MultiTx may already be past RP (local finalize advanced); accept as no-op.
-		if self.record.kind == SessionKind::MultiTx
-			&& matches!(
-				self.record.phase,
-				SessionPhase::KernelRound1 | SessionPhase::KernelRound2 | SessionPhase::Complete
-			) {
+		// MultiTx/CrossEpoch may already be past RP (local finalize advanced); accept as no-op.
+		if matches!(
+			self.record.kind,
+			SessionKind::MultiTx | SessionKind::CrossEpoch
+		) && matches!(
+			self.record.phase,
+			SessionPhase::KernelRound1 | SessionPhase::KernelRound2 | SessionPhase::Complete
+		) {
 			return Ok(());
 		}
 		let commit = commit_from_hex(&msg.commit_hex)?;
@@ -1400,7 +1483,7 @@ impl Negotiator {
 			.as_ref()
 			.ok_or_else(|| Error::Multisig("missing coin".into()))?;
 		let params =
-			rangeproof_params_for_coin(&self.secp, &self.public_poly, coin, None)?;
+			rangeproof_params_for_coin(&self.secp, self.rp_poly(), coin, None)?;
 		if commit != params.commit {
 			return Err(Error::Multisig("RpFinal commit mismatch".into()));
 		}
@@ -1412,7 +1495,7 @@ impl Negotiator {
 			self.record.secrets = None;
 			self.record.emitted_for_phase = true;
 		}
-		// MultiTx: local tick/finalize drives advancement; peer RpFinal is informational.
+		// MultiTx/CrossEpoch: local tick/finalize drives advancement; peer RpFinal is informational.
 		Ok(())
 	}
 
@@ -1448,7 +1531,7 @@ impl Negotiator {
 			.clone()
 			.ok_or_else(|| Error::Multisig("missing coin".into()))?;
 		let params =
-			rangeproof_params_for_coin(&self.secp, &self.public_poly, &coin, None)?;
+			rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
 		let agg = self.rp_agg()?;
 		let secrets = self.rp_secrets_from_wire()?;
 		let tau = rangeproof_round2(&self.secp, &params, &secrets, &agg)?;
@@ -1473,7 +1556,7 @@ impl Negotiator {
 			.clone()
 			.ok_or_else(|| Error::Multisig("missing coin".into()))?;
 		let params =
-			rangeproof_params_for_coin(&self.secp, &self.public_poly, &coin, None)?;
+			rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
 		let agg = self.rp_agg()?;
 		let secrets = self.rp_secrets_from_wire()?;
 
@@ -1481,7 +1564,8 @@ impl Negotiator {
 		let mut r1_shares = Vec::new();
 		let mut tau_parts = Vec::new();
 		let mut pub_blinds = Vec::new();
-		for j in 0..self.quorum.len() {
+		let n = self.rp_quorum().len();
+		for j in 0..n {
 			let w = self
 				.record
 				.rp_r1
@@ -1499,8 +1583,8 @@ impl Negotiator {
 			tau_parts.push(seckey_from_hex(&self.secp, th)?);
 			pub_blinds.push(expected_pub_blind_for_actor(
 				&self.secp,
-				&self.public_poly,
-				&self.quorum,
+				self.rp_poly(),
+				self.rp_quorum(),
 				j,
 				&coin,
 			)?);
@@ -1535,7 +1619,10 @@ impl Negotiator {
 		)
 		.with_session_id(&self.record.session_id);
 
-		if self.record.kind == SessionKind::MultiTx {
+		if matches!(
+			self.record.kind,
+			SessionKind::MultiTx | SessionKind::CrossEpoch
+		) {
 			self.record.multitx_output_proofs.push(MultitxOutputProof {
 				coin: coin.clone(),
 				commit_hex,
@@ -1570,13 +1657,13 @@ impl Negotiator {
 		self.record.coin = Some(coin.clone());
 		let my_blind = super::rangeproof::partial_blind_for_actor(
 			&self.secp,
-			&self.public_poly,
-			&self.quorum,
+			self.rp_poly(),
+			self.rp_quorum(),
 			self.record.my_index,
 			&coin,
 		)?;
 		let params =
-			rangeproof_params_for_coin(&self.secp, &self.public_poly, &coin, None)?;
+			rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
 		let (secrets, share) = rangeproof_round1(&self.secp, &params, &my_blind)?;
 		self.record.secrets = Some(SessionSecretsWire {
 			partial_hex: seckey_to_hex(&secrets.partial_blind),
@@ -1607,36 +1694,89 @@ impl Negotiator {
 		.with_session_id(&self.record.session_id))
 	}
 
-	/// After all MultiTx RPs, open kernel round-1 and emit our FROST commit.
+	/// After all MultiTx/CrossEpoch RPs, open kernel round-1 and emit our FROST commit.
 	fn start_multitx_kernel(&mut self) -> Result<MultisigEnvelope, Error> {
+		use super::kernel::{
+			create_cross_epoch_kernel_session, partial_excess_cross_epoch,
+		};
+		use crate::grin_core::libtx::aggsig;
 		let fee = self
 			.record
 			.fee
 			.ok_or_else(|| Error::Multisig("MultiTx missing fee".into()))?;
 		let features = plain_features(fee)?;
-		let session = create_kernel_session(
-			&self.secp,
-			&self.public_poly,
-			&self.record.session_id,
-			features,
-			self.record.inputs.clone(),
-			self.record.outputs.clone(),
-		)?;
-		let secrets = kernel_round1(
-			&self.secp,
-			&self.public_poly,
-			&self.quorum,
-			self.record.my_index,
-			&session,
-		)?;
-		verify_partial_excess(
-			&self.secp,
-			&self.public_poly,
-			&self.quorum,
-			self.record.my_index,
-			&session,
-			&secrets.commitment.pub_excess,
-		)?;
+		let (session, secrets) = if self.record.kind == SessionKind::CrossEpoch {
+			let new_pp = self
+				.new_public_poly
+				.as_ref()
+				.ok_or_else(|| Error::Multisig("CrossEpoch missing new poly".into()))?;
+			let new_q = self
+				.new_quorum
+				.as_ref()
+				.ok_or_else(|| Error::Multisig("CrossEpoch missing new quorum".into()))?;
+			let session = create_cross_epoch_kernel_session(
+				&self.secp,
+				&self.public_poly,
+				new_pp,
+				&self.record.session_id,
+				features,
+				self.record.inputs.clone(),
+				self.record.outputs.clone(),
+			)?;
+			let partial_excess = partial_excess_cross_epoch(
+				&self.secp,
+				&self.public_poly,
+				&self.quorum,
+				new_pp,
+				new_q,
+				self.record.my_index,
+				&session,
+			)?;
+			let d = aggsig::create_secnonce(&self.secp)
+				.map_err(|e| Error::Multisig(format!("secnonce d: {}", e)))?;
+			let e = aggsig::create_secnonce(&self.secp)
+				.map_err(|e| Error::Multisig(format!("secnonce e: {}", e)))?;
+			let pub_d = crate::grin_util::secp::key::PublicKey::from_secret_key(&self.secp, &d)?;
+			let pub_e = crate::grin_util::secp::key::PublicKey::from_secret_key(&self.secp, &e)?;
+			let pub_excess =
+				crate::grin_util::secp::key::PublicKey::from_secret_key(&self.secp, &partial_excess)?;
+			let secrets = ActorKernelSecrets {
+				partial_excess,
+				d,
+				e,
+				commitment: SigningCommitment {
+					pub_d,
+					pub_e,
+					pub_excess,
+				},
+			};
+			(session, secrets)
+		} else {
+			let session = create_kernel_session(
+				&self.secp,
+				&self.public_poly,
+				&self.record.session_id,
+				features,
+				self.record.inputs.clone(),
+				self.record.outputs.clone(),
+			)?;
+			let secrets = kernel_round1(
+				&self.secp,
+				&self.public_poly,
+				&self.quorum,
+				self.record.my_index,
+				&session,
+			)?;
+			verify_partial_excess(
+				&self.secp,
+				&self.public_poly,
+				&self.quorum,
+				self.record.my_index,
+				&session,
+				&secrets.commitment.pub_excess,
+			)?;
+			(session, secrets)
+		};
 		self.record.secrets = Some(SessionSecretsWire {
 			partial_hex: seckey_to_hex(&secrets.partial_excess),
 			nonce_a_hex: seckey_to_hex(&secrets.d),
@@ -1689,16 +1829,19 @@ impl Negotiator {
 		let idx = msg.actor_index;
 		self.check_actor_index(idx, env)?;
 		let commit = parse_kernel_signing_commit(&self.secp, msg)?;
-		// Rogue-key check against public poly.
-		let session = self.kernel_session()?;
-		verify_partial_excess(
-			&self.secp,
-			&self.public_poly,
-			&self.quorum,
-			idx,
-			&session,
-			&commit.pub_excess,
-		)?;
+		// Rogue-key check against public poly (same-epoch). CrossEpoch uses dual
+		// polys; peer X_j is still checked by FROST partial-sig verify later.
+		if self.record.kind != SessionKind::CrossEpoch {
+			let session = self.kernel_session()?;
+			verify_partial_excess(
+				&self.secp,
+				&self.public_poly,
+				&self.quorum,
+				idx,
+				&session,
+				&commit.pub_excess,
+			)?;
+		}
 		if let Some(existing) = self.record.kern_commits.get(&idx) {
 			if existing.pub_d_hex != msg.pub_d_hex
 				|| existing.pub_e_hex != msg.pub_e_hex
@@ -1935,11 +2078,27 @@ impl Negotiator {
 
 	/// Rebuild the public kernel session parameters (tests / status).
 	pub fn kernel_session(&self) -> Result<KernelSession, Error> {
+		use super::kernel::create_cross_epoch_kernel_session;
 		let fee = self
 			.record
 			.fee
 			.ok_or_else(|| Error::Multisig("missing fee".into()))?;
 		let features = plain_features(fee)?;
+		if self.record.kind == SessionKind::CrossEpoch {
+			let new_pp = self
+				.new_public_poly
+				.as_ref()
+				.ok_or_else(|| Error::Multisig("CrossEpoch missing new poly".into()))?;
+			return create_cross_epoch_kernel_session(
+				&self.secp,
+				&self.public_poly,
+				new_pp,
+				&self.record.session_id,
+				features,
+				self.record.inputs.clone(),
+				self.record.outputs.clone(),
+			);
+		}
 		create_kernel_session(
 			&self.secp,
 			&self.public_poly,
@@ -1948,6 +2107,167 @@ impl Negotiator {
 			self.record.inputs.clone(),
 			self.record.outputs.clone(),
 		)
+	}
+
+	/// Open a CrossEpoch session: RP under **new** poly, FROST with old inputs + new outs.
+	///
+	/// Both quorums must share actor x-coordinates (same roster after re-DKG).
+	pub fn create_cross_epoch(
+		secp: &Secp256k1,
+		old_poly: &PublicPoly,
+		old_quorum: &[ActorPoint],
+		new_poly: &PublicPoly,
+		new_quorum: &[ActorPoint],
+		old_ceremony_id: CeremonyId,
+		new_ceremony_id: CeremonyId,
+		roster: Vec<ActorId>,
+		my_actor: ActorId,
+		inputs: Vec<CoinId>,
+		outputs: Vec<CoinId>,
+		fee: u64,
+		session_id: impl AsRef<[u8]>,
+	) -> Result<(Self, MultisigEnvelope), Error> {
+		let old_q = canonical_quorum(old_quorum)?;
+		let new_q = canonical_quorum(new_quorum)?;
+		if old_q.len() != new_q.len() {
+			return Err(Error::Multisig("cross-epoch quorum size mismatch".into()));
+		}
+		for (a, b) in old_q.iter().zip(new_q.iter()) {
+			if a.x.0 != b.x.0 {
+				return Err(Error::Multisig(
+					"cross-epoch quorums must share actor x-coordinates".into(),
+				));
+			}
+		}
+		if inputs.is_empty() || outputs.is_empty() {
+			return Err(Error::Multisig("CrossEpoch needs inputs and outputs".into()));
+		}
+		let in_sum: u64 = inputs.iter().map(|c| c.value).sum();
+		let out_sum: u64 = outputs.iter().map(|c| c.value).sum();
+		if in_sum != out_sum.saturating_add(fee) {
+			return Err(Error::Multisig(format!(
+				"value imbalance: inputs {} != outputs {} + fee {}",
+				in_sum, out_sum, fee
+			)));
+		}
+		let my_index = find_my_index(secp, &old_q, &my_actor)?;
+		let first = outputs[0].clone();
+		let my_blind = super::rangeproof::partial_blind_for_actor(
+			secp, new_poly, &new_q, my_index, &first,
+		)?;
+		let params = rangeproof_params_for_coin(secp, new_poly, &first, None)?;
+		let (secrets, share) = rangeproof_round1(secp, &params, &my_blind)?;
+
+		let mut sid = session_id.as_ref().to_vec();
+		sid.extend_from_slice(b"|xe|");
+		sid.extend_from_slice(&quorum_transcript(&old_q)?);
+		sid.extend_from_slice(&quorum_transcript(&new_q)?);
+
+		let secrets_wire = SessionSecretsWire {
+			partial_hex: seckey_to_hex(&secrets.partial_blind),
+			nonce_a_hex: seckey_to_hex(&secrets.private_nonce),
+			nonce_b_hex: String::new(),
+			pub_a_hex: pubkey_to_hex_local(secp, &secrets.t_one),
+			pub_b_hex: pubkey_to_hex_local(secp, &secrets.t_two),
+			pub_excess_hex: String::new(),
+		};
+		let new_poly_hexes: Vec<String> = new_poly
+			.coefficients
+			.iter()
+			.map(|c| c.to_hex())
+			.collect();
+
+		let now = unix_now();
+		let mut record = SessionRecord {
+			session_id: sid.clone(),
+			ceremony_id: old_ceremony_id.clone(),
+			kind: SessionKind::CrossEpoch,
+			phase: SessionPhase::RpRound1,
+			my_actor: my_actor.clone(),
+			roster,
+			quorum_x_hexes: old_q.iter().map(|p| seckey_to_hex(&p.x)).collect(),
+			my_index,
+			coin: Some(first.clone()),
+			fee: Some(fee),
+			inputs,
+			outputs,
+			secrets: Some(secrets_wire),
+			rp_r1: BTreeMap::new(),
+			rp_tau: BTreeMap::new(),
+			kern_commits: BTreeMap::new(),
+			kern_partials: BTreeMap::new(),
+			emitted_for_phase: true,
+			seen_body_hashes: BTreeSet::new(),
+			abort_reason: None,
+			result_proof_hex: None,
+			result_commit_hex: None,
+			result_sig_hex: None,
+			result_excess_hex: None,
+			result_nonce_hex: None,
+			created_unix: now,
+			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
+			dkg: None,
+			multitx_output_proofs: Vec::new(),
+			multitx_rp_index: 0,
+			new_ceremony_id: Some(new_ceremony_id),
+			new_public_poly_hexes: Some(new_poly_hexes),
+			peer_seq: BTreeMap::new(),
+			next_out_seq: 1,
+		};
+		record.rp_r1.insert(
+			my_index,
+			RpR1Wire {
+				t_one_hex: pubkey_to_hex_local(secp, &share.t_one),
+				t_two_hex: pubkey_to_hex_local(secp, &share.t_two),
+			},
+		);
+		let env = build_rp_round1(
+			secp,
+			old_ceremony_id,
+			my_actor,
+			&params,
+			&first,
+			my_index,
+			&share,
+		)
+		.with_session_id(&sid)
+		.with_seq(1);
+
+		Ok((
+			Self {
+				record,
+				public_poly: old_poly.clone(),
+				new_public_poly: Some(new_poly.clone()),
+				quorum: old_q,
+				new_quorum: Some(new_q),
+				secp: clone_secp(secp),
+			},
+			env,
+		))
+	}
+
+	/// Resume CrossEpoch with both polys/quorums provided by the caller.
+	pub fn resume_cross_epoch(
+		secp: &Secp256k1,
+		old_poly: &PublicPoly,
+		old_quorum: &[ActorPoint],
+		new_poly: &PublicPoly,
+		new_quorum: &[ActorPoint],
+		record: SessionRecord,
+	) -> Result<Self, Error> {
+		if record.kind != SessionKind::CrossEpoch {
+			return Err(Error::Multisig("not a CrossEpoch session".into()));
+		}
+		let old_q = canonical_quorum(old_quorum)?;
+		let new_q = canonical_quorum(new_quorum)?;
+		Ok(Self {
+			record,
+			public_poly: old_poly.clone(),
+			new_public_poly: Some(new_poly.clone()),
+			quorum: old_q,
+			new_quorum: Some(new_q),
+			secp: clone_secp(secp),
+		})
 	}
 
 	// ----- DKG internals -----
@@ -2991,6 +3311,112 @@ mod tests {
 		assert_eq!(n1.record.phase, SessionPhase::Complete);
 		assert_eq!(n0.record.multitx_output_proofs.len(), 1);
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn multitx_two_outputs() {
+		use crate::grin_core::global;
+		use crate::multisig::tx::create_multisig_output;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, roster, ceremony) = setup_2of2(&secp);
+		let funding =
+			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
+		let fee = 1_000u64;
+		let outs = vec![
+			CoinId::new(2, 400_000),
+			CoinId::new(3, 1_000_000 - 400_000 - fee),
+		];
+		let mut negs = Vec::new();
+		let mut first = Vec::new();
+		for actor in roster.iter() {
+			let (n, env) = Negotiator::create_multitx(
+				&secp,
+				&pp,
+				&q,
+				ceremony.clone(),
+				roster.clone(),
+				actor.clone(),
+				vec![funding.coin.clone()],
+				outs.clone(),
+				fee,
+				b"mtx-2out",
+			)
+			.unwrap();
+			negs.push(n);
+			first.push(env);
+		}
+		let mut pending = VecDeque::new();
+		for env in first {
+			broadcast(&mut negs, env, &mut pending);
+		}
+		drain(&mut negs, &mut pending);
+		assert_eq!(negs[0].record.phase, SessionPhase::Complete);
+		assert_eq!(negs[0].record.multitx_output_proofs.len(), 2);
+		assert!(negs[0].record.result_sig_hex.is_some());
+	}
+
+	#[test]
+	fn cross_epoch_session_completes() {
+		use crate::grin_core::global;
+		use crate::multisig::tx::create_multisig_output;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let old_c = CeremonyId::new();
+		let new_c = CeremonyId::new();
+		let old_states =
+			run_dkg_local(&secp, old_c.clone(), params.clone(), actors.clone()).unwrap();
+		let new_states = run_dkg_local(&secp, new_c.clone(), params, actors.clone()).unwrap();
+		let old_pp = old_states[0].config.public_poly.clone();
+		let new_pp = new_states[0].config.public_poly.clone();
+		let old_q = canonical_quorum(&[
+			ActorPoint::from(&old_states[0].shares[0]),
+			ActorPoint::from(&old_states[1].shares[0]),
+		])
+		.unwrap();
+		let new_q = canonical_quorum(&[
+			ActorPoint::from(&new_states[0].shares[0]),
+			ActorPoint::from(&new_states[1].shares[0]),
+		])
+		.unwrap();
+		let funding =
+			create_multisig_output(&secp, &old_pp, &old_q, &CoinId::new(1, 500_000)).unwrap();
+		let fee = 1_000u64;
+		let out = CoinId::new(10, 500_000 - fee);
+		let mut negs = Vec::new();
+		let mut first = Vec::new();
+		for (i, actor) in actors.iter().enumerate() {
+			let (n, env) = Negotiator::create_cross_epoch(
+				&secp,
+				&old_pp,
+				&old_q,
+				&new_pp,
+				&new_q,
+				old_c.clone(),
+				new_c.clone(),
+				actors.clone(),
+				actor.clone(),
+				vec![funding.coin.clone()],
+				vec![out.clone()],
+				fee,
+				b"xe-sess",
+			)
+			.unwrap();
+			assert_eq!(n.record.kind, SessionKind::CrossEpoch);
+			negs.push(n);
+			first.push(env);
+			let _ = i;
+		}
+		let mut pending = VecDeque::new();
+		for env in first {
+			broadcast(&mut negs, env, &mut pending);
+		}
+		drain(&mut negs, &mut pending);
+		assert_eq!(negs[0].record.phase, SessionPhase::Complete);
+		assert_eq!(negs[0].record.multitx_output_proofs.len(), 1);
+		assert!(negs[0].record.result_sig_hex.is_some());
 	}
 
 	#[test]

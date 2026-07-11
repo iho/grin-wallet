@@ -80,6 +80,10 @@ pub struct MultisigEnvelope {
 	/// Optional session id (kernel / rangeproof session tag), hex.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub session_id_hex: Option<String>,
+	/// Monotonic per-sender sequence within a session (0 = unset/legacy).
+	/// Bound into the signing transcript when non-zero (round replay hygiene).
+	#[serde(default, skip_serializing_if = "is_zero_u64")]
+	pub seq: u64,
 	/// Sender actor identity.
 	pub sender: ActorId,
 	/// Message body.
@@ -88,6 +92,10 @@ pub struct MultisigEnvelope {
 	/// canonical signing transcript (C-04). Absent on unsigned/dev envelopes.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub sig_hex: Option<String>,
+}
+
+fn is_zero_u64(v: &u64) -> bool {
+	*v == 0
 }
 
 /// All supported multisig message bodies.
@@ -405,10 +413,17 @@ impl MultisigEnvelope {
 			version: MULTISIG_MSG_VERSION,
 			ceremony_id: ceremony_id.0,
 			session_id_hex: None,
+			seq: 0,
 			sender,
 			body,
 			sig_hex: None,
 		}
+	}
+
+	/// Attach a per-session sequence number (bound into signature transcript).
+	pub fn with_seq(mut self, seq: u64) -> Self {
+		self.seq = seq;
+		self
 	}
 
 	/// Canonical bytes signed/verified for authentication (C-04).
@@ -427,6 +442,8 @@ impl MultisigEnvelope {
 			Some(s) => m.extend_from_slice(s.as_bytes()),
 			None => m.extend_from_slice(b"none"),
 		}
+		m.extend_from_slice(b"|seq|");
+		m.extend_from_slice(&self.seq.to_be_bytes());
 		m.extend_from_slice(b"|snd|");
 		m.extend_from_slice(&self.sender.id);
 		m.extend_from_slice(b"|body|");

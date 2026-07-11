@@ -291,7 +291,8 @@ Negotiator
 11. ✅ DKG-as-session (index + address roster, signed contribs, age share export) + file harness crash-resume + share replay/equivocation tests.
 12. ✅ Cross-epoch MultiTx local builder (`build_cross_epoch_spend` / FROST with dual polys) + multiparty soak unit rounds.
 13. ✅ MultiTx durable session + 2-of-3 sealed-file MultiTx soak harness.
-14. Residual: multi-process soak on real wallets; networked cross-epoch session kind; slate nesting in standard send flow.
+14. ✅ Networked `SessionKind::CrossEpoch` (dual poly RP+FROST) + envelope `seq` binding; multi-output MultiTx tests.
+15. Residual: multi-process soak on real wallets; slate nesting in standard send flow; continuous fuzz CI.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 

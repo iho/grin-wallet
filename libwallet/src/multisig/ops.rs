@@ -1204,6 +1204,60 @@ where
 	})
 }
 
+/// Start a CrossEpoch session (RP under new ceremony, FROST old→new).
+pub fn session_create_cross_epoch_raw<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	old_ceremony_id: &CeremonyId,
+	new_ceremony_id: &CeremonyId,
+	inputs: Vec<CoinId>,
+	outputs: Vec<CoinId>,
+	fee: u64,
+	session_tag: &str,
+	quorum_indices: Option<&[usize]>,
+) -> Result<MultisigSessionStartResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let old_state = get_state(w, keychain_mask, old_ceremony_id)?;
+	let new_state = get_state(w, keychain_mask, new_ceremony_id)?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let old_q = quorum_points_from_state(&secp, &old_state, quorum_indices)?;
+	let new_q = quorum_points_from_state(&secp, &new_state, quorum_indices)?;
+	let (neg, env) = Negotiator::create_cross_epoch(
+		&secp,
+		&old_state.config.public_poly,
+		&old_q,
+		&new_state.config.public_poly,
+		&new_q,
+		old_ceremony_id.clone(),
+		new_ceremony_id.clone(),
+		old_state.config.actors.clone(),
+		old_state.my_actor.clone(),
+		inputs,
+		outputs,
+		fee,
+		session_tag.as_bytes(),
+	)?;
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	let sid = neg.record.session_id.to_hex();
+	lock_spend_inputs(w, keychain_mask, old_ceremony_id, &neg.record.inputs, &sid)?;
+	for coin in &neg.record.outputs {
+		link_create_output_utxo(w, keychain_mask, new_ceremony_id, coin, &sid)?;
+	}
+	let envelope_json = serde_json::to_string_pretty(&env)
+		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
+	Ok(MultisigSessionStartResult {
+		status: neg.status(),
+		envelope_json,
+	})
+}
+
 /// Start a MultiTx session (RP each output, then FROST); returns status + first envelope.
 pub fn session_create_multitx_raw<'a, T: ?Sized, C, K>(
 	w: &mut T,
@@ -1343,6 +1397,24 @@ where
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let mut neg = if record.kind == SessionKind::Dkg {
 		Negotiator::resume_dkg(&secp, record)?
+	} else if record.kind == SessionKind::CrossEpoch {
+		let old_id = record.ceremony_id.clone();
+		let new_id = record
+			.new_ceremony_id
+			.clone()
+			.ok_or_else(|| Error::Multisig("CrossEpoch missing new_ceremony_id".into()))?;
+		let old_state = get_state(w, keychain_mask, &old_id)?;
+		let new_state = get_state(w, keychain_mask, &new_id)?;
+		let old_q = rebuild_quorum_from_record(&secp, &old_state, &record)?;
+		let new_q = rebuild_quorum_from_record(&secp, &new_state, &record)?;
+		Negotiator::resume_cross_epoch(
+			&secp,
+			&old_state.config.public_poly,
+			&old_q,
+			&new_state.config.public_poly,
+			&new_q,
+			record,
+		)?
 	} else {
 		let ceremony_id = record.ceremony_id.clone();
 		let state = get_state(w, keychain_mask, &ceremony_id)?;
