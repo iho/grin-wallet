@@ -2448,6 +2448,28 @@ where
 				Ok(())
 			})?;
 		}
+		"assemble-tx" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| format!("msig_tx_{}.hex", &sid[..sid.len().min(16)]));
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let tx_hex = libwallet::multisig::assemble_tx_from_spend_session(
+					&mut **w, m, &wdata, &sid,
+				)?;
+				std::fs::write(&out, tx_hex.as_bytes())
+					.map_err(|e| libwallet::Error::Multisig(format!("write tx: {}", e)))?;
+				println!("Assembled transaction ({} bytes hex) → {}", tx_hex.len(), out);
+				println!("Post with: grin-wallet multisig post-tx -i {}", out);
+				Ok(())
+			})?;
+		}
 		other => {
 			return Err(Error::ArgumentError(format!(
 				"unknown multisig subcommand '{}'",

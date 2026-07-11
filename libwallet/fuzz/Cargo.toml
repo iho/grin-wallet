@@ -1,0 +1,22 @@
+[package]
+name = "grin_wallet_libwallet-fuzz"
+version = "0.0.1"
+authors = ["Grin Developers <mimblewimble@lists.launchpad.net>"]
+publish = false
+edition = "2021"
+
+[dependencies]
+libfuzzer-sys = "0.4.0"
+grin_wallet_libwallet = { path = ".." }
+
+# Prevent this from interfering with workspaces
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "multisig_envelope_json"
+path = "fuzz_targets/multisig_envelope_json.rs"
+
+[[bin]]
+name = "multisig_envelope_payload"
+path = "fuzz_targets/multisig_envelope_payload.rs"

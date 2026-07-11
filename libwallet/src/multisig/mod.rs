@@ -73,13 +73,14 @@ pub use messages::{
 	MULTISIG_PAYLOAD_MAGIC,
 };
 pub use ops::{
-	allocate_coin, clear_pending, delete_ceremony, derive_session_key, dkg_export_shares,
-	dkg_finalize, dkg_import_contrib, dkg_import_share, dkg_start, expire_stale_sessions,
-	export_state_json, export_state_sealed, get_state, import_state_json, import_state_sealed,
-	init_local_sim, list_ceremonies, list_utxos, load_pending, plan_epoch_sweep,
-	read_encrypted_share_file, read_envelope_file, recognize_and_register, refresh_multisig_utxos,
-	register_utxo, scan_ceremony_utxos, select_spendable_utxos, session_abort, session_apply,
-	session_apply_raw, session_create_output, session_create_output_raw, session_create_spend,
+	allocate_coin, assemble_tx_from_spend_session, clear_pending, delete_ceremony,
+	derive_session_key, dkg_export_shares, dkg_finalize, dkg_import_contrib, dkg_import_share,
+	dkg_start, expire_stale_sessions, export_state_json, export_state_sealed, get_state,
+	import_state_json, import_state_sealed, init_local_sim, list_ceremonies, list_utxos,
+	load_pending, plan_epoch_sweep, read_encrypted_share_file, read_envelope_file,
+	recognize_and_register, refresh_multisig_utxos, register_utxo, scan_ceremony_utxos,
+	select_spendable_utxos, session_abort, session_apply, session_apply_raw,
+	session_create_output, session_create_output_raw, session_create_spend,
 	session_create_spend_raw, session_list, session_status, set_utxo_status, wallet_data_dir,
 	write_envelope_file, CeremonySummary, EpochSweepPlan, MultisigRefreshResult,
 	MultisigSessionApplyResult, MultisigSessionStartResult, PendingDkg, PendingKey,
@@ -109,9 +110,9 @@ pub use store::{
 	MULTISIG_PREFIX, PENDING_KEY_SIZE, STATE_KEY_SIZE, STATE_SEAL_MAGIC, STATE_SEAL_VERSION,
 };
 pub use tx::{
-	build_multisig_spend, build_self_send, create_multisig_output, demo_fund_and_spend,
-	quorum_from_state, quorum_from_states, run_demo_tx, tx_from_hex, tx_to_hex,
-	MultisigDemoTxResult, MultisigOutput, MultisigSpendResult,
+	assemble_from_kernel_results, build_epoch_sweep_local, build_multisig_spend, build_self_send,
+	create_multisig_output, demo_fund_and_spend, quorum_from_state, quorum_from_states, run_demo_tx,
+	tx_from_hex, tx_to_hex, MultisigDemoTxResult, MultisigOutput, MultisigSpendResult,
 };
 pub use types::{
 	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,

@@ -2004,6 +2004,125 @@ where
 	Ok(out)
 }
 
+/// Assemble a postable transaction hex from a completed Spend session + UTXO proofs.
+///
+/// Requires:
+/// - Spend session in `Complete` with kernel results
+/// - Input UTXOs tracked with matching commits
+/// - Output UTXOs tracked **with** rangeproof hex (from prior CreateOutput)
+pub fn assemble_tx_from_spend_session<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+) -> Result<String, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	use super::messages::{proof_from_hex, sig_from_hex};
+	use super::rangeproof::coin_pedersen_commit_public;
+	use super::session::{SessionKind, SessionPhase};
+	use super::tx::{assemble_from_kernel_results, tx_to_hex, MultisigOutput};
+	use super::kernel::AggregatedKernelPubs;
+	use super::messages::pubkey_from_hex;
+
+	let session_id = crate::grin_util::from_hex(session_id_hex)
+		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
+	if record.kind != SessionKind::Spend {
+		return Err(Error::Multisig("not a Spend session".into()));
+	}
+	if record.phase != SessionPhase::Complete {
+		return Err(Error::Multisig(format!(
+			"session not complete ({:?})",
+			record.phase
+		)));
+	}
+	let fee = record
+		.fee
+		.ok_or_else(|| Error::Multisig("spend missing fee".into()))?;
+	let sig_hex = record
+		.result_sig_hex
+		.as_ref()
+		.ok_or_else(|| Error::Multisig("missing kernel sig".into()))?;
+	let excess_hex = record
+		.result_excess_hex
+		.as_ref()
+		.ok_or_else(|| Error::Multisig("missing excess".into()))?;
+	let nonce_hex = record
+		.result_nonce_hex
+		.as_ref()
+		.ok_or_else(|| Error::Multisig("missing nonce".into()))?;
+
+	let state = get_state(w, keychain_mask, &record.ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let sig = sig_from_hex(&secp, sig_hex)?;
+	let agg = AggregatedKernelPubs {
+		nonce_sum: pubkey_from_hex(&secp, nonce_hex)?,
+		excess_sum: pubkey_from_hex(&secp, excess_hex)?,
+	};
+
+	let mut inputs = Vec::new();
+	for coin in &record.inputs {
+		let utxo = w.get_multisig_utxo(&record.ceremony_id, coin.number)?;
+		let commit = utxo.commitment()?;
+		// Inputs do not need stored proofs for assembly.
+		inputs.push(MultisigOutput {
+			coin: coin.clone(),
+			commit,
+			proof: crate::grin_util::secp::pedersen::RangeProof {
+				proof: [0u8; crate::grin_util::secp::constants::MAX_PROOF_SIZE],
+				plen: 0,
+			},
+		});
+		// Still check public commit derivation.
+		let expected = coin_pedersen_commit_public(&secp, &state.config.public_poly, coin)?;
+		if expected != commit {
+			return Err(Error::Multisig(format!(
+				"input coin #{} commit mismatch",
+				coin.number
+			)));
+		}
+	}
+
+	let mut outputs = Vec::new();
+	for coin in &record.outputs {
+		let utxo = w.get_multisig_utxo(&record.ceremony_id, coin.number)?;
+		let proof_hex = utxo
+			.proof_hex
+			.as_ref()
+			.ok_or_else(|| {
+				Error::Multisig(format!(
+					"output coin #{} missing rangeproof (run CreateOutput first)",
+					coin.number
+				))
+			})?;
+		let proof = proof_from_hex(proof_hex)?;
+		let commit = utxo.commitment()?;
+		outputs.push(MultisigOutput {
+			coin: coin.clone(),
+			commit,
+			proof,
+		});
+	}
+
+	let tx = assemble_from_kernel_results(
+		&secp,
+		&state.config.public_poly,
+		&record.session_id,
+		fee,
+		&inputs,
+		&outputs,
+		sig,
+		&agg,
+	)?;
+	tx_to_hex(&tx)
+}
+
 fn rebuild_quorum_from_record(
 	secp: &Secp256k1,
 	state: &MultisigWalletState,

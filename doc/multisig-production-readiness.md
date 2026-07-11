@@ -286,7 +286,9 @@ Negotiator
 6. ✅ Light `refresh_multisig_utxos` + `expire_stale_sessions` hooked into `update_wallet_state` / owner updater (soft-fail).
 7. ✅ Session deadlines (default 24h TTL); apply after deadline aborts + unlocks.
 8. ✅ `select_spendable_utxos` greedy selection; `plan_epoch_sweep` for re-DKG migration inventory.
-9. Residual: concurrent multi-process reservation soak; send/receive nesting in standard slate flow; automated on-chain epoch sweep tx builder.
+9. ✅ Tx assembly from completed Spend + proofs (`assemble_from_kernel_results` / `assemble-tx`); local `build_epoch_sweep_local` consolidation.
+10. ✅ Envelope fuzz targets under `libwallet/fuzz`; v1 JSON wire freeze notes + ops runbook in `doc/multisig.md`.
+11. Residual: concurrent multi-process reservation soak; DKG-as-session; automated cross-epoch MultiTx (two polys) builder; send/receive nesting in standard slate flow.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 
@@ -314,9 +316,9 @@ Negotiator
 9b. ✅ Session TTL/deadline + expire path; updater light refresh.
 
 **P1 — before mainnet flag:**
-10. ✅ WS6 UTXO foundation (track/allocate/recognize/scan/refresh/select/sweep-plan). Residual: automated rotation spend builder.
-11. ✅ C-08 AEAD state + Debug redaction (WS3 core); residual: restore drill runbook.
-12. WS5 residual: freeze wire format + fuzz `MultisigEnvelope` parser.
+10. ✅ WS6 UTXO foundation + assemble-tx + local epoch sweep builder. Residual: cross-epoch MultiTx (old poly → new poly).
+11. ✅ C-08 AEAD state + Debug redaction; restore/compromise runbook in `doc/multisig.md`.
+12. ✅ WS5: v1 JSON freeze notes + `libwallet/fuzz` envelope targets. Residual: continuous fuzz CI.
 13. External audit + malicious-peer suite + 30-day soak.
 
 **P2 — quality/optional:**

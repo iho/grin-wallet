@@ -11,21 +11,21 @@ This is the first implementation slice of RFC-0023 style multisig:
 
 | Done | Not done |
 | --- | --- |
-| Joint Feldman DKG (degree = threshold−1) | DKG-as-session + multi-process CLI |
-| PoP on coefficient commitments | Production key rotation / epochs |
+| Joint Feldman DKG (degree = threshold−1) | DKG-as-session |
+| PoP on coefficient commitments | Cross-epoch MultiTx (two polys) |
 | Share verify against public poly | External crypto audit |
-| Lagrange partial keys + reconstruction | Chain-aware UTXO tracking |
-| δ-masked add-actor (local) | Networked multi-wallet slatepack orchestration |
-| Coin id derivation (number + value) | |
+| Lagrange partial keys + reconstruction | Multi-process soak |
+| Coin id derivation (number + value) | Continuous fuzz CI |
 | LMDB + export AEAD-sealed (C-08); Debug redacts secrets | |
 | Multiparty Bulletproof (T1/T2/τ + verifiable τ) | |
 | Threshold kernel signing (**FROST** + excess check) | |
-| Slatepack wire messages (DKG / RP / kernel) | |
-| CLI + Owner API + JSON-RPC + post-tx | Session CLI/RPC lifecycle |
-| E2E tx build (multiparty RP + kernel, validates) | |
-| Durable negotiator (CreateOutput + Spend, crash-resume) | |
-| Session CLI + Owner RPC (`multisig_session_*`) | Multi-process soak tests |
-| Multisig UTXO track/allocate/recognize (WS6) | Full chain-scan integration |
+| Slatepack wire messages (DKG / RP / kernel) + C-04/C-12 | |
+| CLI + Owner API + JSON-RPC + post-tx + assemble-tx | |
+| E2E tx build + assemble from kernel results | |
+| Durable negotiator (CreateOutput + Spend, crash-resume, TTL) | |
+| Session CLI + Owner RPC | |
+| Multisig UTXO track/scan/refresh/select/sweep-plan | |
+| Envelope fuzz targets (`libwallet/fuzz`) | |
 | Unit / integration tests | |
 
 ## Design choices vs draft RFC
@@ -282,6 +282,7 @@ Owner JSON-RPC (experimental, token required):
 | `multisig_select_utxos` | Greedy spend selection |
 | `multisig_plan_epoch_sweep` | List Unspent coins for epoch migration |
 | `multisig_expire_sessions` | Abort sessions past 24h deadline |
+| `multisig_assemble_tx` | Assemble postable tx hex from completed Spend |
 
 ## Multisig UTXOs (WS6)
 
@@ -296,12 +297,53 @@ grin-wallet multisig refresh-utxos -c <ceremony>
 grin-wallet multisig select-utxos -c <ceremony> --amount 1000000000 --min-confirmations 1
 grin-wallet multisig plan-epoch-sweep -c <old-ceremony> --target-ceremony <new>
 grin-wallet multisig expire-sessions
+# After CreateOutput (outputs) + Spend complete:
+grin-wallet multisig assemble-tx -s <spend-session-hex> -o tx.hex
+grin-wallet multisig post-tx -i tx.hex
 ```
 
 Session lifecycle auto-links UTXOs: CreateOutput registers/links the coin;
 Spend locks inputs and marks them Spent on Complete; Abort unlocks inputs.
 Sessions default to a **24h deadline**; `apply` after expiry aborts and unlocks.
 The owner updater also runs light refresh + session expiry each cycle.
+
+## Wire format freeze (v1, experimental)
+
+**Decision:** keep **JSON envelopes** with magic-prefixed payload for v1.
+
+| Field | Rule |
+| --- | --- |
+| Magic | `GMS1` (4 bytes) on slatepack/payload path |
+| Version | `MULTISIG_MSG_VERSION` (bump only on breaking change) |
+| Auth | ed25519 over transcript (ceremony, session, sender, body hash) — C-04 |
+| Caps | `MAX_ENVELOPE_JSON_BYTES` (256 KiB), list/hex field limits — C-12 |
+| Session bind | optional `session_id_hex` on every post-DKG message |
+| Replay | body content hash set per durable session |
+
+Fuzz targets: `libwallet/fuzz` (`multisig_envelope_json`, `multisig_envelope_payload`).
+
+Do **not** change the v1 schema without a version bump and dual-parse period.
+
+## Ops runbook (experimental)
+
+### Backup
+- Export sealed ceremony state (`export-state` / Owner export).
+- Back up each actor’s AEAD share material separately (M shares for restore).
+- Session files under `wallet_data/multisig/sessions/*.enc` are keychain-bound.
+
+### Restore from M shares
+1. Restore wallet seed (keychain) on each restoring actor.
+2. Import sealed state or re-aggregate DKG from M honest share backups.
+3. `scan-utxos` / `refresh-utxos` to rebuild MultisigUtxo rows.
+4. Verify balances via `list-utxos`.
+
+### Compromise response
+1. Assume epoch view key (strategy A) may be burned for privacy — plan re-DKG.
+2. `plan-epoch-sweep` → CreateOutput under **new** ceremony → Spend from old → `assemble-tx` → post.
+3. Do **not** use interactive add-actor (C-13).
+
+### Removed-actor privacy (C-10)
+A removed actor who still holds the old public poly can rewind old-epoch rangeproofs forever. Sweep to a new epoch and treat old outputs as privacy-compromised.
 
 ## Next implementation steps
 
@@ -315,5 +357,6 @@ The owner updater also runs light refresh + session expiry each cycle.
 8. ~~Post hex tx to node (`multisig_post_tx` / CLI).~~
 9. ~~Durable session negotiator + session CLI.~~
 10. ~~Owner RPC for session lifecycle.~~
-11. Chain-aware UTXO selection + wallet output tracking
-12. Multi-process soak tests
+11. ~~UTXO track/select/refresh/assemble.~~
+12. Multi-process soak tests + DKG-as-session
+13. External audit

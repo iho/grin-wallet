@@ -2183,6 +2183,13 @@ pub trait OwnerRpc {
 
 	/// Experimental: abort sessions past their deadline.
 	fn multisig_expire_sessions(&self, token: Token) -> Result<Vec<SessionStatus>, Error>;
+
+	/// Experimental: assemble postable tx hex from a completed Spend session.
+	fn multisig_assemble_tx(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<String, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2879,6 +2886,14 @@ where
 
 	fn multisig_expire_sessions(&self, token: Token) -> Result<Vec<SessionStatus>, Error> {
 		Owner::multisig_expire_sessions(self, (&token.keychain_mask).as_ref())
+	}
+
+	fn multisig_assemble_tx(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<String, Error> {
+		Owner::multisig_assemble_tx(self, (&token.keychain_mask).as_ref(), session_id_hex)
 	}
 }
 

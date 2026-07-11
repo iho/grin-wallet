@@ -246,6 +246,107 @@ pub fn quorum_from_states(states: &[MultisigWalletState]) -> Result<Vec<ActorPoi
 	canonical_quorum(&q)
 }
 
+/// Assemble a Grin transaction from multiparty artifacts (no secret shares).
+///
+/// Used after networked CreateOutput + Spend sessions complete: inputs are
+/// known commitments, outputs carry multiparty rangeproofs, and the kernel
+/// signature + aggregated pubs come from FROST. Offset is re-derived from the
+/// public poly + spend session id (deterministic).
+///
+/// `session_id` must be the durable spend session id bytes (same as on the
+/// negotiator record). `sig` / `agg` come from
+/// [`super::session::Negotiator::result_kernel`].
+pub fn assemble_from_kernel_results(
+	secp: &Secp256k1,
+	public_poly: &PublicPoly,
+	session_id: &[u8],
+	fee: u64,
+	inputs: &[MultisigOutput],
+	outputs: &[MultisigOutput],
+	sig: crate::grin_util::secp::Signature,
+	agg: &super::kernel::AggregatedKernelPubs,
+) -> Result<Transaction, Error> {
+	use super::kernel::{create_kernel_session, excess_commitment, plain_features, verify_kernel_sig};
+	use super::rangeproof::{coin_pedersen_commit_public, verify_rangeproof};
+
+	if inputs.is_empty() || outputs.is_empty() {
+		return Err(Error::Multisig("assemble needs inputs and outputs".into()));
+	}
+	let in_sum: u64 = inputs.iter().map(|o| o.coin.value).sum();
+	let out_sum: u64 = outputs.iter().map(|o| o.coin.value).sum();
+	if in_sum != out_sum.saturating_add(fee) {
+		return Err(Error::Multisig(format!(
+			"value imbalance: inputs {} != outputs {} + fee {}",
+			in_sum, out_sum, fee
+		)));
+	}
+	for o in inputs.iter().chain(outputs.iter()) {
+		let expected = coin_pedersen_commit_public(secp, public_poly, &o.coin)?;
+		if expected != o.commit {
+			return Err(Error::Multisig(format!(
+				"commit mismatch for coin #{}",
+				o.coin.number
+			)));
+		}
+	}
+	for o in outputs {
+		verify_rangeproof(secp, o.commit, o.proof, None)?;
+	}
+
+	let in_ids: Vec<CoinId> = inputs.iter().map(|o| o.coin.clone()).collect();
+	let out_ids: Vec<CoinId> = outputs.iter().map(|o| o.coin.clone()).collect();
+	let features = plain_features(fee)?;
+	let session = create_kernel_session(secp, public_poly, session_id, features, in_ids, out_ids)?;
+	verify_kernel_sig(secp, &sig, agg, &session)?;
+	let excess = excess_commitment(secp, agg)?;
+	let kernel = TxKernel {
+		features: session.features.clone(),
+		excess,
+		excess_sig: sig,
+	};
+	kernel
+		.verify()
+		.map_err(|e| Error::Multisig(format!("kernel verify: {}", e)))?;
+
+	let tx_inputs: Vec<Input> = inputs
+		.iter()
+		.map(|o| Input::new(OutputFeatures::Plain, o.commit))
+		.collect();
+	let tx_outputs: Vec<Output> = outputs
+		.iter()
+		.map(|o| Output::new(OutputFeatures::Plain, o.commit, o.proof))
+		.collect();
+	let offset = BlindingFactor::from_secret_key(session.offset.clone());
+	let tx = Transaction::new(Inputs::from(tx_inputs.as_slice()), &tx_outputs, &[kernel])
+		.with_offset(offset);
+	tx.validate(Weighting::AsTransaction)
+		.map_err(|e| Error::Multisig(format!("tx validate failed: {}", e)))?;
+	Ok(tx)
+}
+
+/// Local-sim epoch consolidation: sweep `inputs` into one new coin under the
+/// **same** ceremony poly (membership change still requires re-DKG + this
+/// pattern on the new poly after outputs are re-created).
+pub fn build_epoch_sweep_local(
+	secp: &Secp256k1,
+	public_poly: &PublicPoly,
+	quorum: &[ActorPoint],
+	inputs: &[MultisigOutput],
+	output_number: u64,
+	fee: u64,
+	session_tag: impl AsRef<[u8]>,
+) -> Result<MultisigSpendResult, Error> {
+	build_self_send(
+		secp,
+		public_poly,
+		quorum,
+		inputs,
+		output_number,
+		fee,
+		session_tag,
+	)
+}
+
 /// Serialize a transaction to hex (protocol v3 body encoding).
 pub fn tx_to_hex(tx: &Transaction) -> Result<String, Error> {
 	let bytes = ser::ser_vec(tx, ser::ProtocolVersion(3))
@@ -395,6 +496,59 @@ mod tests {
 			Error::Multisig(m) => assert!(m.contains("imbalance")),
 			_ => panic!("unexpected"),
 		}
+	}
+
+	#[test]
+	fn assemble_from_kernel_results_validates() {
+		use super::super::kernel::run_kernel_sign_local;
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, _) = setup_2of3(&secp);
+		let fee = 1_000u64;
+		let funding =
+			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
+		let change = create_multisig_output(
+			&secp,
+			&pp,
+			&q,
+			&CoinId::new(2, 1_000_000 - fee),
+		)
+		.unwrap();
+		let (sig, agg, session) = run_kernel_sign_local(
+			&secp,
+			&pp,
+			&q,
+			b"assemble-sess",
+			fee,
+			vec![funding.coin.clone()],
+			vec![change.coin.clone()],
+		)
+		.unwrap();
+		let tx = assemble_from_kernel_results(
+			&secp,
+			&pp,
+			&session.session_id,
+			fee,
+			&[funding],
+			&[change],
+			sig,
+			&agg,
+		)
+		.unwrap();
+		tx.validate(Weighting::AsTransaction).unwrap();
+	}
+
+	#[test]
+	fn epoch_sweep_local_consolidates() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, _) = setup_2of3(&secp);
+		let a = create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 400_000)).unwrap();
+		let b = create_multisig_output(&secp, &pp, &q, &CoinId::new(2, 600_000)).unwrap();
+		let fee = 1_000;
+		let res = build_epoch_sweep_local(&secp, &pp, &q, &[a, b], 99, fee, b"sweep").unwrap();
+		assert_eq!(res.outputs.len(), 1);
+		assert_eq!(res.outputs[0].coin.number, 99);
+		assert_eq!(res.outputs[0].coin.value, 1_000_000 - fee);
+		res.tx.validate(Weighting::AsTransaction).unwrap();
 	}
 
 	#[test]

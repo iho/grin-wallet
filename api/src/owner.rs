@@ -2934,6 +2934,24 @@ where
 			&wdata.display().to_string(),
 		)
 	}
+
+	/// Assemble a postable tx hex from a completed Spend session + tracked proofs.
+	pub fn multisig_assemble_tx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+	) -> Result<String, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::assemble_tx_from_spend_session(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&session_id_hex,
+		)
+	}
 }
 
 /// attempt to send slate synchronously with TOR

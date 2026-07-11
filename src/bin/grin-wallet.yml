@@ -463,6 +463,20 @@ subcommands:
                   takes_value: true
         - expire-sessions:
             about: Abort open multisig sessions past their deadline and unlock UTXOs
+        - assemble-tx:
+            about: Assemble postable tx hex from a completed Spend session + UTXO proofs
+            args:
+              - session:
+                  help: Completed spend session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - out:
+                  help: Output path for transaction hex
+                  short: o
+                  long: out
+                  takes_value: true
 
   - rewind_hash:
       about: Return the hash of the wallet root public key.
