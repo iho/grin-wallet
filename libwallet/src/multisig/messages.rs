@@ -35,8 +35,11 @@ use crate::grin_util::secp::{Secp256k1, Signature};
 use crate::grin_util::{from_hex, ToHex};
 use crate::slatepack::{Slatepack, SlatepackAddress, SlatepackArmor, SlatepackBin};
 use crate::Error;
-use ed25519_dalek::SecretKey as EdSecretKey;
+use ed25519_dalek::{
+	ExpandedSecretKey, PublicKey as EdPublicKey, SecretKey as EdSecretKey, Signature as EdSignature,
+};
 use grin_wallet_util::byte_ser;
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::coin::CoinId;
@@ -66,6 +69,10 @@ pub struct MultisigEnvelope {
 	pub sender: ActorId,
 	/// Message body.
 	pub body: MultisigBody,
+	/// Detached ed25519 signature (hex) by the sender's Slatepack key over the
+	/// canonical signing transcript (C-04). Absent on unsigned/dev envelopes.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub sig_hex: Option<String>,
 }
 
 /// All supported multisig message bodies.
@@ -350,7 +357,81 @@ impl MultisigEnvelope {
 			session_id_hex: None,
 			sender,
 			body,
+			sig_hex: None,
 		}
+	}
+
+	/// Canonical bytes signed/verified for authentication (C-04).
+	///
+	/// Binds magic, version, ceremony id, session id, the declared sender
+	/// identity, and a hash of the body — everything except the signature
+	/// itself. A signature is therefore useless if replayed under a different
+	/// ceremony/session/sender or with a mutated body.
+	fn signing_transcript(&self) -> Result<Vec<u8>, Error> {
+		let mut m = Vec::new();
+		m.extend_from_slice(MULTISIG_PAYLOAD_MAGIC);
+		m.extend_from_slice(&self.version.to_be_bytes());
+		m.extend_from_slice(self.ceremony_id.as_bytes());
+		m.extend_from_slice(b"|sid|");
+		match &self.session_id_hex {
+			Some(s) => m.extend_from_slice(s.as_bytes()),
+			None => m.extend_from_slice(b"none"),
+		}
+		m.extend_from_slice(b"|snd|");
+		m.extend_from_slice(&self.sender.id);
+		m.extend_from_slice(b"|body|");
+		let body_json = serde_json::to_vec(&self.body)
+			.map_err(|e| Error::Multisig(format!("sign body encode: {}", e)))?;
+		let mut h = Sha256::new();
+		h.update(&body_json);
+		m.extend_from_slice(&h.finalize());
+		Ok(m)
+	}
+
+	/// Sign this envelope with the sender's ed25519 Slatepack secret key.
+	///
+	/// The key must correspond to the declared `sender` address (checked), so a
+	/// wallet cannot sign as an actor it is not.
+	pub fn sign(&mut self, sec_key: &EdSecretKey) -> Result<(), Error> {
+		let sender_addr = self.sender.slatepack_address()?;
+		let public: EdPublicKey = sec_key.into();
+		if public.to_bytes() != sender_addr.pub_key.to_bytes() {
+			return Err(Error::Multisig(
+				"signing key does not match sender address".into(),
+			));
+		}
+		let msg = self.signing_transcript()?;
+		let expanded = ExpandedSecretKey::from(sec_key);
+		let sig = expanded.sign(&msg, &public);
+		self.sig_hex = Some(sig.to_bytes().to_vec().to_hex());
+		Ok(())
+	}
+
+	/// Verify the sender's signature over the transcript.
+	///
+	/// Errors if the envelope is unsigned, the sender is not address-backed, or
+	/// the signature does not verify under the sender's Slatepack public key.
+	pub fn verify_signature(&self) -> Result<(), Error> {
+		let sig_hex = self
+			.sig_hex
+			.as_ref()
+			.ok_or_else(|| Error::Multisig("envelope is not signed".into()))?;
+		let sender_addr = self.sender.slatepack_address()?;
+		let sig_bytes =
+			from_hex(sig_hex).map_err(|e| Error::Multisig(format!("sig hex: {}", e)))?;
+		let sig = EdSignature::from_bytes(&sig_bytes)
+			.map_err(|e| Error::Multisig(format!("bad signature encoding: {}", e)))?;
+		let msg = self.signing_transcript()?;
+		sender_addr
+			.pub_key
+			.verify_strict(&msg, &sig)
+			.map_err(|e| Error::Multisig(format!("signature verification failed: {}", e)))
+	}
+
+	/// True if the sender identity is address-backed (i.e. authentication is
+	/// expected). Index-based dev actors cannot be authenticated.
+	pub fn sender_is_addressable(&self) -> bool {
+		self.sender.slatepack_address().is_ok()
 	}
 
 	/// Attach session id bytes.
@@ -947,5 +1028,70 @@ mod tests {
 	fn index_actor_has_no_slatepack_address() {
 		// Index-based (dev) actors cannot be encrypted-share recipients.
 		assert!(ActorId::from_index(3).slatepack_address().is_err());
+	}
+
+	fn addr_and_key(seed: u8) -> (crate::SlatepackAddress, EdSecretKey, ActorId) {
+		let sk = EdSecretKey::from_bytes(&[seed; 32]).unwrap();
+		let pk = ed25519_dalek::PublicKey::from(&sk);
+		let addr = crate::SlatepackAddress::new(&pk);
+		let actor = ActorId::from_slatepack_address(&addr).unwrap();
+		(addr, sk, actor)
+	}
+
+	fn sample_body() -> MultisigBody {
+		MultisigBody::KernelFinal(KernelFinalMsg {
+			session_id_hex: "aa".into(),
+			sig_hex: "bb".into(),
+			excess_sum_hex: "cc".into(),
+			nonce_sum_hex: "dd".into(),
+		})
+	}
+
+	#[test]
+	fn envelope_sign_and_verify() {
+		use crate::grin_core::global;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let (_addr, sk, sender) = addr_and_key(9);
+
+		let mut env = MultisigEnvelope::new(CeremonyId::new(), sender.clone(), sample_body());
+		assert!(env.verify_signature().is_err(), "unsigned must not verify");
+		env.sign(&sk).unwrap();
+		env.verify_signature().unwrap();
+	}
+
+	#[test]
+	fn envelope_tamper_rejected() {
+		use crate::grin_core::global;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let (_addr, sk, sender) = addr_and_key(11);
+		let mut env = MultisigEnvelope::new(CeremonyId::new(), sender, sample_body());
+		env.sign(&sk).unwrap();
+
+		// Mutating the body invalidates the signature.
+		let mut tampered = env.clone();
+		if let MultisigBody::KernelFinal(ref mut m) = tampered.body {
+			m.excess_sum_hex = "ee".into();
+		}
+		assert!(tampered.verify_signature().is_err());
+	}
+
+	#[test]
+	fn envelope_wrong_sender_rejected() {
+		use crate::grin_core::global;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let (_a1, sk1, sender1) = addr_and_key(12);
+		let (_a2, sk2, sender2) = addr_and_key(13);
+
+		let mut env = MultisigEnvelope::new(CeremonyId::new(), sender1, sample_body());
+		env.sign(&sk1).unwrap();
+
+		// Re-labelling the envelope as a different sender must not verify.
+		let mut impostor = env.clone();
+		impostor.sender = sender2;
+		assert!(impostor.verify_signature().is_err());
+
+		// Signing as an actor you are not (key != declared sender address) fails.
+		let mut env2 = MultisigEnvelope::new(CeremonyId::new(), env.sender.clone(), sample_body());
+		assert!(env2.sign(&sk2).is_err());
 	}
 }

@@ -1651,6 +1651,9 @@ where
 			} else {
 				let wdata = msig_wallet_data_dir(owner_api)?;
 				let key = msig_pending_key(owner_api, keychain_mask)?;
+				let sign_key = owner_api
+					.get_slatepack_secret_key(keychain_mask, 0)
+					.map_err(Error::LibWallet)?;
 				let out = args.out.unwrap_or_else(|| "msig_contrib.json".to_owned());
 				let ceremony = match args.ceremony_id.as_ref() {
 					Some(s) => {
@@ -1663,6 +1666,7 @@ where
 				let pending = libwallet::multisig::dkg_start(
 					&wdata,
 					&key,
+					Some(&sign_key),
 					threshold,
 					total,
 					my_index,
@@ -1741,10 +1745,18 @@ where
 			let sender_addr = owner_api
 				.get_slatepack_address(keychain_mask, 0)
 				.map_err(Error::LibWallet)?;
+			let sign_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
 			let out_dir = args.out_dir.unwrap_or_else(|| "msig_shares".to_owned());
-			let paths =
-				libwallet::multisig::dkg_export_shares(&wdata, &key, &sender_addr, &out_dir)
-					.map_err(Error::LibWallet)?;
+			let paths = libwallet::multisig::dkg_export_shares(
+				&wdata,
+				&key,
+				&sender_addr,
+				&sign_key,
+				&out_dir,
+			)
+			.map_err(Error::LibWallet)?;
 			println!(
 				"Wrote {} encrypted share file(s) under {}:",
 				paths.len(),

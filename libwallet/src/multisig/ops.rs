@@ -85,6 +85,11 @@ pub struct PendingDkg {
 	pub contributions: Vec<Option<StoredContribution>>,
 	/// Received final share y values for my x-coordinates (hex), one per share_index.
 	pub my_share_ys_hex: Vec<Option<String>>,
+	/// Dealer actor indices whose partial share has already been summed into
+	/// `my_share_ys_hex`, per share_index. Used to reject duplicate/replayed
+	/// shares, which would otherwise double-count into the accumulator (C-04).
+	#[serde(default)]
+	pub applied_share_dealers: Vec<Vec<usize>>,
 }
 
 /// Stored public contribution for pending DKG.
@@ -266,6 +271,7 @@ where
 pub fn dkg_start(
 	wallet_data_dir: &str,
 	key: &PendingKey,
+	sign_key: Option<&EdSecretKey>,
 	threshold: usize,
 	total: usize,
 	my_index: usize,
@@ -340,10 +346,19 @@ pub fn dkg_start(
 			.collect(),
 		contributions,
 		my_share_ys_hex: vec![None; params.shares_per_actor],
+		applied_share_dealers: vec![Vec::new(); params.shares_per_actor],
 	};
 	save_pending(wallet_data_dir, key, &pending)?;
 
-	let env = build_dkg_contribution(&secp, ceremony, my_actor, params, &contrib)?;
+	let mut env = build_dkg_contribution(&secp, ceremony, my_actor.clone(), params, &contrib)?;
+	// Authenticate the broadcast contribution when the roster is address-based
+	// (C-04). Index/dev rosters cannot be signed and stay unsigned.
+	if my_actor.slatepack_address().is_ok() {
+		let sk = sign_key.ok_or_else(|| {
+			Error::Multisig("address-based DKG requires the wallet slatepack key to sign".into())
+		})?;
+		env.sign(sk)?;
+	}
 	write_envelope_file(out_contrib_path, &env)?;
 	Ok(pending)
 }
@@ -370,6 +385,13 @@ pub fn dkg_import_contrib(
 		.position(|a| a.id == actor.id)
 		.ok_or_else(|| Error::Multisig(format!("unknown actor {}", actor.label)))?;
 
+	// Authenticate the sender against the trusted roster entry (C-04). For an
+	// address-based ceremony a valid signature is mandatory; index/dev rosters
+	// cannot be authenticated and are accepted unsigned.
+	if pending.actors[idx].slatepack_address().is_ok() {
+		envelope.verify_signature()?;
+	}
+
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let contrib = parse_dkg_contribution(msg, actor.clone())?;
 	verify_pop(
@@ -379,14 +401,28 @@ pub fn dkg_import_contrib(
 		pending.params.num_coefficients(),
 	)?;
 
+	let new_commit_hexes: Vec<String> = contrib
+		.commitments
+		.coefficients
+		.iter()
+		.map(|c| c.to_hex())
+		.collect();
+
+	// Reject equivocation: a second, *different* contribution from the same
+	// actor must not silently overwrite the first (C-04).
+	if let Some(existing) = &pending.contributions[idx] {
+		if existing.commitment_hexes != new_commit_hexes {
+			return Err(Error::Multisig(format!(
+				"actor {} already submitted a different contribution (equivocation)",
+				actor.label
+			)));
+		}
+		return Ok(pending); // idempotent re-import of the identical contribution
+	}
+
 	pending.contributions[idx] = Some(StoredContribution {
 		actor,
-		commitment_hexes: contrib
-			.commitments
-			.coefficients
-			.iter()
-			.map(|c| c.to_hex())
-			.collect(),
+		commitment_hexes: new_commit_hexes,
 		pop_sig_hexes: contrib.pops.iter().map(|p| p.sig.to_hex()).collect(),
 	});
 	save_pending(wallet_data_dir, key, &pending)?;
@@ -416,11 +452,14 @@ fn all_contributions_ready(pending: &PendingDkg) -> bool {
 /// (`{out_dir}/share_to_actor{i}_s{k}.slatepack`) — never plaintext (C-02).
 /// This requires an address-based roster; an index-only roster (dev/local-sim)
 /// is rejected because such actors have no encryption key. `sender_address` is
-/// this wallet's own Slatepack address, stamped on the outgoing packs.
+/// this wallet's own Slatepack address, stamped on the outgoing packs;
+/// `sign_key` is the matching secret key, used to authenticate each share
+/// before it is encrypted (C-04, sign-then-encrypt).
 pub fn dkg_export_shares(
 	wallet_data_dir: &str,
 	key: &PendingKey,
 	sender_address: &SlatepackAddress,
+	sign_key: &EdSecretKey,
 	out_dir: &str,
 ) -> Result<Vec<String>, Error> {
 	let pending = load_pending(wallet_data_dir, key)?
@@ -457,7 +496,7 @@ pub fn dkg_export_shares(
 		for share_index in 0..pending.params.shares_per_actor {
 			let x = actor.x_coordinate_share(&secp, share_index)?;
 			let y = dealer_partial_share(&secp, &secrets, &x)?;
-			let env = build_dkg_partial_share(
+			let mut env = build_dkg_partial_share(
 				pending.ceremony_id.clone(),
 				sender.clone(),
 				actor.clone(),
@@ -465,6 +504,7 @@ pub fn dkg_export_shares(
 				&y,
 				&x,
 			);
+			env.sign(sign_key)?;
 			let armored =
 				env.to_armored_string(Some(sender_address.clone()), vec![recipient_addr.clone()])?;
 			let path =
@@ -498,14 +538,37 @@ pub fn dkg_import_share(
 	if msg.recipient.id != me.id {
 		return Err(Error::Multisig("share not addressed to this actor".into()));
 	}
-	if msg.share_index >= pending.params.shares_per_actor {
+	let share_index = msg.share_index;
+	if share_index >= pending.params.shares_per_actor {
 		return Err(Error::Multisig("share_index out of range".into()));
 	}
 
-	// Accumulate partials: store running sum of received dealer partials in my_share_ys_hex
+	// Identify the dealer (sender) in the trusted roster and authenticate it.
+	let dealer_idx = pending
+		.actors
+		.iter()
+		.position(|a| a.id == envelope.sender.id)
+		.ok_or_else(|| Error::Multisig(format!("unknown dealer {}", envelope.sender.label)))?;
+	if pending.actors[dealer_idx].slatepack_address().is_ok() {
+		envelope.verify_signature()?;
+	}
+
+	// Reject duplicate/replayed shares: applying the same dealer's partial twice
+	// would double-count into the accumulator and corrupt the final share (C-04).
+	if pending.applied_share_dealers.len() != pending.params.shares_per_actor {
+		pending.applied_share_dealers = vec![Vec::new(); pending.params.shares_per_actor];
+	}
+	if pending.applied_share_dealers[share_index].contains(&dealer_idx) {
+		return Err(Error::Multisig(format!(
+			"duplicate share from dealer {} for share_index {} (replay)",
+			envelope.sender.label, share_index
+		)));
+	}
+
+	// Accumulate partials: running sum of received dealer partials.
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let part = seckey_from_hex(&secp, &msg.share_hex)?;
-	let existing = &pending.my_share_ys_hex[msg.share_index];
+	let existing = &pending.my_share_ys_hex[share_index];
 	let sum = match existing {
 		Some(h) => {
 			let prev = seckey_from_hex(&secp, h)?;
@@ -513,7 +576,8 @@ pub fn dkg_import_share(
 		}
 		None => part,
 	};
-	pending.my_share_ys_hex[msg.share_index] = Some(seckey_to_hex(&sum));
+	pending.my_share_ys_hex[share_index] = Some(seckey_to_hex(&sum));
+	pending.applied_share_dealers[share_index].push(dealer_idx);
 	save_pending(wallet_data_dir, key, &pending)?;
 	Ok(pending)
 }
@@ -690,4 +754,107 @@ where
 pub fn wallet_data_dir(top_level: &str) -> PathBuf {
 	// Match GRIN_WALLET_DIR constant used by lifecycle
 	Path::new(top_level).join("wallet_data")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::grin_core::global;
+	use std::convert::TryFrom;
+
+	fn keypair(seed: u8) -> (EdSecretKey, SlatepackAddress) {
+		let sk = EdSecretKey::from_bytes(&[seed; 32]).unwrap();
+		let pk = ed25519_dalek::PublicKey::from(&sk);
+		(sk, SlatepackAddress::new(&pk))
+	}
+
+	// Full 2-of-2 address-based DKG exchange over the file API, asserting the
+	// C-04 properties: signed contributions verify, tampered/unsigned ones are
+	// rejected, and a replayed share is refused instead of double-counted.
+	#[test]
+	fn dkg_exchange_authenticated_and_replay_safe() {
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+
+		let (sk0, addr0) = keypair(21);
+		let (sk1, addr1) = keypair(22);
+		let roster = vec![
+			String::try_from(&addr0).unwrap(),
+			String::try_from(&addr1).unwrap(),
+		];
+
+		let base = std::env::temp_dir().join(format!("msig_c04_{}", uuid::Uuid::new_v4()));
+		let w0 = base.join("w0");
+		let w1 = base.join("w1");
+		std::fs::create_dir_all(&w0).unwrap();
+		std::fs::create_dir_all(&w1).unwrap();
+		let w0s = w0.to_str().unwrap();
+		let w1s = w1.to_str().unwrap();
+		let k0: PendingKey = [1u8; 32];
+		let k1: PendingKey = [2u8; 32];
+		let cid = CeremonyId::new();
+		let c0 = w0.join("contrib0.json");
+		let c1 = w1.join("contrib1.json");
+
+		dkg_start(
+			w0s,
+			&k0,
+			Some(&sk0),
+			2,
+			2,
+			0,
+			Some(1),
+			Some(roster.clone()),
+			Some(cid.clone()),
+			c0.to_str().unwrap(),
+		)
+		.unwrap();
+		dkg_start(
+			w1s,
+			&k1,
+			Some(&sk1),
+			2,
+			2,
+			1,
+			Some(1),
+			Some(roster.clone()),
+			Some(cid.clone()),
+			c1.to_str().unwrap(),
+		)
+		.unwrap();
+
+		let env_c0 = read_envelope_file(c0.to_str().unwrap()).unwrap();
+		let env_c1 = read_envelope_file(c1.to_str().unwrap()).unwrap();
+		// The broadcast contribution is authenticated.
+		env_c0.verify_signature().unwrap();
+
+		// A tampered signature is rejected on import.
+		let mut bad = env_c1.clone();
+		bad.sig_hex = Some("00".repeat(64));
+		assert!(dkg_import_contrib(w0s, &k0, &bad).is_err());
+		// An unsigned contribution is rejected in an address-based ceremony.
+		let mut unsigned = env_c1.clone();
+		unsigned.sig_hex = None;
+		assert!(dkg_import_contrib(w0s, &k0, &unsigned).is_err());
+
+		// The genuine contributions import cleanly.
+		dkg_import_contrib(w0s, &k0, &env_c1).unwrap();
+		dkg_import_contrib(w1s, &k1, &env_c0).unwrap();
+
+		// Actor 1 exports the share addressed to actor 0.
+		let paths1 =
+			dkg_export_shares(w1s, &k1, &addr1, &sk1, w1.join("out").to_str().unwrap()).unwrap();
+		assert_eq!(paths1.len(), 1);
+
+		let share_env = read_encrypted_share_file(&paths1[0], &sk0).unwrap();
+		share_env.verify_signature().unwrap();
+		dkg_import_share(w0s, &k0, &share_env).unwrap();
+		// Replaying the same dealer's share must be rejected (no double-count).
+		let err = dkg_import_share(w0s, &k0, &share_env).unwrap_err();
+		match err {
+			Error::Multisig(m) => assert!(m.contains("replay"), "unexpected: {}", m),
+			_ => panic!("expected replay rejection"),
+		}
+
+		let _ = std::fs::remove_dir_all(&base);
+	}
 }

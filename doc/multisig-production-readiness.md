@@ -97,9 +97,14 @@ These are **new findings from reading the working-tree code**, complementary to 
 **Resolution:** the pending file is now AEAD-encrypted (ChaCha20-Poly1305, `store::seal_pending`/`open_pending`) under a keychain-derived key (`store::derive_pending_key`, domain-separated from the share-obfuscation key). File renamed to `pending_dkg.enc`; every pending-touching CLI command now unlocks the wallet to derive the key, so the file can neither be read nor written without wallet access. Legacy plaintext file removed on `clear`. Verified: seal/open roundtrip, wrong-key rejection, and tamper rejection tests pass (35/35 multisig tests).
 **Residual (tracked under WS3):** `zeroize` on the in-memory secret buffers is still pending; AEAD is not yet applied to `export_state_json` (C-08) or the LMDB XOR path.
 
-### C-04 — Wire envelopes are unauthenticated — **High**
-`MultisigEnvelope.sender` is attacker-controlled: `dkg_import_contrib` (`ops.rs:317`) looks up the actor roster by `envelope.sender.id` with no signature check. Any party who can place a file/slatepack can impersonate any actor, substitute contributions, or replay a previous ceremony's messages (there is no round/sequence number, only ceremony-id match; a re-imported contribution silently overwrites `contributions[idx]`).
-**Fix (WS5):** sign every envelope with the sender's slatepack ed25519 key over `(magic ‖ version ‖ ceremony_id ‖ session_id ‖ round ‖ seq ‖ body_hash)`; reject duplicates/equivocation explicitly (two different signed round-r messages from one actor = abort with proof).
+### C-04 — Wire envelopes are unauthenticated — **High** — ✅ FIXED
+`MultisigEnvelope.sender` was attacker-controlled, checked against the roster by id with no signature; a re-imported contribution silently overwrote `contributions[idx]`, and a replayed share was **summed twice** into the accumulator (a silent corruption, not just a nuisance).
+**Resolution:**
+- **Authentication:** `MultisigEnvelope` carries a detached ed25519 `sig_hex` over a canonical transcript — `magic ‖ version ‖ ceremony_id ‖ session_id ‖ sender.id ‖ SHA256(body)` — signed by the sender's Slatepack key (`sign`/`verify_signature`). The signing key must match the declared sender address, so a wallet cannot sign as an actor it is not. `dkg_start` and `dkg_export_shares` sign; `dkg_import_contrib`/`dkg_import_share` verify against the **trusted roster** entry (address-based ceremonies require a valid signature; index/dev rosters, which cannot be authenticated, stay unsigned). Shares are signed **then** encrypted.
+- **Equivocation:** a second, *different* contribution from an actor is rejected (identical re-import is idempotent).
+- **Replay:** `PendingDkg.applied_share_dealers` tracks which dealer indices have been summed per share; a duplicate/replayed share is refused instead of double-counted.
+Verified by unit tests (sign/verify, tamper, wrong-sender, key-mismatch) and a full 2-of-2 authenticated DKG exchange over the file API that also asserts replay rejection (41/41 multisig tests).
+**Residual (WS2/WS5):** transcript binds sender+ceremony+session+body but not an explicit round/sequence counter (contribution/share replay is covered structurally; kernel/rangeproof round messages will need per-round sequence binding when the session engine lands). δ-masking of delivered shares (F-03) is still open.
 
 ### C-05 — Kernel nonce commitment binds too little — **High**
 `kernel.rs::commit_nonce` (line 236) commits to `SHA256(tag‖pub_nonce)` only. It does not bind the actor identity, session id, or the actor's `pub_excess`. Consequences: (a) commitments are replayable across sessions; (b) the last revealer chooses/claims `pub_excess` **after** seeing everyone's nonces and excess keys — the classic adaptive-key setting the commit-reveal was meant to prevent (rogue-key style cancellation on `excess_sum` is checked nowhere; correctness currently relies on tx balance failing, which is detection-by-DoS, not security).
@@ -260,7 +265,7 @@ Rules to adopt from Beam `MultiTx`: barriers (never reveal a finalizable secret 
 **P0 — before any real value (testnet with meaningful amounts included):**
 1. ✅ C-01 chain-type footgun removal.
 2. ✅ C-02/C-03 plaintext secrets on disk (pending file AEAD-encrypted; share export age-encrypted to recipient addresses).
-3. C-04 envelope authentication + replay protection.
+3. ✅ C-04 envelope authentication + replay protection.
 4. WS1 spec freeze (incl. C-07 canonical transcript, C-11 degree floor, C-13 add-actor removal).
 5. WS2 FROST kernel + verifiable τ (C-05/C-06).
 6. WS4 durable negotiator with crash recovery.
