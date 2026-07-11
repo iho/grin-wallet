@@ -45,7 +45,7 @@ Wallet-layer **M-of-N threshold multisig** for Grin (Mimblewimble):
 1. **Feldman-style DKG** and share distribution (including PoP on coefficient commitments).  
 2. **Coin blinding-factor derivation** from the secret polynomial (`sk(x)` + view mix).  
 3. **Multiparty Bulletproof** construction via `secp256k1zkp::bullet_proof_multisig`.  
-4. **Multiparty kernel excess signing** (additive partial Schnorr / Grin aggsig + nonce commitments).  
+4. **Multiparty kernel excess signing** — FROST (two-round, binding factors) over Lagrange partial excess keys, aggregated via Grin aggsig; **including its composition with the multiparty BP over the same shares** (§4.6 Q2).  
 5. **Threat model**, including:  
    - fewer than M corrupted actors  
    - M share leak / collusion  
@@ -155,11 +155,11 @@ These deliberately diverge from (or fix) draft RFC prose:
 | Topic | Implementation stance |
 | --- | --- |
 | **Degree** | `degree = threshold × shares_per_actor − 1` (not “degree M with M points”) |
-| **Multi-share** | `recommended_shares_per_actor(M)` raises degree for small M (PTE hardening intent) |
+| **Multi-share** | `recommended_shares_per_actor(M)` raises degree for small M; production constructors enforce `num_coefficients ≥ MIN_SHARES_FOR_DEGREE = 4` (effective degree ≥ 3) — **the constant is asserted, not cryptanalyzed** |
 | **View mix** | **Not** claimed to hide the polynomial if full blinds leak + public \(S_*\) known |
-| **Add-actor** | Implemented with δ-masking; **documented as dangerous** under near-quorum collusion |
-| **Kernel scheme** | Grin additive aggsig + **nonce commit-then-reveal** — **not** FROST/MuSig2 |
-| **BP** | `secp256k1zkp` multiparty bulletproof API (τ path) |
+| **Add-actor** | Removed from v1: `#[cfg(test)]`-gated, no production callers; membership change = re-DKG + sweep |
+| **Kernel scheme** | **FROST** (Komlo–Goldberg two-round, two nonces + binding factors) over Lagrange partial excess keys, aggregated via Grin `aggsig` — hand-rolled on `kernel.rs`, **not** the ZF-FROST crate |
+| **BP** | `secp256k1zkp` multiparty bulletproof API (τ path), with per-actor τ verification against the public polynomial (identifiable abort) |
 
 ### 4.4 Inherent model limitation (must not be forgotten)
 
@@ -169,9 +169,16 @@ Any **M** shares (or enough partials to interpolate) reconstruct the **entire** 
 
 The branch implements a vertical slice:
 
-DKG → LMDB persistence → multiparty BP → multiparty kernel → slatepack-style messages → CLI → local-quorum E2E `Transaction::validate` → Owner RPC / post-tx hex.
+DKG (file-based **and** durable session) → AEAD-sealed LMDB/session persistence → multiparty BP with verifiable τ → FROST kernel signing → authenticated, replay-protected, size-capped wire envelopes → durable session negotiator (crash-resume, deadlines, equivocation rejection) → UTXO tracking + coin-number allocation + PMMR scan → CLI + Owner RPC → local-quorum E2E `Transaction::validate` → cross-epoch (re-DKG migration) spends → envelope fuzz targets.
 
-It does **not** mean: multi-machine adversarial sessions, durable negotiator, production encryption-at-rest, FROST, or audited security.
+It does **not** mean: multi-process adversarial soak on real networks, a robust (bias-resistant) DKG, cryptanalysis behind the PTE degree floor, external validation of the FROST + multiparty-BP composition, or audited security.
+
+### 4.6 The two headline questions (read §9 for the full list)
+
+Everything mechanical that the internal reviews flagged has been implemented and regression-tested. What remains open — and what this review must primarily answer — are two **proof-shaped** questions no amount of unit testing can settle:
+
+1. **Is `MIN_SHARES_FOR_DEGREE = 4` a sound floor?** The PTE/Wagner analysis (F-08) says polynomial-derived blinds admit excess-collision attacks whose cost depends on the effective polynomial degree. The code enforces `num_coefficients = threshold × shares_per_actor ≥ 4` (effective degree ≥ 3) and raises `shares_per_actor` for small M — but the constant 4 is an engineering guess. The review must either justify a concrete floor (for stated max inputs/outputs per tx and UTXO counts) or prescribe the correct one.
+2. **Is the FROST + multiparty-bulletproof composition sound?** The same Lagrange shares of the same polynomial feed two interactive protocols — τ contributions to the multiparty BP and FROST partial signatures over the kernel excess — within one session and across concurrent sessions. Each protocol is individually standard; their **joint** use of shared key material (plus the deterministic public offset and view-mix terms on canonical actor 0) has no security argument. The review must confirm no cross-protocol leakage or forgery leverage exists, or specify the required domain separation.
 
 ---
 
@@ -180,21 +187,27 @@ It does **not** mean: multi-machine adversarial sessions, durable negotiator, pr
 ### 5.1 Primary (must review)
 
 ```text
-libwallet/src/multisig/          (~4.6k LOC at package time)
+libwallet/src/multisig/          (~13k LOC at package time)
 ├── mod.rs           # module surface / docs
-├── types.rs         # threshold params, ceremony state
-├── scalar.rs        # hash-to-scalar, field ops
+├── types.rs         # threshold params (incl. MIN_SHARES_FOR_DEGREE floor), ceremony state
+├── scalar.rs        # hash-to-scalar (rejection sampling), field ops
 ├── poly.rs          # secret/public polynomial eval, share verify
-├── dkg.rs           # Feldman-style DKG, PoP, local DKG
-├── share.rs         # Lagrange partials, δ-masking, add-actor
+├── dkg.rs           # joint-Feldman DKG, PoP, local DKG (bias-resistance OPEN, C-14)
+├── share.rs         # Lagrange partials, δ-masking; add-actor is #[cfg(test)]-gated
 ├── coin.rs          # coin id → x, blind, offset, view mix
-├── rangeproof.rs    # multiparty BP (T1/T2/τ)
-├── kernel.rs        # multiparty kernel excess (aggsig + nonce commit)
+├── rangeproof.rs    # multiparty BP (T1/T2/τ) + per-actor τ verification
+├── kernel.rs        # FROST kernel signing (binding factors, rogue-key checks,
+│                    #   cross-epoch dual-poly excess verification)
 ├── tx.rs            # E2E local-quorum Transaction build + validate
-├── messages.rs      # slatepack/JSON wire envelopes
-├── store.rs         # LMDB encrypt/decrypt helpers
-└── ops.rs           # CLI/ops lifecycle (DKG pending files, etc.)
+├── messages.rs      # signed/seq-stamped JSON wire envelopes, DoS caps
+├── session.rs       # durable negotiator: DKG/CreateOutput/Spend/MultiTx/CrossEpoch,
+│                    #   crash-resume, replay + equivocation rejection, TTL
+├── utxo.rs          # multisig UTXO lifecycle, coin-number allocator, rewind recognition
+├── store.rs         # ChaCha20-Poly1305 AEAD sealing (state, pending DKG, sessions)
+└── ops.rs           # CLI/ops lifecycle, session orchestration, envelope signing
 ```
+
+Fuzz targets: `libwallet/fuzz/fuzz_targets/multisig_envelope_{json,payload}.rs`.
 
 ### 5.2 Secondary (persistence / API glue)
 
@@ -222,15 +235,16 @@ git clone <grin-wallet-remote>
 cd grin-wallet
 git checkout feat/multisig-wallet
 git log -1 --oneline
-# Package-time tip was approximately: 7696dd1 — verify; work may be uncommitted
-# on a local working tree. Prefer a tag or commit hash frozen for the review.
+# Implementation frozen at: d4cd8215 ("multisig: authenticate tx-session
+# envelopes, bind kernel final to session transcript"). This package document
+# is committed immediately on top of it; see §10 for the pinned hash.
 
 # Optional sibling docs (if not in the zip bundle)
 # grin/doc/multisig-crypto-review.md
 # grin/doc/multisig-implementation.md
 ```
 
-**Note for reviewers:** At package time the multisig implementation may exist as a large **working-tree** delta on `feat/multisig-wallet` rather than a single clean published commit. Request a **frozen commit or tarball** from the requesting party if hashes must be pinned.
+**Note for reviewers:** confirm the frozen commit in §10 matches what you received; do not review a moving branch.
 
 ---
 
@@ -242,14 +256,14 @@ Independent design review produced **F-01…F-15**. Implementation and readiness
 
 | ID | Severity | Topic | Summary | Impl note (package time) |
 | --- | --- | --- | --- | --- |
-| **F-01** | Critical (spec) | Degree vs threshold | Draft RFC mixed degree M with M points; wrong for SSS | Aims at `threshold * shares_per_actor − 1`; **verify math + vectors** |
+| **F-01** | Critical (spec) | Degree vs threshold | Draft RFC mixed degree M with M points; wrong for SSS | Fixed: `threshold × shares_per_actor − 1`, structurally enforced; **verify math + vectors** |
 | **F-02** | High | View mix / HKDF | Public \(S_0\)-derived mix does **not** hide poly if blinds leak | Docs/code note: no poly-hiding claim |
-| **F-03** | High | Add-actor | M−1 colluders + new actor can extract last honest share | API exists + warning; **not gated off** |
-| **F-04** | High/Med | Joint Feldman | Bias / robust DKG literature not fully engaged | Classic joint Feldman + PoP |
-| **F-05** | Medium | PoP transcripts | PoP present; end-to-end binding must be checked | Present in `dkg.rs` — audit transcript |
-| **F-06** | High | Kernel multiparty | Additive aggsig + hash nonce commit — **not** FROST/MuSig2 | `kernel.rs` — specialist judgment required |
-| **F-07** | Med/High | Multiparty BP | Spec incomplete vs full multiparty BP practice | Uses secp multiparty API; rounds in `rangeproof.rs` |
-| **F-08** | High (small M) | Wagner / PTE | Excess collision risk for poly blinds; degree TBD | Multi-share helper exists; **no proven D_min** |
+| **F-03** | High | Add-actor | M−1 colluders + new actor can extract last honest share | **Gated off**: `#[cfg(test)]`, no production callers; v1 = re-DKG + sweep |
+| **F-04** | High/Med | Joint Feldman | Bias / robust DKG literature not fully engaged | **OPEN** (C-14): classic joint Feldman + PoP, no commit-reveal / complaint round |
+| **F-05** | Medium | PoP transcripts | PoP present; end-to-end binding must be checked | Present in `dkg.rs` (binds ceremony/actor/index/commitment) — audit transcript |
+| **F-06** | High | Kernel multiparty | RFC prose underspecified threshold signing | **FROST implemented** in `kernel.rs` (two nonces, binding factors, rogue-key excess checks incl. cross-epoch) — specialist judgment on the hand-rolled composition required (§4.6 Q2) |
+| **F-07** | Med/High | Multiparty BP | Spec incomplete vs full multiparty BP practice | secp multiparty API + **verifiable per-actor τ** with identifiable abort (`rangeproof.rs`) |
+| **F-08** | High (small M) | Wagner / PTE | Excess collision risk for poly blinds; degree TBD | Floor enforced (`MIN_SHARES_FOR_DEGREE = 4`); **no cryptanalysis behind the constant** (§4.6 Q1) |
 | **F-09** | Medium | Cross-curve | Slatepack ed25519 identity vs secp money keys | δ / hash-to-scalar path — check carefully |
 | **F-10** | Medium | δ-masking | Algebra OK; “perfect hiding” overclaimed | Computational only |
 | **F-11** | Medium | Backup model | Seed-only restore vs random DKG coeffs | Export-state JSON; not seed-restorable alone |
@@ -274,17 +288,26 @@ Full write-ups: **`grin/doc/multisig-crypto-review.md`** (artifact H).
 
 ### 6.3 Implementation / product maturity (code-level)
 
-From readiness review (`doc/multisig-production-readiness.md`) and implementation work — examples (re-validate):
+The readiness review (`doc/multisig-production-readiness.md`) produced code findings **C-01…C-14**; all except C-14 are fixed or explicitly decided at package time. Re-validate the fixes — do not take the ✅ marks on trust:
 
-| Issue | Summary |
+| Finding | Status at package time |
 | --- | --- |
-| No durable negotiator | Multi-round sessions not crash-resilient multi-process product |
-| Local-sim E2E only | `tx.validate()` for in-process quorum; not multi-machine adversarial |
-| Share export / temp files | Risk of plaintext share material on disk during multi-party DKG file flow |
-| Add-actor not hard-gated | Doc warning only; UI/API can still call it |
-| Demo / chain-type coupling | Ensure test-only global state cannot affect production APIs |
-| Share XOR at rest | Keychain-derived XOR — not strong encryption if seed unlocked in-process |
-| Experimental flag | CLI/docs warn: not for real funds without review + fixes |
+| C-01 chain-type global mutation from Owner API | Fixed (removed) |
+| C-02/C-03 plaintext shares / dealer coeffs on disk | Fixed (age-encrypted share slatepacks; AEAD pending file) |
+| C-04 unauthenticated wire envelopes | Fixed: ed25519-signed transcript (incl. per-session `seq`) verified for **all** session kinds — DKG *and* RP/kernel/MultiTx/CrossEpoch |
+| C-05 kernel nonce binding | Fixed: FROST + rogue-key excess checks (incl. cross-epoch dual-poly); `KernelFinal` bound to the session's own commitments; partials bound to round-1 commits |
+| C-06 unverifiable τ | Fixed: per-actor τ verification, identifiable abort |
+| C-07 quorum ordering | Fixed: canonical quorum, transcripted |
+| C-08 secrets through JSON / no zeroize | Fixed (AEAD state, debug redaction); clones in hot paths remain |
+| C-09/C-10 offset & view-key semantics | Decided + documented (v1 accepts; see readiness doc) |
+| C-11 PTE floor | Enforced; **constant unjustified** (§4.6 Q1) |
+| C-12 envelope DoS caps | Fixed + fuzz targets |
+| C-13 add-actor exposure | Fixed (`#[cfg(test)]`) |
+| C-14 joint-Feldman bias / no complaint round | **OPEN** — the one unfixed code finding |
+
+**Package-time caveat:** the session-layer hardening (C-04 extension to transaction sessions, `KernelFinal`/partial binding, cross-epoch rogue-key check) landed **at package time** with regression tests but no soak period. Treat those paths as fresh code and probe them accordingly.
+
+Remaining product gaps (not crypto): multi-process soak on real wallets, slate nesting in the standard send flow, continuous fuzz CI, hardware-signer path.
 
 ### 6.4 Beam comparison (one paragraph)
 
@@ -316,18 +339,23 @@ cargo build -p grin_wallet
 ./target/debug/grin-wallet multisig demo-tx -m 2 -n 2
 ```
 
+87 multisig unit tests at package time (plus the LMDB store roundtrip). Fuzz targets: `cd libwallet/fuzz && cargo +nightly fuzz run multisig_envelope_json` (and `_payload`).
+
 **Claims tests support**
 
-- DKG share verification against public polynomial  
-- Multiparty rangeproof verify + rewind value  
-- Multiparty kernel partial/final verify  
-- Full `Transaction::validate` for local fund→spend  
-- LMDB encrypt/decrypt of shares  
+- DKG share verification against public polynomial; threshold-inflation rejection  
+- Multiparty rangeproof verify + rewind value; corrupted τ rejected with actor attribution  
+- FROST kernel sign/verify incl. binding-factor context, bad-partial rejection, `TxKernel::verify`  
+- Malicious-peer negatives: forged `KernelFinal` (internally consistent, foreign excess) rejected; partial/commit equivocation rejected; unsigned envelope from address roster rejected; cross-epoch rogue commit rejected; replay idempotent; deadline abort  
+- Session crash-resume mid-round; abort wipes secrets  
+- Full `Transaction::validate` for local fund→spend, MultiTx, cross-epoch sweep  
+- AEAD seal/open with wrong-key and tamper rejection  
 
 **Claims tests do *not* support**
 
-- Security against malicious co-signers beyond unit checks  
-- Multi-process / network adversarial sessions  
+- Security against malicious co-signers beyond the unit-level negatives above  
+- Multi-process / network adversarial sessions (file-harness sims only)  
+- Any parameter-level claim: the PTE floor constant and the FROST × multiparty-BP composition are untested by construction (§4.6)  
 - On-chain confirmation of demo txs (inputs are synthetic)
 
 ---
@@ -371,11 +399,16 @@ Recommendation: ...
 
 ## 9. Questions we explicitly want answered
 
-1. Is the **M-of-N polynomial key tree** acceptable for a treasury, given total compromise if M shares leak?  
-2. Is **multiparty BP** usage (T1/T2/τ aggregation) consistent with known secure multiparty BP practice (e.g. Beam / Bünz et al.)?  
-3. Is the **kernel multiparty** construction safe as implemented, or must it be replaced with FROST/MuSig2 before any funds?  
-4. What **minimum polynomial degree / shares-per-actor** is required against PTE-style excess collisions for realistic UTXO counts?  
-5. Should **add-actor** be removed from v1?  
+**Primary (the two §4.6 headline questions — these decide go/no-go):**
+
+1. **PTE floor:** What minimum effective polynomial degree / `shares_per_actor` is required against PTE-style excess collisions for realistic transaction shapes (state your assumed max inputs/outputs and UTXO count)? Is the enforced `MIN_SHARES_FOR_DEGREE = 4` (effective degree ≥ 3) adequate, and if not, what constant is?  
+2. **Composition:** Is the hand-rolled FROST kernel signing sound when composed with the multiparty bulletproof over the **same** Lagrange shares of the same polynomial — within one session and across concurrent sessions, including the cross-epoch dual-poly variant? Is the domain separation (session ids, offsets, binding factors, τ challenges) sufficient, or is additional separation / a different key derivation required?
+
+**Secondary:**
+
+3. Is the **M-of-N polynomial key tree** acceptable for a treasury, given total compromise if M shares leak (F-12)?  
+4. Does **joint-Feldman without commit-reveal / complaints** (C-14) create exploitable bias given how the public polynomial feeds coin derivation, view mix, and offsets — or is it only a robustness/DoS concern here?  
+5. Are the **PoP transcript**, hash-to-scalar, and envelope-signing transcripts correctly bound (no cross-ceremony / cross-session replay)?  
 6. For a **2-of-3** org wallet on mainnet, what is your **go / no-go** after reading this package and code?  
 7. Which findings are **blockers for testnet value** vs **blockers for mainnet treasury** only?
 
@@ -390,7 +423,7 @@ Recommendation: ...
 | Prior design review | Internal engineering analysis (F-01…F-15); not a paid audit |
 | Reviewer | *to be filled* |
 | Requesting party | *to be filled* |
-| Frozen commit / tarball hash | *to be filled before engagement starts* |
+| Frozen commit / tarball hash | `d4cd8215` (implementation) — branch `feat/multisig-wallet`, fork `iho/grin-wallet` |
 
 ---
 
@@ -428,10 +461,10 @@ Optional: `git archive` or a single commit hash + patch of all uncommitted multi
 ## 12. One-page summary for the reviewer
 
 - **What:** Threshold multisig wallet for Grin; co-owners hold shares; M of N can build rangeproofs and kernels without reconstructing the full secret in normal operation.  
-- **What is solid (as engineering prototype):** Clear MW problem framing; multiparty BP is the right tool family; local E2E txs validate; LMDB persistence exists; Beam comparison clarifies product vs crypto gaps.  
-- **What is not solid:** Kernel multi-sig scheme class (F-06), DKG robustness (F-04), PTE parameters (F-08), add-actor (F-03), session/product maturity, **no external specialist audit until you**.  
-- **Your job:** Independent judgment on **crypto correctness and fund-safety**, not product roadmap or CLI polish.  
-- **Prior internal verdict:** Not production-ready; use F-series as a checklist, not as gospel.
+- **What is solid (as engineering prototype):** Clear MW problem framing; FROST kernel signing with rogue-key checks; verifiable multiparty BP with identifiable abort; authenticated + replay-protected wire; AEAD secrets at rest; durable crash-resumable sessions; UTXO/chain integration; local E2E txs validate; malicious-peer regression tests.  
+- **What is not solid — your job:** (1) the **PTE degree floor is an unjustified constant** (§4.6 Q1); (2) the **FROST × multiparty-BP composition over shared polynomial material has no security argument** (§4.6 Q2); (3) **joint-Feldman DKG bias** is unmitigated (C-14); plus the inherent M-leak model limit (F-12). **No external specialist audit until you.**  
+- **Scope:** Independent judgment on **crypto correctness and fund-safety**, not product roadmap or CLI polish.  
+- **Prior internal verdict:** Not production-ready; use the F-series and C-series as checklists, not as gospel.
 
 ---
 
