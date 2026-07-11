@@ -82,6 +82,17 @@ use super::types::{ActorId, CeremonyId};
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
 /// Max actors in a session quorum.
 pub const MAX_SESSION_ACTORS: usize = 16;
+/// Default session lifetime (24h). After the deadline, apply/expire abort the session.
+pub const DEFAULT_SESSION_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// Current unix time in seconds (best-effort; 0 if the clock is unavailable).
+pub fn unix_now() -> u64 {
+	use std::time::{SystemTime, UNIX_EPOCH};
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|d| d.as_secs())
+		.unwrap_or(0)
+}
 
 /// 32-byte AEAD key for session files (same size as pending/state keys).
 pub type SessionKey = [u8; 32];
@@ -257,6 +268,28 @@ pub struct SessionRecord {
 	/// Aggregated nonce pubkey hex (Spend).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub result_nonce_hex: Option<String>,
+	/// Unix timestamp (seconds) when the session was created.
+	#[serde(default)]
+	pub created_unix: u64,
+	/// Optional hard deadline (unix seconds). After this, the session should abort.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deadline_unix: Option<u64>,
+}
+
+impl SessionRecord {
+	/// Whether this open session is past its deadline at `now_unix`.
+	pub fn is_expired(&self, now_unix: u64) -> bool {
+		if matches!(
+			self.phase,
+			SessionPhase::Complete | SessionPhase::Aborted
+		) {
+			return false;
+		}
+		match self.deadline_unix {
+			Some(d) => now_unix >= d,
+			None => false,
+		}
+	}
 }
 
 impl std::fmt::Debug for SessionRecord {
@@ -481,6 +514,7 @@ impl Negotiator {
 			pub_excess_hex: String::new(),
 		};
 
+		let now = unix_now();
 		let mut record = SessionRecord {
 			session_id: sid.clone(),
 			ceremony_id: ceremony_id.clone(),
@@ -507,6 +541,8 @@ impl Negotiator {
 			result_sig_hex: None,
 			result_excess_hex: None,
 			result_nonce_hex: None,
+			created_unix: now,
+			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
 		};
 		// Record our own round-1 contribution.
 		record.rp_r1.insert(
@@ -591,6 +627,7 @@ impl Negotiator {
 			pub_excess_hex: pubkey_to_hex_local(secp, &secrets.commitment.pub_excess),
 		};
 
+		let now = unix_now();
 		let mut record = SessionRecord {
 			session_id: sid.clone(),
 			ceremony_id: ceremony_id.clone(),
@@ -617,6 +654,8 @@ impl Negotiator {
 			result_sig_hex: None,
 			result_excess_hex: None,
 			result_nonce_hex: None,
+			created_unix: now,
+			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
 		};
 		record.kern_commits.insert(
 			my_index,
@@ -688,6 +727,13 @@ impl Negotiator {
 				"session aborted: {}",
 				self.record.abort_reason.as_deref().unwrap_or("unknown")
 			)));
+		}
+		// Deadline: refuse further progress (caller should persist via abort path).
+		if self.record.is_expired(unix_now()) {
+			self.abort("deadline exceeded");
+			return Err(Error::Multisig(
+				"session deadline exceeded; session aborted".into(),
+			));
 		}
 		if env.ceremony_id != self.record.ceremony_id.0 {
 			return Err(Error::Multisig("envelope ceremony_id mismatch".into()));
@@ -1590,6 +1636,43 @@ mod tests {
 			verify_rangeproof(&secp, c, p, None).unwrap();
 		}
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn session_deadline_aborts_on_apply() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, roster, ceremony) = setup_2of2(&secp);
+		let coin = CoinId::new(1, 1_000_000);
+		let (mut n0, env0) = Negotiator::create_output(
+			&secp,
+			&pp,
+			&q,
+			ceremony.clone(),
+			roster.clone(),
+			roster[0].clone(),
+			coin.clone(),
+			b"ttl-sess",
+		)
+		.unwrap();
+		let (mut n1, _env1) = Negotiator::create_output(
+			&secp,
+			&pp,
+			&q,
+			ceremony,
+			roster.clone(),
+			roster[1].clone(),
+			coin,
+			b"ttl-sess",
+		)
+		.unwrap();
+		// Force an already-expired deadline.
+		n0.record.deadline_unix = Some(1);
+		n1.record.deadline_unix = Some(1);
+		assert!(n0.record.is_expired(unix_now()));
+		let err = n1.apply(&env0).unwrap_err();
+		assert!(format!("{}", err).contains("deadline"));
+		assert_eq!(n1.record.phase, SessionPhase::Aborted);
+		assert!(n1.record.secrets.is_none());
 	}
 
 	#[test]

@@ -278,6 +278,10 @@ Owner JSON-RPC (experimental, token required):
 | `multisig_register_utxo` | Register after CreateOutput |
 | `multisig_recognize_utxo` | Shared-nonce rewind + optional register |
 | `multisig_scan_utxos` | PMMR scan + shared-nonce recognition |
+| `multisig_refresh_utxos` | Light confirm/spent refresh of tracked commits |
+| `multisig_select_utxos` | Greedy spend selection |
+| `multisig_plan_epoch_sweep` | List Unspent coins for epoch migration |
+| `multisig_expire_sessions` | Abort sessions past 24h deadline |
 
 ## Multisig UTXOs (WS6)
 
@@ -288,10 +292,16 @@ grin-wallet multisig list-utxos -c <ceremony>
 grin-wallet multisig recognize-utxo -c <ceremony> --commit <hex> --proof proof.hex --height 100 --register
 # Chain scan (node must be reachable):
 grin-wallet multisig scan-utxos -c <ceremony> --start-index 1 --max 1000
+grin-wallet multisig refresh-utxos -c <ceremony>
+grin-wallet multisig select-utxos -c <ceremony> --amount 1000000000 --min-confirmations 1
+grin-wallet multisig plan-epoch-sweep -c <old-ceremony> --target-ceremony <new>
+grin-wallet multisig expire-sessions
 ```
 
 Session lifecycle auto-links UTXOs: CreateOutput registers/links the coin;
 Spend locks inputs and marks them Spent on Complete; Abort unlocks inputs.
+Sessions default to a **24h deadline**; `apply` after expiry aborts and unlocks.
+The owner updater also runs light refresh + session expiry each cycle.
 
 ## Next implementation steps
 

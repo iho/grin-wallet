@@ -1166,6 +1166,49 @@ where
 		}
 	}
 
+	// Step 6 (experimental multisig): light UTXO refresh + session deadline expiry.
+	// Soft-fail: never block ordinary wallet updates if multisig/node paths error.
+	{
+		use crate::multisig;
+		if let Some(ref s) = status_send_channel {
+			let _ = s.send(StatusMessage::UpdatingOutputs(
+				"Refreshing multisig UTXOs (if any)".to_owned(),
+			));
+		}
+		let tld = {
+			let mut w_lock = wallet_inst.lock();
+			w_lock.lc_provider()?.get_top_level_directory().ok()
+		};
+		wallet_lock!(wallet_inst, w);
+		match multisig::refresh_multisig_utxos(&mut **w, keychain_mask, None) {
+			Ok(r) => {
+				if r.confirmed > 0 || r.marked_spent > 0 {
+					debug!(
+						"multisig refresh: confirmed={} spent={} examined={}",
+						r.confirmed, r.marked_spent, r.examined
+					);
+				}
+			}
+			Err(e) => {
+				debug!("multisig UTXO refresh skipped: {}", e);
+			}
+		}
+		if let Some(tld) = tld {
+			let wdata = multisig::wallet_data_dir(&tld);
+			let wdata_s = wdata.display().to_string();
+			match multisig::expire_stale_sessions(&mut **w, keychain_mask, &wdata_s) {
+				Ok(expired) => {
+					if !expired.is_empty() {
+						debug!("multisig expired {} stale session(s)", expired.len());
+					}
+				}
+				Err(e) => {
+					debug!("multisig session expire skipped: {}", e);
+				}
+			}
+		}
+	}
+
 	Ok(result)
 }
 

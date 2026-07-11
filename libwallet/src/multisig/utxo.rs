@@ -375,4 +375,27 @@ mod tests {
 		);
 		verify_utxo_commit(&secp, &states[0].config.public_poly, &utxo).unwrap();
 	}
+
+	#[test]
+	fn eligible_to_spend_respects_status_and_confs() {
+		let id = CeremonyId::new();
+		let mut u = MultisigUtxo {
+			ceremony_id: id,
+			coin: CoinId::new(1, 100),
+			commit_hex: "00".repeat(33),
+			proof_hex: None,
+			status: MultisigUtxoStatus::Unspent,
+			height: 10,
+			mmr_index: None,
+			session_id_hex: None,
+			label: None,
+		};
+		assert!(!u.eligible_to_spend(10, 10)); // 1 conf only
+		assert!(u.eligible_to_spend(19, 10)); // 10 confs
+		u.status = MultisigUtxoStatus::Locked;
+		assert!(!u.eligible_to_spend(100, 1));
+		u.status = MultisigUtxoStatus::Unconfirmed;
+		assert!(u.eligible_to_spend(100, 0));
+		assert!(!u.eligible_to_spend(100, 1));
+	}
 }

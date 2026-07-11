@@ -283,7 +283,10 @@ Negotiator
 3. ✅ Coin-number allocator: high-water meta (`N` prefix) + `allocate_coin` → Reserved UTXO; next = max(known, high_water)+1.
 4. ✅ Recognition via shared-nonce rewind (`try_recognize_output`) without enumerating coin numbers.
 5. ✅ Session ↔ UTXO coupling: CreateOutput links/registers on start+complete; Spend locks inputs and marks Spent on complete; Abort unlocks; `scan_ceremony_utxos` PMMR walk via node client.
-6. Residual: hook scan into `owner_updater` background loop; concurrent multi-process reservation; send/receive nesting in standard slate flow; epoch rotation sweep.
+6. ✅ Light `refresh_multisig_utxos` + `expire_stale_sessions` hooked into `update_wallet_state` / owner updater (soft-fail).
+7. ✅ Session deadlines (default 24h TTL); apply after deadline aborts + unlocks.
+8. ✅ `select_spendable_utxos` greedy selection; `plan_epoch_sweep` for re-DKG migration inventory.
+9. Residual: concurrent multi-process reservation soak; send/receive nesting in standard slate flow; automated on-chain epoch sweep tx builder.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 
@@ -308,9 +311,10 @@ Negotiator
 7. ✅ C-09/C-10 v1 product decisions documented (public offset; strategy A view). Residual: formal RFC freeze text.
 8. ✅ WS4 negotiator + CLI + Owner RPC session methods. Residual: multi-process soak + DKG-as-session.
 9. ✅ C-12 envelope DoS caps.
+9b. ✅ Session TTL/deadline + expire path; updater light refresh.
 
 **P1 — before mainnet flag:**
-10. ✅ WS6 UTXO foundation (track/allocate/recognize). Residual: chain-scan hook + rotation sweep.
+10. ✅ WS6 UTXO foundation (track/allocate/recognize/scan/refresh/select/sweep-plan). Residual: automated rotation spend builder.
 11. ✅ C-08 AEAD state + Debug redaction (WS3 core); residual: restore drill runbook.
 12. WS5 residual: freeze wire format + fuzz `MultisigEnvelope` parser.
 13. External audit + malicious-peer suite + 30-day soak.

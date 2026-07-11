@@ -1056,6 +1056,17 @@ pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, P
 			.value_of("max")
 			.map(|v| parse_u64(v, "max"))
 			.transpose()?,
+		amount: sub_args
+			.value_of("amount")
+			.map(|v| parse_u64(v, "amount"))
+			.transpose()?,
+		min_confirmations: sub_args
+			.value_of("min_confirmations")
+			.map(|v| parse_u64(v, "min-confirmations"))
+			.transpose()?,
+		target_ceremony_id: sub_args
+			.value_of("target_ceremony")
+			.map(|s| s.to_owned()),
 	})
 }
 

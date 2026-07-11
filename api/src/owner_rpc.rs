@@ -22,8 +22,9 @@ use crate::core::core::OutputFeatures;
 use crate::core::global;
 use crate::keychain::{Identifier, Keychain};
 use crate::libwallet::multisig::{
-	CeremonySummary, MultisigDemoTxResult, MultisigSessionApplyResult, MultisigSessionStartResult,
-	MultisigUtxo, RecognizedMultisigOutput, SessionStatus,
+	CeremonySummary, EpochSweepPlan, MultisigDemoTxResult, MultisigRefreshResult,
+	MultisigSessionApplyResult, MultisigSessionStartResult, MultisigUtxo, RecognizedMultisigOutput,
+	SessionStatus,
 };
 use crate::libwallet::{
 	mwixnet::MixnetReqCreationParams, AcctPathMapping, Amount, BuiltOutput, Error, InitTxArgs,
@@ -2154,6 +2155,34 @@ pub trait OwnerRpc {
 		end_index: Option<u64>,
 		max_outputs: u64,
 	) -> Result<Vec<MultisigUtxo>, Error>;
+
+	/// Experimental: light refresh of tracked multisig UTXOs vs node UTXO set.
+	fn multisig_refresh_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<MultisigRefreshResult, Error>;
+
+	/// Experimental: greedy select spendable multisig UTXOs for an amount.
+	fn multisig_select_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		amount: u64,
+		current_height: u64,
+		min_confirmations: u64,
+	) -> Result<(Vec<MultisigUtxo>, u64), Error>;
+
+	/// Experimental: plan epoch sweep from an old ceremony's Unspent coins.
+	fn multisig_plan_epoch_sweep(
+		&self,
+		token: Token,
+		source_ceremony_id: String,
+		target_ceremony_id: Option<String>,
+	) -> Result<EpochSweepPlan, Error>;
+
+	/// Experimental: abort sessions past their deadline.
+	fn multisig_expire_sessions(&self, token: Token) -> Result<Vec<SessionStatus>, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2806,6 +2835,50 @@ where
 			end_index,
 			max_outputs,
 		)
+	}
+
+	fn multisig_refresh_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<MultisigRefreshResult, Error> {
+		Owner::multisig_refresh_utxos(self, (&token.keychain_mask).as_ref(), ceremony_id)
+	}
+
+	fn multisig_select_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		amount: u64,
+		current_height: u64,
+		min_confirmations: u64,
+	) -> Result<(Vec<MultisigUtxo>, u64), Error> {
+		Owner::multisig_select_utxos(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			amount,
+			current_height,
+			min_confirmations,
+		)
+	}
+
+	fn multisig_plan_epoch_sweep(
+		&self,
+		token: Token,
+		source_ceremony_id: String,
+		target_ceremony_id: Option<String>,
+	) -> Result<EpochSweepPlan, Error> {
+		Owner::multisig_plan_epoch_sweep(
+			self,
+			(&token.keychain_mask).as_ref(),
+			source_ceremony_id,
+			target_ceremony_id,
+		)
+	}
+
+	fn multisig_expire_sessions(&self, token: Token) -> Result<Vec<SessionStatus>, Error> {
+		Owner::multisig_expire_sessions(self, (&token.keychain_mask).as_ref())
 	}
 }
 

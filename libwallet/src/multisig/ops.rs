@@ -1262,7 +1262,17 @@ where
 	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
 	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
 	let env = MultisigEnvelope::from_json_str(peer_envelope_json)?;
-	let outbound = neg.apply(&env)?;
+	let outbound = match neg.apply(&env) {
+		Ok(o) => o,
+		Err(e) => {
+			// Persist auto-abort (e.g. deadline) and unlock any locked UTXOs.
+			if neg.record.phase == super::session::SessionPhase::Aborted {
+				unlock_session_utxos(w, keychain_mask, &neg)?;
+				save_session(wallet_data_dir, &session_key, &neg.record)?;
+			}
+			return Err(e);
+		}
+	};
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	// UTXO side-effects on Complete / still mid-flight (WS6).
 	apply_session_utxo_effects(w, keychain_mask, &neg)?;
@@ -1754,6 +1764,244 @@ where
 		start = last + 1;
 	}
 	Ok(found)
+}
+
+/// Summary of a light multisig UTXO refresh against the node UTXO set.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct MultisigRefreshResult {
+	/// Outputs upgraded to Unspent after appearing on-chain.
+	pub confirmed: u64,
+	/// Outputs marked Spent after leaving the UTXO set.
+	pub marked_spent: u64,
+	/// Total rows examined.
+	pub examined: u64,
+}
+
+/// Light refresh: confirm tracked commits present on the node, mark missing ones Spent.
+///
+/// Unlike [`scan_ceremony_utxos`], this does **not** walk the full PMMR — it only
+/// re-checks commits already stored in the wallet. Suitable for the background
+/// owner updater loop.
+pub fn refresh_multisig_utxos<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: Option<&CeremonyId>,
+) -> Result<MultisigRefreshResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let list = w.list_multisig_utxos(ceremony_id)?;
+	let mut result = MultisigRefreshResult {
+		examined: list.len() as u64,
+		..Default::default()
+	};
+	// Only query statuses that may be on-chain.
+	let mut to_check: Vec<MultisigUtxo> = list
+		.into_iter()
+		.filter(|u| {
+			matches!(
+				u.status,
+				MultisigUtxoStatus::Unconfirmed
+					| MultisigUtxoStatus::Unspent
+					| MultisigUtxoStatus::Locked
+			)
+		})
+		.collect();
+	if to_check.is_empty() {
+		return Ok(result);
+	}
+	let commits: Vec<_> = to_check
+		.iter()
+		.filter_map(|u| u.commitment().ok())
+		.collect();
+	if commits.is_empty() {
+		return Ok(result);
+	}
+	let client = w.w2n_client().clone();
+	let on_chain = client.get_outputs_from_node(commits)?;
+	for u in &mut to_check {
+		let commit = match u.commitment() {
+			Ok(c) => c,
+			Err(_) => continue,
+		};
+		match on_chain.get(&commit) {
+			Some((_hash, height, mmr_index)) => {
+				// Present on chain → confirm Unconfirmed; refresh height.
+				if u.status == MultisigUtxoStatus::Unconfirmed {
+					u.status = MultisigUtxoStatus::Unspent;
+					result.confirmed += 1;
+				}
+				u.height = *height;
+				u.mmr_index = Some(*mmr_index);
+				let mut batch = w.batch(keychain_mask)?;
+				batch.save_multisig_utxo(u)?;
+				batch.commit()?;
+			}
+			None => {
+				// Missing from UTXO set: only mark Spent if we had previously confirmed.
+				if matches!(
+					u.status,
+					MultisigUtxoStatus::Unspent | MultisigUtxoStatus::Locked
+				) && u.height > 0
+				{
+					u.status = MultisigUtxoStatus::Spent;
+					result.marked_spent += 1;
+					let mut batch = w.batch(keychain_mask)?;
+					batch.save_multisig_utxo(u)?;
+					batch.commit()?;
+				}
+			}
+		}
+	}
+	Ok(result)
+}
+
+/// Greedy spend selection for a ceremony: largest eligible Unspent first.
+///
+/// Returns selected UTXOs and their total value. Errors if insufficient funds.
+pub fn select_spendable_utxos<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	ceremony_id: &CeremonyId,
+	amount: u64,
+	current_height: u64,
+	min_confirmations: u64,
+) -> Result<(Vec<MultisigUtxo>, u64), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let mut list = w.list_multisig_utxos(Some(ceremony_id))?;
+	list.retain(|u| u.eligible_to_spend(current_height, min_confirmations));
+	list.sort_by(|a, b| b.coin.value.cmp(&a.coin.value));
+	let mut selected = Vec::new();
+	let mut total = 0u64;
+	for u in list {
+		total = total.saturating_add(u.coin.value);
+		selected.push(u);
+		if total >= amount {
+			return Ok((selected, total));
+		}
+	}
+	Err(Error::Multisig(format!(
+		"insufficient multisig funds: need {}, have {}",
+		amount, total
+	)))
+}
+
+/// Plan for sweeping Unspent coins from an old epoch/ceremony (membership change).
+///
+/// Does **not** build transactions — returns the coin list and total so a quorum
+/// can run CreateOutput on a new ceremony then Spend from the old one.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct EpochSweepPlan {
+	/// Source (old) ceremony.
+	pub source_ceremony_id: String,
+	/// Optional target (new) ceremony UUID string.
+	pub target_ceremony_id: Option<String>,
+	/// Coins to migrate (number + value).
+	pub coins: Vec<CoinId>,
+	/// Sum of coin values.
+	pub total_value: u64,
+	/// Human guidance.
+	pub note: String,
+}
+
+/// Build an epoch-sweep plan from currently Unspent UTXOs of `source_ceremony`.
+pub fn plan_epoch_sweep<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	source_ceremony: &CeremonyId,
+	target_ceremony: Option<&CeremonyId>,
+) -> Result<EpochSweepPlan, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let list = w.list_multisig_utxos(Some(source_ceremony))?;
+	let mut coins = Vec::new();
+	let mut total = 0u64;
+	for u in list {
+		if u.status == MultisigUtxoStatus::Unspent {
+			total = total.saturating_add(u.coin.value);
+			coins.push(u.coin);
+		}
+	}
+	Ok(EpochSweepPlan {
+		source_ceremony_id: source_ceremony.0.to_string(),
+		target_ceremony_id: target_ceremony.map(|c| c.0.to_string()),
+		coins,
+		total_value: total,
+		note: "Membership change requires re-DKG (new ceremony) then multiparty \
+			Spend from the old epoch into CreateOutput(s) under the new epoch. \
+			Do not use interactive add-actor (C-13)."
+			.into(),
+	})
+}
+
+/// Abort open sessions past their deadline; unlock any locked UTXOs.
+///
+/// Returns statuses of sessions that were expired (or already aborted for deadline).
+pub fn expire_stale_sessions<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+) -> Result<Vec<SessionStatus>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	use super::session::unix_now;
+	let now = unix_now();
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let ids = list_session_ids(wallet_data_dir)?;
+	let mut out = Vec::new();
+	for hex_id in ids {
+		let sid = crate::grin_util::from_hex(&hex_id)
+			.map_err(|e| Error::Multisig(format!("session id: {}", e)))?;
+		let record = match load_session(wallet_data_dir, &session_key, &sid) {
+			Ok(r) => r,
+			Err(_) => continue,
+		};
+		if !record.is_expired(now) {
+			continue;
+		}
+		// Prefer full resume → unlock locked UTXOs when ceremony state is present.
+		if let Ok(state) = get_state(w, keychain_mask, &record.ceremony_id) {
+			let secp = Secp256k1::with_caps(ContextFlag::Commit);
+			if let Ok(quorum) = rebuild_quorum_from_record(&secp, &state, &record) {
+				if let Ok(mut neg) =
+					Negotiator::resume(&secp, &state.config.public_poly, &quorum, record.clone())
+				{
+					neg.abort("deadline exceeded");
+					unlock_session_utxos(w, keychain_mask, &neg)?;
+					save_session(wallet_data_dir, &session_key, &neg.record)?;
+					out.push(neg.status());
+					continue;
+				}
+			}
+		}
+		// Fallback: wipe secrets in place if resume is impossible.
+		let mut saved = record;
+		saved.phase = super::session::SessionPhase::Aborted;
+		saved.abort_reason = Some("deadline exceeded".into());
+		saved.secrets = None;
+		save_session(wallet_data_dir, &session_key, &saved)?;
+		out.push(SessionStatus {
+			session_id_hex: hex_id,
+			kind: saved.kind,
+			phase: saved.phase,
+			my_index: saved.my_index,
+			quorum_size: saved.quorum_x_hexes.len(),
+			collected: 0,
+			abort_reason: saved.abort_reason,
+		});
+	}
+	Ok(out)
 }
 
 fn rebuild_quorum_from_record(

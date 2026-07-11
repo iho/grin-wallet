@@ -421,6 +421,48 @@ subcommands:
                   long: max
                   takes_value: true
                   default_value: "1000"
+        - refresh-utxos:
+            about: Light refresh of tracked multisig UTXOs against the node UTXO set
+            args:
+              - ceremony:
+                  help: Optional ceremony UUID filter
+                  short: c
+                  long: ceremony
+                  takes_value: true
+        - select-utxos:
+            about: Greedy select spendable multisig UTXOs for an amount
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - amount:
+                  help: Target amount (nanogrins)
+                  long: amount
+                  takes_value: true
+                  required: true
+              - min_confirmations:
+                  help: Minimum confirmations (default 1)
+                  long: min-confirmations
+                  takes_value: true
+                  default_value: "1"
+        - plan-epoch-sweep:
+            about: List Unspent coins to migrate from an old ceremony (re-DKG plan)
+            args:
+              - ceremony:
+                  help: Source (old) ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - target_ceremony:
+                  help: Optional target (new) ceremony UUID
+                  long: target-ceremony
+                  takes_value: true
+        - expire-sessions:
+            about: Abort open multisig sessions past their deadline and unlock UTXOs
 
   - rewind_hash:
       about: Return the hash of the wallet root public key.

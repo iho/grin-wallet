@@ -2854,6 +2854,86 @@ where
 			max_outputs,
 		)
 	}
+
+	/// Light refresh of tracked multisig UTXOs against the node UTXO set.
+	pub fn multisig_refresh_utxos(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: Option<String>,
+	) -> Result<multisig::MultisigRefreshResult, Error> {
+		let cid = match ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::refresh_multisig_utxos(&mut **w, keychain_mask, cid.as_ref())
+	}
+
+	/// Select spendable multisig UTXOs for a target amount (greedy).
+	pub fn multisig_select_utxos(
+		&self,
+		_keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		amount: u64,
+		current_height: u64,
+		min_confirmations: u64,
+	) -> Result<(Vec<MultisigUtxo>, u64), Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::select_spendable_utxos(
+			&mut **w,
+			&multisig::CeremonyId(uuid),
+			amount,
+			current_height,
+			min_confirmations,
+		)
+	}
+
+	/// Plan an epoch sweep of Unspent coins from an old ceremony.
+	pub fn multisig_plan_epoch_sweep(
+		&self,
+		_keychain_mask: Option<&SecretKey>,
+		source_ceremony_id: String,
+		target_ceremony_id: Option<String>,
+	) -> Result<multisig::EpochSweepPlan, Error> {
+		let src = Uuid::parse_str(&source_ceremony_id)
+			.map(multisig::CeremonyId)
+			.map_err(|e| Error::GenericError(format!("bad source ceremony id: {}", e)))?;
+		let tgt = match target_ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad target ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::plan_epoch_sweep(&mut **w, &src, tgt.as_ref())
+	}
+
+	/// Abort open sessions past their deadline and unlock locked UTXOs.
+	pub fn multisig_expire_sessions(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+	) -> Result<Vec<SessionStatus>, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::expire_stale_sessions(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+		)
+	}
 }
 
 /// attempt to send slate synchronously with TOR
