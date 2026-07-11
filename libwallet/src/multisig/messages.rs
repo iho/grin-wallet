@@ -33,9 +33,10 @@ use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::pedersen::{Commitment, RangeProof};
 use crate::grin_util::secp::{Secp256k1, Signature};
 use crate::grin_util::{from_hex, ToHex};
-use crate::slatepack::{Slatepack, SlatepackAddress, SlatepackArmor};
+use crate::slatepack::{Slatepack, SlatepackAddress, SlatepackArmor, SlatepackBin};
 use crate::Error;
 use ed25519_dalek::SecretKey as EdSecretKey;
+use grin_wallet_util::byte_ser;
 use uuid::Uuid;
 
 use super::coin::CoinId;
@@ -375,8 +376,9 @@ impl MultisigEnvelope {
 		if &data[..MULTISIG_PAYLOAD_MAGIC.len()] != MULTISIG_PAYLOAD_MAGIC {
 			return Err(Error::Multisig("missing GMS1 magic".into()));
 		}
-		let env: MultisigEnvelope = serde_json::from_slice(&data[MULTISIG_PAYLOAD_MAGIC.len()..])
-			.map_err(|e| Error::Multisig(format!("envelope parse: {}", e)))?;
+		let env: MultisigEnvelope =
+			serde_json::from_slice(&data[MULTISIG_PAYLOAD_MAGIC.len()..])
+				.map_err(|e| Error::Multisig(format!("envelope parse: {}", e)))?;
 		if env.version != MULTISIG_MSG_VERSION {
 			return Err(Error::Multisig(format!(
 				"unsupported multisig msg version {}",
@@ -413,6 +415,23 @@ impl MultisigEnvelope {
 	) -> Result<Self, Error> {
 		slatepack.try_decrypt_payload(dec_key)?;
 		Self::from_payload_bytes(&slatepack.payload)
+	}
+
+	/// Decode an armored Slatepack string and extract the envelope, decrypting
+	/// the payload with `dec_key` when it was encrypted to a recipient.
+	///
+	/// This is the counterpart to [`MultisigEnvelope::to_armored_string`] and is
+	/// how an actor ingests an age-encrypted DKG share delivery (C-02).
+	pub fn from_armored_string(
+		armored: &str,
+		dec_key: Option<&EdSecretKey>,
+	) -> Result<Self, Error> {
+		let raw = SlatepackArmor::decode(armored.trim().as_bytes())
+			.map_err(|e| Error::Multisig(format!("slatepack de-armor: {}", e)))?;
+		let mut sp: Slatepack = byte_ser::from_bytes::<SlatepackBin>(&raw)
+			.map_err(|e| Error::Multisig(format!("slatepack deser: {:?}", e)))?
+			.0;
+		Self::from_slatepack(&mut sp, dec_key)
 	}
 
 	/// Armor as slatepack string (optionally encrypted first).
@@ -475,9 +494,7 @@ pub fn parse_dkg_contribution(
 	let coefficients: Result<Vec<Vec<u8>>, Error> = msg
 		.commitment_hexes
 		.iter()
-		.map(|h| {
-			from_hex(h).map_err(|e| Error::Multisig(format!("commit hex: {}", e)))
-		})
+		.map(|h| from_hex(h).map_err(|e| Error::Multisig(format!("commit hex: {}", e))))
 		.collect();
 	let coefficients = coefficients?;
 	let pops: Result<Vec<PopProof>, Error> = msg
@@ -727,8 +744,8 @@ mod tests {
 	use crate::multisig::dkg::{generate_dealer_contribution, run_dkg_local};
 	use crate::multisig::kernel::run_kernel_sign_local;
 	use crate::multisig::rangeproof::run_rangeproof_local;
-	use crate::multisig::types::{ActorId, CeremonyId, ThresholdParams};
 	use crate::multisig::share::ActorPoint;
+	use crate::multisig::types::{ActorId, CeremonyId, ThresholdParams};
 
 	#[test]
 	fn envelope_json_roundtrip() {
@@ -784,8 +801,7 @@ mod tests {
 			.collect();
 		let coin = CoinId::new(1, 1000);
 		let (proof, rp_params) =
-			run_rangeproof_local(&secp, &states[0].config.public_poly, &q, &coin, None)
-				.unwrap();
+			run_rangeproof_local(&secp, &states[0].config.public_poly, &q, &coin, None).unwrap();
 
 		// RP final message
 		let env = build_rp_final(
@@ -875,10 +891,61 @@ mod tests {
 				x_hex: "02".repeat(32),
 			}),
 		);
-		let sp = env
-			.to_encrypted_slatepack(None, vec![recipient])
-			.unwrap();
+		let sp = env.to_encrypted_slatepack(None, vec![recipient]).unwrap();
 		assert_eq!(sp.mode, 1);
 		assert!(!sp.payload.is_empty());
+	}
+
+	#[test]
+	fn encrypted_share_export_import_roundtrip() {
+		use crate::grin_core::global;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+
+		// Recipient address with a known ed25519 secret key (so we can decrypt).
+		let seed = [7u8; 32];
+		let rcpt_sk = EdSecretKey::from_bytes(&seed).unwrap();
+		let rcpt_pk = ed25519_dalek::PublicKey::from(&rcpt_sk);
+		let rcpt_addr = crate::SlatepackAddress::new(&rcpt_pk);
+		let recipient = ActorId::from_slatepack_address(&rcpt_addr).unwrap();
+
+		// Address-backed id resolves back to the same address.
+		assert_eq!(
+			String::try_from(&recipient.slatepack_address().unwrap()).unwrap(),
+			String::try_from(&rcpt_addr).unwrap()
+		);
+
+		let share_hex = "ab".repeat(32);
+		let env = MultisigEnvelope::new(
+			CeremonyId::new(),
+			ActorId::from_index(0),
+			MultisigBody::DkgPartialShare(DkgPartialShareMsg {
+				recipient: recipient.clone(),
+				share_index: 0,
+				share_hex: share_hex.clone(),
+				x_hex: "02".repeat(32),
+			}),
+		);
+
+		let armored = env
+			.to_armored_string(None, vec![rcpt_addr.clone()])
+			.unwrap();
+		// The armored blob must not leak the plaintext share scalar.
+		assert!(!armored.contains(&share_hex));
+
+		// Recipient decrypts and recovers the exact share.
+		let back = MultisigEnvelope::from_armored_string(&armored, Some(&rcpt_sk)).unwrap();
+		match back.body {
+			MultisigBody::DkgPartialShare(m) => {
+				assert_eq!(m.share_hex, share_hex);
+				assert_eq!(m.recipient.id, recipient.id);
+			}
+			_ => panic!("expected DkgPartialShare"),
+		}
+	}
+
+	#[test]
+	fn index_actor_has_no_slatepack_address() {
+		// Index-based (dev) actors cannot be encrypted-share recipients.
+		assert!(ActorId::from_index(3).slatepack_address().is_err());
 	}
 }

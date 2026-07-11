@@ -1003,6 +1003,12 @@ pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, P
 		file: sub_args.value_of("file").map(|s| s.to_owned()),
 		out: sub_args.value_of("out").map(|s| s.to_owned()),
 		out_dir: sub_args.value_of("dir").map(|s| s.to_owned()),
+		addresses: sub_args.value_of("addresses").map(|s| {
+			s.split(',')
+				.map(|a| a.trim().to_owned())
+				.filter(|a| !a.is_empty())
+				.collect()
+		}),
 	})
 }
 

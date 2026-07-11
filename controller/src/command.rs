@@ -1492,6 +1492,9 @@ pub struct MultisigArgs {
 	pub file: Option<String>,
 	pub out: Option<String>,
 	pub out_dir: Option<String>,
+	/// Ordered Slatepack addresses of all actors (multi-party roster). Enables
+	/// encrypted share delivery; all parties must supply the same list.
+	pub addresses: Option<Vec<String>>,
 }
 
 fn msig_wallet_data_dir<L, C, K>(owner_api: &Owner<L, C, K>) -> Result<String, Error>
@@ -1500,7 +1503,9 @@ where
 	C: NodeClient + 'static,
 	K: keychain::Keychain + 'static,
 {
-	let tld = owner_api.get_top_level_directory().map_err(Error::LibWallet)?;
+	let tld = owner_api
+		.get_top_level_directory()
+		.map_err(Error::LibWallet)?;
 	let dir = libwallet::multisig::wallet_data_dir(&tld);
 	Ok(dir.display().to_string())
 }
@@ -1583,10 +1588,7 @@ where
 					"Threshold:   {}-of-{}",
 					st.config.params.threshold, st.config.params.total_actors
 				);
-				println!(
-					"Shares/actor:{}",
-					st.config.params.shares_per_actor
-				);
+				println!("Shares/actor:{}", st.config.params.shares_per_actor);
 				println!(
 					"My actor:    {} ({})",
 					st.my_actor.label,
@@ -1649,14 +1651,11 @@ where
 			} else {
 				let wdata = msig_wallet_data_dir(owner_api)?;
 				let key = msig_pending_key(owner_api, keychain_mask)?;
-				let out = args
-					.out
-					.unwrap_or_else(|| "msig_contrib.json".to_owned());
+				let out = args.out.unwrap_or_else(|| "msig_contrib.json".to_owned());
 				let ceremony = match args.ceremony_id.as_ref() {
 					Some(s) => {
-						let u = Uuid::parse_str(s).map_err(|e| {
-							Error::ArgumentError(format!("bad ceremony id: {}", e))
-						})?;
+						let u = Uuid::parse_str(s)
+							.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
 						Some(libwallet::multisig::CeremonyId(u))
 					}
 					None => None,
@@ -1668,6 +1667,7 @@ where
 					total,
 					my_index,
 					args.shares_per_actor,
+					args.addresses.clone(),
 					ceremony,
 					&out,
 				)
@@ -1682,9 +1682,13 @@ where
 					"  grin-wallet multisig init -m {} -n {} --index <i> --ceremony-id {} -o contrib_i.json",
 					threshold, total, pending.ceremony_id.0
 				);
-				println!("  grin-wallet multisig import-contrib -i contrib_j.json  (for each peer)");
+				println!(
+					"  grin-wallet multisig import-contrib -i contrib_j.json  (for each peer)"
+				);
 				println!("  grin-wallet multisig export-shares -d shares_out/");
-				println!("  grin-wallet multisig import-share -i share_file.json  (from each peer)");
+				println!(
+					"  grin-wallet multisig import-share -i share_file.json  (from each peer)"
+				);
 				println!("  grin-wallet multisig finalize");
 			}
 		}
@@ -1722,8 +1726,7 @@ where
 				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
 			let wdata = msig_wallet_data_dir(owner_api)?;
 			let key = msig_pending_key(owner_api, keychain_mask)?;
-			let env =
-				libwallet::multisig::read_envelope_file(&file).map_err(Error::LibWallet)?;
+			let env = libwallet::multisig::read_envelope_file(&file).map_err(Error::LibWallet)?;
 			let p = libwallet::multisig::dkg_import_contrib(&wdata, &key, &env)
 				.map_err(Error::LibWallet)?;
 			let got: usize = p.contributions.iter().filter(|c| c.is_some()).count();
@@ -1735,14 +1738,25 @@ where
 		"export-shares" => {
 			let wdata = msig_wallet_data_dir(owner_api)?;
 			let key = msig_pending_key(owner_api, keychain_mask)?;
-			let out_dir = args.out_dir.unwrap_or_else(|| "msig_shares".to_owned());
-			let paths = libwallet::multisig::dkg_export_shares(&wdata, &key, &out_dir)
+			let sender_addr = owner_api
+				.get_slatepack_address(keychain_mask, 0)
 				.map_err(Error::LibWallet)?;
-			println!("Wrote {} share file(s) under {}:", paths.len(), out_dir);
+			let out_dir = args.out_dir.unwrap_or_else(|| "msig_shares".to_owned());
+			let paths =
+				libwallet::multisig::dkg_export_shares(&wdata, &key, &sender_addr, &out_dir)
+					.map_err(Error::LibWallet)?;
+			println!(
+				"Wrote {} encrypted share file(s) under {}:",
+				paths.len(),
+				out_dir
+			);
 			for p in paths {
 				println!("  {}", p);
 			}
-			println!("Deliver each file securely to the named actor (prefer age-encrypted slatepack).");
+			println!(
+				"Each file is an age-encrypted slatepack addressed to one actor; \
+				 deliver it to that actor and import with `multisig import-share`."
+			);
 		}
 		"import-share" => {
 			let file = args
@@ -1750,8 +1764,11 @@ where
 				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
 			let wdata = msig_wallet_data_dir(owner_api)?;
 			let key = msig_pending_key(owner_api, keychain_mask)?;
-			let env =
-				libwallet::multisig::read_envelope_file(&file).map_err(Error::LibWallet)?;
+			let dec_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			let env = libwallet::multisig::read_encrypted_share_file(&file, &dec_key)
+				.map_err(Error::LibWallet)?;
 			let p = libwallet::multisig::dkg_import_share(&wdata, &key, &env)
 				.map_err(Error::LibWallet)?;
 			let shares_got: usize = p.my_share_ys_hex.iter().filter(|s| s.is_some()).count();
@@ -1787,7 +1804,10 @@ where
 				let w = w_lock.lc_provider()?.wallet_inst()?;
 				let st = libwallet::multisig::get_state(&mut **w, m, &ceremony)?;
 				libwallet::multisig::export_state_json(&st, &out)?;
-				println!("Exported state (SENSITIVE — contains share material) to {}", out);
+				println!(
+					"Exported state (SENSITIVE — contains share material) to {}",
+					out
+				);
 				Ok(())
 			})?;
 		}

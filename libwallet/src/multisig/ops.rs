@@ -24,8 +24,10 @@ use crate::grin_keychain::Keychain;
 use crate::grin_util::secp::key::SecretKey;
 use crate::grin_util::secp::{ContextFlag, Secp256k1};
 use crate::grin_util::ToHex;
+use crate::slatepack::SlatepackAddress;
 use crate::types::WalletBackend;
 use crate::Error;
+use ed25519_dalek::SecretKey as EdSecretKey;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -138,8 +140,8 @@ pub fn save_pending(
 ) -> Result<(), Error> {
 	ensure_multisig_dir(wallet_data_dir)?;
 	let p = pending_path(wallet_data_dir);
-	let plaintext = serde_json::to_vec(pending)
-		.map_err(|e| Error::Multisig(format!("ser pending: {}", e)))?;
+	let plaintext =
+		serde_json::to_vec(pending).map_err(|e| Error::Multisig(format!("ser pending: {}", e)))?;
 	let blob = super::store::seal_pending(key, &plaintext)?;
 	let mut f = File::create(&p).map_err(|e| Error::Multisig(format!("create pending: {}", e)))?;
 	f.write_all(&blob)
@@ -268,6 +270,7 @@ pub fn dkg_start(
 	total: usize,
 	my_index: usize,
 	shares_per_actor: Option<usize>,
+	addresses: Option<Vec<String>>,
 	ceremony_id: Option<CeremonyId>,
 	out_contrib_path: &str,
 ) -> Result<PendingDkg, Error> {
@@ -284,17 +287,33 @@ pub fn dkg_start(
 	let params = ThresholdParams::with_shares_per_actor(threshold, total, spa)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let ceremony = ceremony_id.unwrap_or_else(CeremonyId::new);
-	let actors: Vec<_> = (0..total as u32).map(ActorId::from_index).collect();
+	// Address-based roster enables encrypted share delivery (C-02). All parties
+	// must agree on the same ordered roster so x-coordinates align. The
+	// index-only fallback is dev/local-sim and cannot export shares.
+	let actors: Vec<ActorId> = match &addresses {
+		Some(list) => {
+			if list.len() != total {
+				return Err(Error::Multisig(format!(
+					"expected {} actor addresses, got {}",
+					total,
+					list.len()
+				)));
+			}
+			let mut v = Vec::with_capacity(total);
+			for s in list {
+				let addr = SlatepackAddress::try_from(s.as_str())
+					.map_err(|e| Error::Multisig(format!("bad actor address '{}': {}", s, e)))?;
+				v.push(ActorId::from_slatepack_address(&addr)?);
+			}
+			v
+		}
+		None => (0..total as u32).map(ActorId::from_index).collect(),
+	};
 	let my_actor = actors[my_index].clone();
 
 	let (secrets, contrib) =
 		generate_dealer_contribution(&secp, &ceremony, my_actor.clone(), &params)?;
-	verify_pop(
-		&secp,
-		&ceremony,
-		&contrib,
-		params.num_coefficients(),
-	)?;
+	verify_pop(&secp, &ceremony, &contrib, params.num_coefficients())?;
 
 	let mut contributions = vec![None; total];
 	contributions[my_index] = Some(StoredContribution {
@@ -324,13 +343,7 @@ pub fn dkg_start(
 	};
 	save_pending(wallet_data_dir, key, &pending)?;
 
-	let env = build_dkg_contribution(
-		&secp,
-		ceremony,
-		my_actor,
-		params,
-		&contrib,
-	)?;
+	let env = build_dkg_contribution(&secp, ceremony, my_actor, params, &contrib)?;
 	write_envelope_file(out_contrib_path, &env)?;
 	Ok(pending)
 }
@@ -348,11 +361,7 @@ pub fn dkg_import_contrib(
 	}
 	let msg = match &envelope.body {
 		MultisigBody::DkgContribution(m) => m,
-		_ => {
-			return Err(Error::Multisig(
-				"envelope is not a DkgContribution".into(),
-			))
-		}
+		_ => return Err(Error::Multisig("envelope is not a DkgContribution".into())),
 	};
 	let actor = envelope.sender.clone();
 	let idx = pending
@@ -402,10 +411,16 @@ fn all_contributions_ready(pending: &PendingDkg) -> bool {
 
 /// After all contributions are collected, export partial shares for every other actor.
 ///
-/// Writes one envelope JSON per recipient: `{out_dir}/share_to_{label}.json`.
+/// Each partial share is a **secret** dealer evaluation, so it is written as an
+/// age-encrypted, armored Slatepack addressed to the recipient actor
+/// (`{out_dir}/share_to_actor{i}_s{k}.slatepack`) — never plaintext (C-02).
+/// This requires an address-based roster; an index-only roster (dev/local-sim)
+/// is rejected because such actors have no encryption key. `sender_address` is
+/// this wallet's own Slatepack address, stamped on the outgoing packs.
 pub fn dkg_export_shares(
 	wallet_data_dir: &str,
 	key: &PendingKey,
+	sender_address: &SlatepackAddress,
 	out_dir: &str,
 ) -> Result<Vec<String>, Error> {
 	let pending = load_pending(wallet_data_dir, key)?
@@ -415,6 +430,17 @@ pub fn dkg_export_shares(
 			"not all DKG contributions received yet".into(),
 		));
 	}
+
+	// Fail before writing anything if any recipient lacks a Slatepack address.
+	let mut recipients = Vec::with_capacity(pending.actors.len());
+	for (i, actor) in pending.actors.iter().enumerate() {
+		if i == pending.my_index {
+			recipients.push(None);
+			continue;
+		}
+		recipients.push(Some(actor.slatepack_address()?));
+	}
+
 	fs::create_dir_all(out_dir).map_err(|e| Error::Multisig(format!("mkdir: {}", e)))?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let secrets = restore_dealer_secrets(&pending)?;
@@ -425,8 +451,9 @@ pub fn dkg_export_shares(
 		if i == pending.my_index {
 			continue;
 		}
-		// For multi-share actors, export one message per share_index (or pack together).
-		// Export one combined file with first share only if shares_per_actor==1; else multiple.
+		let recipient_addr = recipients[i]
+			.clone()
+			.expect("recipient address resolved above");
 		for share_index in 0..pending.params.shares_per_actor {
 			let x = actor.x_coordinate_share(&secp, share_index)?;
 			let y = dealer_partial_share(&secp, &secrets, &x)?;
@@ -438,11 +465,14 @@ pub fn dkg_export_shares(
 				&y,
 				&x,
 			);
-			let path = Path::new(out_dir).join(format!(
-				"share_to_{}_s{}.json",
-				actor.label, share_index
-			));
-			write_envelope_file(path.to_str().unwrap(), &env)?;
+			let armored =
+				env.to_armored_string(Some(sender_address.clone()), vec![recipient_addr.clone()])?;
+			let path =
+				Path::new(out_dir).join(format!("share_to_actor{}_s{}.slatepack", i, share_index));
+			let mut f = File::create(&path)
+				.map_err(|e| Error::Multisig(format!("create share file: {}", e)))?;
+			f.write_all(armored.as_bytes())
+				.map_err(|e| Error::Multisig(format!("write share file: {}", e)))?;
 			paths.push(path.display().to_string());
 		}
 	}
@@ -526,8 +556,7 @@ where
 			.commitment_hexes
 			.iter()
 			.map(|h| {
-				crate::grin_util::from_hex(h)
-					.map_err(|e| Error::Multisig(format!("hex: {}", e)))
+				crate::grin_util::from_hex(h).map_err(|e| Error::Multisig(format!("hex: {}", e)))
 			})
 			.collect();
 		let pp = PublicPoly {
@@ -563,11 +592,7 @@ where
 				share_index
 			)));
 		}
-		shares.push(SecretShare {
-			share_index,
-			x,
-			y,
-		});
+		shares.push(SecretShare { share_index, x, y });
 	}
 
 	let state = MultisigWalletState {
@@ -614,6 +639,19 @@ pub fn read_envelope_file(path: &str) -> Result<MultisigEnvelope, Error> {
 		.or_else(|_| MultisigEnvelope::from_payload_bytes(s.as_bytes()))
 }
 
+/// Read an age-encrypted, armored Slatepack share file and decrypt it to the
+/// underlying envelope using this wallet's Slatepack secret key (C-02).
+pub fn read_encrypted_share_file(
+	path: &str,
+	dec_key: &EdSecretKey,
+) -> Result<MultisigEnvelope, Error> {
+	let mut f = File::open(path).map_err(|e| Error::Multisig(format!("open share: {}", e)))?;
+	let mut s = String::new();
+	f.read_to_string(&mut s)
+		.map_err(|e| Error::Multisig(format!("read share: {}", e)))?;
+	MultisigEnvelope::from_armored_string(&s, Some(dec_key))
+}
+
 /// Export a completed ceremony state as JSON (plaintext shares — sensitive!).
 pub fn export_state_json(state: &MultisigWalletState, path: &str) -> Result<(), Error> {
 	let s = serde_json::to_string_pretty(state)
@@ -639,8 +677,8 @@ where
 	let mut s = String::new();
 	f.read_to_string(&mut s)
 		.map_err(|e| Error::Multisig(format!("read: {}", e)))?;
-	let state: MultisigWalletState = serde_json::from_str(&s)
-		.map_err(|e| Error::Multisig(format!("parse state: {}", e)))?;
+	let state: MultisigWalletState =
+		serde_json::from_str(&s).map_err(|e| Error::Multisig(format!("parse state: {}", e)))?;
 	state.config.validate()?;
 	let mut batch = w.batch(keychain_mask)?;
 	batch.save_multisig_state(&state)?;

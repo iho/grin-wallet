@@ -16,7 +16,9 @@
 
 use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::Secp256k1;
+use crate::slatepack::SlatepackAddress;
 use crate::Error;
+use std::convert::TryFrom;
 use uuid::Uuid;
 
 use super::poly::PublicPoly;
@@ -137,6 +139,10 @@ impl ActorId {
 	}
 
 	/// Deterministic id from a simple index (avoids address grinding).
+	///
+	/// **Dev / local-sim only.** Index-based actors have no Slatepack address,
+	/// so they cannot receive encrypted share deliveries; real multi-party
+	/// ceremonies must use [`ActorId::from_slatepack_address`].
 	pub fn from_index(index: u32) -> Self {
 		let mut id = b"actor-index:".to_vec();
 		id.extend_from_slice(&index.to_be_bytes());
@@ -144,6 +150,37 @@ impl ActorId {
 			id,
 			label: format!("actor-{}", index),
 		}
+	}
+
+	/// Create an actor identity from a Slatepack address (production model).
+	///
+	/// The address's canonical bech32 encoding becomes the identity bytes, so
+	/// the polynomial x-coordinate is `Hash_s("actor-" || addr)` per RFC-0023
+	/// and the same bytes let peers age-encrypt share deliveries to this actor.
+	pub fn from_slatepack_address(addr: &SlatepackAddress) -> Result<Self, Error> {
+		let s = String::try_from(addr)
+			.map_err(|e| Error::Multisig(format!("encode slatepack address: {}", e)))?;
+		Ok(Self {
+			id: s.clone().into_bytes(),
+			label: s,
+		})
+	}
+
+	/// Resolve this actor's Slatepack address, if the identity is address-backed.
+	///
+	/// Errors for index-based ids ([`ActorId::from_index`]), which cannot be a
+	/// share-delivery recipient (C-02).
+	pub fn slatepack_address(&self) -> Result<SlatepackAddress, Error> {
+		let s = std::str::from_utf8(&self.id).map_err(|_| {
+			Error::Multisig("actor id is not a slatepack address (non-utf8)".into())
+		})?;
+		SlatepackAddress::try_from(s).map_err(|e| {
+			Error::Multisig(format!(
+				"actor id is not a slatepack address ({}); \
+				 encrypted share delivery requires an address-based roster",
+				e
+			))
+		})
 	}
 
 	/// Polynomial x-coordinate for this actor (share index base).

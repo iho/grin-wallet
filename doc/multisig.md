@@ -157,13 +157,20 @@ let armored = env.to_armored_string(None, vec![])?;
 # Dev: full DKG on one machine, store this actor in wallet DB
 grin-wallet multisig init --local-sim -m 2 -n 3 --index 0
 
-# Multi-party DKG (all actors agree on ceremony-id after first start)
-grin-wallet multisig init -m 2 -n 3 --index 0 -o contrib0.json
-# peers:
-grin-wallet multisig init -m 2 -n 3 --index 1 --ceremony-id <UUID> -o contrib1.json
-grin-wallet multisig import-contrib -i contrib1.json   # each imports others
-grin-wallet multisig export-shares -d shares/
-grin-wallet multisig import-share -i shares/share_to_actor-0_s0.json
+# Multi-party DKG.
+# Each actor first publishes their index-0 slatepack address:
+grin-wallet address    # -> grin1... / tgrin1...
+# The initiator passes the full ordered roster of addresses so shares can be
+# encrypted to each actor (C-02). Every party must pass the SAME --addresses
+# list in the SAME order, and the same ceremony-id.
+grin-wallet multisig init -m 2 -n 3 --index 0 \
+  --addresses tgrin1aaa...,tgrin1bbb...,tgrin1ccc... -o contrib0.json
+# peers (same roster + ceremony-id, their own index):
+grin-wallet multisig init -m 2 -n 3 --index 1 --ceremony-id <UUID> \
+  --addresses tgrin1aaa...,tgrin1bbb...,tgrin1ccc... -o contrib1.json
+grin-wallet multisig import-contrib -i contrib1.json   # each imports others (public)
+grin-wallet multisig export-shares -d shares/          # writes *.slatepack, age-encrypted
+grin-wallet multisig import-share -i shares/share_to_actor0_s0.slatepack
 grin-wallet multisig finalize
 
 grin-wallet multisig list

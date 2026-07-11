@@ -87,9 +87,10 @@ These are **new findings from reading the working-tree code**, complementary to 
 `tx.rs:305` (`run_demo_tx`) called `global::set_local_chain_type(ChainTypes::AutomatedTesting)`, reachable from the **Owner JSON-RPC** via `multisig_demo_tx`. On a live wallet handler thread this installed a thread-local override that silently reconfigured consensus parameters for every subsequent operation on that thread.
 **Resolution:** the global mutation was removed from `run_demo_tx`; the demo now runs under whatever chain type the host already configured (always set inside a running wallet). Chain-type setup moved into the unit test that needed it; the Owner API method carries an explicit dev-only warning. Verified: 32/32 multisig tests pass.
 
-### C-02 — DKG partial shares written to disk in plaintext — **Critical (secrets)**
-`ops.rs::dkg_export_shares` (lines 383–426) writes raw dealer partial evaluations (`share_hex`) as plaintext JSON files. δ-masking is implemented in `share.rs` but **not applied** in this path, and age encryption exists in `messages.rs::to_encrypted_slatepack` but is not used. Anyone who reads the export directory (or the files in transit) learns dealer partials; M of them reconstruct shares.
-**Fix (WS3/WS5):** exporting a `DkgPartialShare` must be impossible without age encryption to the recipient; apply δ-masking to production share delivery; shred plaintext temp files.
+### C-02 — DKG partial shares written to disk in plaintext — **Critical (secrets)** — ✅ FIXED
+`ops.rs::dkg_export_shares` wrote raw dealer partial evaluations (`share_hex`) as plaintext JSON files; age encryption existed in `messages.rs` but was unused, because index-based actor ids carried no recipient key.
+**Resolution:** adopted the RFC-0023 identity model — actors in a multi-party ceremony are identified by their **Slatepack address** (`ActorId::from_slatepack_address` / `slatepack_address()`; `from_index` remains dev/local-sim only). `dkg_export_shares` now resolves each recipient's address and writes an **age-encrypted, armored Slatepack** (`share_to_actor{i}_s{k}.slatepack`), refusing to run at all on an index-only roster — so a plaintext share can no longer be written. Import decrypts with the wallet's Slatepack secret key (`read_encrypted_share_file` → `MultisigEnvelope::from_armored_string`). The roster is supplied via `multisig init --addresses` (each actor's index-0 address, same ordered list for all parties). Verified: encrypt→decrypt roundtrip recovers the exact share, the armored blob does not contain the plaintext, and index actors are rejected (37/37 multisig tests).
+**Residual (tracked under WS2):** δ-masking is still not applied to the delivered partials (defense against a malicious near-quorum during add-actor, F-03); envelope authentication/replay protection is C-04.
 
 ### C-03 — Dealer secret coefficients persisted in plaintext pending file — **Critical (secrets)** — ✅ FIXED
 `PendingDkg` stored `my_coeff_hexes` (the dealer's secret polynomial) and accumulated share sums (`my_share_ys_hex`) as hex in a JSON file in the wallet data dir. A file-system read during the (possibly days-long) ceremony window leaked the dealer's entire contribution.
@@ -257,8 +258,8 @@ Rules to adopt from Beam `MultiTx`: barriers (never reveal a finalizable secret 
 ## 6. Prioritized backlog
 
 **P0 — before any real value (testnet with meaningful amounts included):**
-1. C-01 chain-type footgun removal.
-2. C-02/C-03 plaintext secrets on disk.
+1. ✅ C-01 chain-type footgun removal.
+2. ✅ C-02/C-03 plaintext secrets on disk (pending file AEAD-encrypted; share export age-encrypted to recipient addresses).
 3. C-04 envelope authentication + replay protection.
 4. WS1 spec freeze (incl. C-07 canonical transcript, C-11 degree floor, C-13 add-actor removal).
 5. WS2 FROST kernel + verifiable τ (C-05/C-06).

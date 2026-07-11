@@ -100,6 +100,10 @@ subcommands:
                   help: Join an existing ceremony UUID (multi-party)
                   long: ceremony-id
                   takes_value: true
+              - addresses:
+                  help: "Comma-separated Slatepack addresses of all N actors, in roster order (enables encrypted share delivery; all parties must pass the same list)"
+                  long: addresses
+                  takes_value: true
               - local_sim:
                   help: Run full DKG locally and save this actor (dev only)
                   long: local-sim

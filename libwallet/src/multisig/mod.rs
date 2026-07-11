@@ -70,8 +70,8 @@ pub use messages::{
 pub use ops::{
 	clear_pending, delete_ceremony, dkg_export_shares, dkg_finalize, dkg_import_contrib,
 	dkg_import_share, dkg_start, export_state_json, get_state, import_state_json, init_local_sim,
-	list_ceremonies, load_pending, read_envelope_file, wallet_data_dir, write_envelope_file,
-	CeremonySummary, PendingDkg, PendingKey,
+	list_ceremonies, load_pending, read_encrypted_share_file, read_envelope_file, wallet_data_dir,
+	write_envelope_file, CeremonySummary, PendingDkg, PendingKey,
 };
 pub use poly::{eval_public_poly, eval_secret_poly, verify_share, PublicPoly, SecretPoly};
 pub use rangeproof::{
@@ -82,8 +82,8 @@ pub use rangeproof::{
 };
 pub use scalar::{hash_to_scalar, sk_add, sk_from_bytes, sk_mul, sk_neg, sk_sub, HashDomain};
 pub use share::{
-	add_actor_masked_share, delta_mask, lagrange_coefficient, partial_key_at, reconstruct_secret_at,
-	unmask_sum, ActorPoint,
+	add_actor_masked_share, delta_mask, lagrange_coefficient, partial_key_at,
+	reconstruct_secret_at, unmask_sum, ActorPoint,
 };
 pub use store::{
 	ceremony_id_from_db_key, decrypt_from_storage, derive_pending_key, encrypt_for_storage,
@@ -91,8 +91,8 @@ pub use store::{
 };
 pub use tx::{
 	build_multisig_spend, build_self_send, create_multisig_output, demo_fund_and_spend,
-	quorum_from_state, quorum_from_states, run_demo_tx, tx_from_hex, tx_to_hex, MultisigDemoTxResult,
-	MultisigOutput, MultisigSpendResult,
+	quorum_from_state, quorum_from_states, run_demo_tx, tx_from_hex, tx_to_hex,
+	MultisigDemoTxResult, MultisigOutput, MultisigSpendResult,
 };
 pub use types::{
 	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,
