@@ -2952,6 +2952,62 @@ where
 			&session_id_hex,
 		)
 	}
+
+	/// Start a durable DKG session (index roster; experimental).
+	pub fn multisig_session_dkg_create(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		threshold: usize,
+		total: usize,
+		my_index: usize,
+		shares_per_actor: Option<usize>,
+		ceremony_id: Option<String>,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let cid = match ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_dkg_create_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			threshold,
+			total,
+			my_index,
+			shares_per_actor,
+			cid,
+			&session_tag,
+		)
+	}
+
+	/// Finalize a completed DKG session into LMDB ceremony state.
+	pub fn multisig_session_dkg_finalize(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		delete_session_file: bool,
+	) -> Result<MultisigWalletState, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_dkg_finalize(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&session_id_hex,
+			delete_session_file,
+		)
+	}
 }
 
 /// attempt to send slate synchronously with TOR

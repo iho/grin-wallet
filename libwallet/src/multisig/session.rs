@@ -62,13 +62,17 @@ use super::kernel::{
 	verify_partial_excess, ActorKernelSecrets, AggregatedKernelPubs, KernelSession,
 	SigningCommitment,
 };
+use super::dkg::{
+	dealer_partial_share, generate_dealer_contribution, verify_pop, DealerSecrets,
+};
 use super::messages::{
-	build_kernel_final, build_kernel_partial_sig, build_kernel_signing_commit, build_rp_final,
-	build_rp_round1, build_rp_round2, parse_kernel_signing_commit, parse_rp_round1,
+	build_dkg_contribution, build_dkg_partial_share, build_kernel_final,
+	build_kernel_partial_sig, build_kernel_signing_commit, build_rp_final, build_rp_round1,
+	build_rp_round2, parse_dkg_contribution, parse_kernel_signing_commit, parse_rp_round1,
 	proof_from_hex, proof_to_hex, pubkey_from_hex, seckey_from_hex, seckey_to_hex, MultisigBody,
 	MultisigEnvelope,
 };
-use super::poly::PublicPoly;
+use super::poly::{verify_share, PublicPoly, SecretPoly};
 use super::rangeproof::{
 	aggregate_round1, aggregate_tau_verified, expected_pub_blind_for_actor, rangeproof_finalize,
 	rangeproof_params_for_coin, rangeproof_round1, rangeproof_round2, verify_rangeproof,
@@ -76,7 +80,10 @@ use super::rangeproof::{
 };
 use super::share::{canonical_quorum, quorum_transcript, ActorPoint};
 use super::store::{open_pending, seal_pending};
-use super::types::{ActorId, CeremonyId};
+use super::types::{
+	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,
+};
+use super::scalar::sk_from_u64;
 
 /// Max envelope JSON size accepted by the negotiator (C-12 lite).
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
@@ -155,6 +162,8 @@ pub enum SessionKind {
 	CreateOutput,
 	/// Spend multisig inputs (FROST kernel signing).
 	Spend,
+	/// Joint Feldman DKG (contributions + private partial shares).
+	Dkg,
 }
 
 /// Protocol phase (ordered).
@@ -170,10 +179,57 @@ pub enum SessionPhase {
 	KernelRound1,
 	/// Collecting kernel partial signatures.
 	KernelRound2,
+	/// Collecting public DKG contributions.
+	DkgContrib,
+	/// Collecting private DKG partial shares.
+	DkgShares,
 	/// Local work complete; result available.
 	Complete,
 	/// Aborted; secrets wiped.
 	Aborted,
+}
+
+/// Durable DKG state nested in a session record (WS4).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct DkgSessionState {
+	/// Threshold params.
+	pub params: super::types::ThresholdParams,
+	/// Collected contributions by roster index.
+	pub contributions: Vec<Option<DkgContribWire>>,
+	/// This dealer's secret coefficients (hex) — wiped on Complete/Abort.
+	pub my_coeff_hexes: Vec<String>,
+	/// Accumulated imported partials per share_index (hex).
+	pub my_share_ys_hex: Vec<Option<String>>,
+	/// Dealer indices already applied per share_index (replay guard).
+	#[serde(default)]
+	pub applied_share_dealers: Vec<Vec<usize>>,
+	/// Whether we have emitted our partial shares for peers.
+	#[serde(default)]
+	pub shares_exported: bool,
+}
+
+impl std::fmt::Debug for DkgSessionState {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("DkgSessionState")
+			.field("params", &self.params)
+			.field("contributions", &self.contributions)
+			.field("my_coeff_hexes", &"[redacted]")
+			.field("my_share_ys_hex", &"[redacted]")
+			.field("applied_share_dealers", &self.applied_share_dealers)
+			.field("shares_exported", &self.shares_exported)
+			.finish()
+	}
+}
+
+/// Wire form of one public DKG contribution.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DkgContribWire {
+	/// Dealer actor.
+	pub actor: ActorId,
+	/// Commitment compressed hexes.
+	pub commitment_hexes: Vec<String>,
+	/// PoP DER hexes.
+	pub pop_sig_hexes: Vec<String>,
 }
 
 /// High-level status returned to CLI / API.
@@ -274,6 +330,9 @@ pub struct SessionRecord {
 	/// Optional hard deadline (unix seconds). After this, the session should abort.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub deadline_unix: Option<u64>,
+	/// Nested DKG state (only for [`SessionKind::Dkg`]).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub dkg: Option<DkgSessionState>,
 }
 
 impl SessionRecord {
@@ -466,6 +525,23 @@ impl Negotiator {
 			SessionPhase::RpRound2 => self.record.rp_tau.len(),
 			SessionPhase::KernelRound1 => self.record.kern_commits.len(),
 			SessionPhase::KernelRound2 => self.record.kern_partials.len(),
+			SessionPhase::DkgContrib => self
+				.record
+				.dkg
+				.as_ref()
+				.map(|d| d.contributions.iter().filter(|c| c.is_some()).count())
+				.unwrap_or(0),
+			SessionPhase::DkgShares => self
+				.record
+				.dkg
+				.as_ref()
+				.map(|d| {
+					d.applied_share_dealers
+						.first()
+						.map(|v| v.len())
+						.unwrap_or(0)
+				})
+				.unwrap_or(0),
 			_ => 0,
 		};
 		SessionStatus {
@@ -543,6 +619,7 @@ impl Negotiator {
 			result_nonce_hex: None,
 			created_unix: now,
 			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
+			dkg: None,
 		};
 		// Record our own round-1 contribution.
 		record.rp_r1.insert(
@@ -656,6 +733,7 @@ impl Negotiator {
 			result_nonce_hex: None,
 			created_unix: now,
 			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
+			dkg: None,
 		};
 		record.kern_commits.insert(
 			my_index,
@@ -693,6 +771,9 @@ impl Negotiator {
 		quorum: &[ActorPoint],
 		record: SessionRecord,
 	) -> Result<Self, Error> {
+		if record.kind == SessionKind::Dkg {
+			return Self::resume_dkg(secp, record);
+		}
 		let quorum = canonical_quorum(quorum)?;
 		if quorum.len() != record.quorum_x_hexes.len() {
 			return Err(Error::Multisig("quorum size mismatch on resume".into()));
@@ -712,11 +793,224 @@ impl Negotiator {
 		})
 	}
 
+	/// Resume a DKG session (no ceremony public poly yet).
+	pub fn resume_dkg(secp: &Secp256k1, record: SessionRecord) -> Result<Self, Error> {
+		if record.kind != SessionKind::Dkg {
+			return Err(Error::Multisig("not a DKG session".into()));
+		}
+		let dummy_y = sk_from_u64(secp, 1)?;
+		let mut quorum = Vec::new();
+		for x_hex in &record.quorum_x_hexes {
+			let x = seckey_from_hex(secp, x_hex)?;
+			quorum.push(ActorPoint {
+				x,
+				y: dummy_y.clone(),
+			});
+		}
+		Ok(Self {
+			record,
+			public_poly: PublicPoly {
+				coefficients: Vec::new(),
+			},
+			quorum,
+			secp: clone_secp(secp),
+		})
+	}
+
+	/// Open a DKG session and emit our public contribution.
+	///
+	/// All parties must use the same `ceremony_id`, `params`, ordered `roster`,
+	/// and `session_tag`. Partial shares are exchanged as plain envelopes in
+	/// the session path (AEAD at rest); for production OOB transport prefer
+	/// age-encrypted slatepacks (C-02) via the classic `dkg_export_shares` path.
+	pub fn create_dkg(
+		secp: &Secp256k1,
+		ceremony_id: CeremonyId,
+		params: ThresholdParams,
+		roster: Vec<ActorId>,
+		my_index: usize,
+		session_tag: impl AsRef<[u8]>,
+	) -> Result<(Self, MultisigEnvelope), Error> {
+		if roster.len() != params.total_actors {
+			return Err(Error::Multisig("roster size != total_actors".into()));
+		}
+		if my_index >= roster.len() {
+			return Err(Error::Multisig("my_index out of range".into()));
+		}
+		if roster.len() > MAX_SESSION_ACTORS {
+			return Err(Error::Multisig("roster too large".into()));
+		}
+		let my_actor = roster[my_index].clone();
+		let (secrets, contrib) =
+			generate_dealer_contribution(secp, &ceremony_id, my_actor.clone(), &params)?;
+		verify_pop(secp, &ceremony_id, &contrib, params.num_coefficients())?;
+
+		let mut sid = session_tag.as_ref().to_vec();
+		sid.extend_from_slice(b"|dkg|");
+		sid.extend_from_slice(ceremony_id.0.as_bytes());
+
+		let mut contributions = vec![None; roster.len()];
+		contributions[my_index] = Some(DkgContribWire {
+			actor: my_actor.clone(),
+			commitment_hexes: contrib
+				.commitments
+				.coefficients
+				.iter()
+				.map(|c| c.to_hex())
+				.collect(),
+			pop_sig_hexes: contrib.pops.iter().map(|p| p.sig.to_hex()).collect(),
+		});
+
+		let dkg = DkgSessionState {
+			params: params.clone(),
+			contributions,
+			my_coeff_hexes: secrets
+				.poly
+				.coeffs
+				.iter()
+				.map(|c| seckey_to_hex(c))
+				.collect(),
+			my_share_ys_hex: vec![None; params.shares_per_actor],
+			applied_share_dealers: vec![Vec::new(); params.shares_per_actor],
+			shares_exported: false,
+		};
+
+		let dummy_y = sk_from_u64(secp, 1)?;
+		let mut quorum_x_hexes = Vec::new();
+		let mut quorum = Vec::new();
+		for a in &roster {
+			let x = a.x_coordinate_share(secp, 0)?;
+			quorum_x_hexes.push(seckey_to_hex(&x));
+			quorum.push(ActorPoint {
+				x,
+				y: dummy_y.clone(),
+			});
+		}
+
+		let now = unix_now();
+		let record = SessionRecord {
+			session_id: sid.clone(),
+			ceremony_id: ceremony_id.clone(),
+			kind: SessionKind::Dkg,
+			phase: SessionPhase::DkgContrib,
+			my_actor: my_actor.clone(),
+			roster,
+			quorum_x_hexes,
+			my_index,
+			coin: None,
+			fee: None,
+			inputs: Vec::new(),
+			outputs: Vec::new(),
+			secrets: None,
+			rp_r1: BTreeMap::new(),
+			rp_tau: BTreeMap::new(),
+			kern_commits: BTreeMap::new(),
+			kern_partials: BTreeMap::new(),
+			emitted_for_phase: true,
+			seen_body_hashes: BTreeSet::new(),
+			abort_reason: None,
+			result_proof_hex: None,
+			result_commit_hex: None,
+			result_sig_hex: None,
+			result_excess_hex: None,
+			result_nonce_hex: None,
+			created_unix: now,
+			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
+			dkg: Some(dkg),
+		};
+
+		let env = build_dkg_contribution(secp, ceremony_id, my_actor, params, &contrib)?
+			.with_session_id(&sid);
+		Ok((
+			Self {
+				record,
+				public_poly: PublicPoly {
+					coefficients: Vec::new(),
+				},
+				quorum,
+				secp: clone_secp(secp),
+			},
+			env,
+		))
+	}
+
+	/// Build [`MultisigWalletState`] after a completed DKG session (wipes coeffs).
+	pub fn finalize_dkg_state(&mut self) -> Result<MultisigWalletState, Error> {
+		if self.record.kind != SessionKind::Dkg {
+			return Err(Error::Multisig("not a DKG session".into()));
+		}
+		if self.record.phase != SessionPhase::Complete {
+			// Try to complete if all material is present.
+			self.try_complete_dkg()?;
+		}
+		if self.record.phase != SessionPhase::Complete {
+			return Err(Error::Multisig(format!(
+				"DKG not complete ({:?})",
+				self.record.phase
+			)));
+		}
+		let dkg = self
+			.record
+			.dkg
+			.as_ref()
+			.ok_or_else(|| Error::Multisig("missing dkg state".into()))?;
+		if dkg.my_coeff_hexes.is_empty() {
+			return Err(Error::Multisig(
+				"DKG secrets already wiped; state must have been finalized".into(),
+			));
+		}
+		let secrets = self.dkg_dealer_secrets()?;
+		let public_poly = self.dkg_aggregate_public_poly()?;
+		let me = &self.record.roster[self.record.my_index];
+		let mut shares = Vec::new();
+		for share_index in 0..dkg.params.shares_per_actor {
+			let x = me.x_coordinate_share(&self.secp, share_index)?;
+			let mut y = dealer_partial_share(&self.secp, &secrets, &x)?;
+			if let Some(ref h) = dkg.my_share_ys_hex[share_index] {
+				let others = seckey_from_hex(&self.secp, h)?;
+				y = super::scalar::sk_add(&self.secp, &y, &others)?;
+			} else if dkg.params.total_actors > 1 {
+				return Err(Error::Multisig(format!(
+					"missing imported shares for share_index {}",
+					share_index
+				)));
+			}
+			if !verify_share(&self.secp, &public_poly, &x, &y)? {
+				return Err(Error::Multisig(format!(
+					"share verification failed for share {}",
+					share_index
+				)));
+			}
+			shares.push(SecretShare { share_index, x, y });
+		}
+		let state = MultisigWalletState {
+			config: MultisigConfig {
+				ceremony_id: self.record.ceremony_id.clone(),
+				params: dkg.params.clone(),
+				actors: self.record.roster.clone(),
+				public_poly: public_poly.clone(),
+			},
+			my_actor: me.clone(),
+			shares,
+		};
+		state.config.validate()?;
+		// Wipe dealer coeffs after successful finalize.
+		if let Some(ref mut d) = self.record.dkg {
+			d.my_coeff_hexes.clear();
+		}
+		self.public_poly = public_poly;
+		Ok(state)
+	}
+
 	/// Abort the session and wipe secrets.
 	pub fn abort(&mut self, reason: impl Into<String>) {
 		self.record.phase = SessionPhase::Aborted;
 		self.record.abort_reason = Some(reason.into());
 		self.record.secrets = None;
+		if let Some(ref mut dkg) = self.record.dkg {
+			dkg.my_coeff_hexes.clear();
+			dkg.my_share_ys_hex.clear();
+		}
 		self.record.emitted_for_phase = true;
 	}
 
@@ -774,6 +1068,8 @@ impl Negotiator {
 			MultisigBody::KernelSigningCommit(msg) => self.apply_kern_commit(env, msg)?,
 			MultisigBody::KernelPartialSig(msg) => self.apply_kern_partial(env, msg)?,
 			MultisigBody::KernelFinal(msg) => self.apply_kern_final(env, msg)?,
+			MultisigBody::DkgContribution(msg) => self.apply_dkg_contrib(env, msg)?,
+			MultisigBody::DkgPartialShare(msg) => self.apply_dkg_share(env, msg)?,
 			_ => {
 				return Err(Error::Multisig(
 					"envelope body not valid for this session kind/phase".into(),
@@ -797,6 +1093,7 @@ impl Negotiator {
 		match self.record.kind {
 			SessionKind::CreateOutput => self.tick_create_output(),
 			SessionKind::Spend => self.tick_spend(),
+			SessionKind::Dkg => self.tick_dkg(),
 		}
 	}
 
@@ -1343,6 +1640,257 @@ impl Negotiator {
 		)
 	}
 
+	// ----- DKG internals -----
+
+	fn apply_dkg_contrib(
+		&mut self,
+		env: &MultisigEnvelope,
+		msg: &super::messages::DkgContributionMsg,
+	) -> Result<(), Error> {
+		if self.record.kind != SessionKind::Dkg {
+			return Err(Error::Multisig(
+				"DkgContribution not valid for this session".into(),
+			));
+		}
+		if !matches!(
+			self.record.phase,
+			SessionPhase::DkgContrib | SessionPhase::DkgShares
+		) {
+			return Err(Error::Multisig(
+				"DkgContribution not expected in this phase".into(),
+			));
+		}
+		let dkg = self
+			.record
+			.dkg
+			.as_mut()
+			.ok_or_else(|| Error::Multisig("missing dkg state".into()))?;
+		if msg.params != dkg.params {
+			return Err(Error::Multisig("DKG params mismatch".into()));
+		}
+		let actor = env.sender.clone();
+		let idx = self
+			.record
+			.roster
+			.iter()
+			.position(|a| a.id == actor.id)
+			.ok_or_else(|| Error::Multisig(format!("unknown actor {}", actor.label)))?;
+		let contrib = parse_dkg_contribution(msg, actor.clone())?;
+		verify_pop(
+			&self.secp,
+			&self.record.ceremony_id,
+			&contrib,
+			dkg.params.num_coefficients(),
+		)?;
+		let new_hexes: Vec<String> = contrib
+			.commitments
+			.coefficients
+			.iter()
+			.map(|c| c.to_hex())
+			.collect();
+		if let Some(existing) = &dkg.contributions[idx] {
+			if existing.commitment_hexes != new_hexes {
+				return Err(Error::Multisig(format!(
+					"actor {} DKG contribution equivocation",
+					actor.label
+				)));
+			}
+			return Ok(());
+		}
+		dkg.contributions[idx] = Some(DkgContribWire {
+			actor,
+			commitment_hexes: new_hexes,
+			pop_sig_hexes: contrib.pops.iter().map(|p| p.sig.to_hex()).collect(),
+		});
+		Ok(())
+	}
+
+	fn apply_dkg_share(
+		&mut self,
+		env: &MultisigEnvelope,
+		msg: &super::messages::DkgPartialShareMsg,
+	) -> Result<(), Error> {
+		if self.record.kind != SessionKind::Dkg {
+			return Err(Error::Multisig(
+				"DkgPartialShare not valid for this session".into(),
+			));
+		}
+		let me = &self.record.roster[self.record.my_index];
+		if msg.recipient.id != me.id {
+			return Err(Error::Multisig("share not addressed to this actor".into()));
+		}
+		let dkg = self
+			.record
+			.dkg
+			.as_mut()
+			.ok_or_else(|| Error::Multisig("missing dkg state".into()))?;
+		if msg.share_index >= dkg.params.shares_per_actor {
+			return Err(Error::Multisig("share_index out of range".into()));
+		}
+		let dealer_idx = self
+			.record
+			.roster
+			.iter()
+			.position(|a| a.id == env.sender.id)
+			.ok_or_else(|| Error::Multisig(format!("unknown dealer {}", env.sender.label)))?;
+		if dkg.applied_share_dealers.len() != dkg.params.shares_per_actor {
+			dkg.applied_share_dealers = vec![Vec::new(); dkg.params.shares_per_actor];
+		}
+		if dkg.applied_share_dealers[msg.share_index].contains(&dealer_idx) {
+			return Err(Error::Multisig(format!(
+				"duplicate share from dealer {} for share_index {} (replay)",
+				env.sender.label, msg.share_index
+			)));
+		}
+		let part = seckey_from_hex(&self.secp, &msg.share_hex)?;
+		let sum = match &dkg.my_share_ys_hex[msg.share_index] {
+			Some(h) => {
+				let prev = seckey_from_hex(&self.secp, h)?;
+				super::scalar::sk_add(&self.secp, &prev, &part)?
+			}
+			None => part,
+		};
+		dkg.my_share_ys_hex[msg.share_index] = Some(seckey_to_hex(&sum));
+		dkg.applied_share_dealers[msg.share_index].push(dealer_idx);
+		Ok(())
+	}
+
+	fn tick_dkg(&mut self) -> Result<Vec<MultisigEnvelope>, Error> {
+		let mut out = Vec::new();
+		let n = self.record.roster.len();
+		let all_contrib = self
+			.record
+			.dkg
+			.as_ref()
+			.map(|d| d.contributions.iter().all(|c| c.is_some()))
+			.unwrap_or(false);
+
+		if self.record.phase == SessionPhase::DkgContrib && all_contrib {
+			self.record.phase = SessionPhase::DkgShares;
+			self.record.emitted_for_phase = false;
+		}
+
+		if self.record.phase == SessionPhase::DkgShares
+			&& !self
+				.record
+				.dkg
+				.as_ref()
+				.map(|d| d.shares_exported)
+				.unwrap_or(true)
+		{
+			out.extend(self.emit_dkg_partials()?);
+			if let Some(ref mut d) = self.record.dkg {
+				d.shares_exported = true;
+			}
+			self.record.emitted_for_phase = true;
+		}
+
+		// Complete when every share_index has (n-1) foreign dealers applied
+		// (own dealer partial is added at finalize).
+		if self.record.phase == SessionPhase::DkgShares {
+			let need = n.saturating_sub(1);
+			let ready = self.record.dkg.as_ref().map(|d| {
+				if need == 0 {
+					true
+				} else {
+					(0..d.params.shares_per_actor).all(|si| {
+						d.applied_share_dealers
+							.get(si)
+							.map(|v| v.len() >= need)
+							.unwrap_or(false)
+					})
+				}
+			});
+			if ready == Some(true) {
+				self.record.phase = SessionPhase::Complete;
+				self.record.emitted_for_phase = true;
+			}
+		}
+		Ok(out)
+	}
+
+	fn emit_dkg_partials(&self) -> Result<Vec<MultisigEnvelope>, Error> {
+		let dkg = self
+			.record
+			.dkg
+			.as_ref()
+			.ok_or_else(|| Error::Multisig("missing dkg state".into()))?;
+		let secrets = self.dkg_dealer_secrets()?;
+		let sender = self.record.roster[self.record.my_index].clone();
+		let mut out = Vec::new();
+		for (i, actor) in self.record.roster.iter().enumerate() {
+			if i == self.record.my_index {
+				continue;
+			}
+			for share_index in 0..dkg.params.shares_per_actor {
+				let x = actor.x_coordinate_share(&self.secp, share_index)?;
+				let y = dealer_partial_share(&self.secp, &secrets, &x)?;
+				let env = build_dkg_partial_share(
+					self.record.ceremony_id.clone(),
+					sender.clone(),
+					actor.clone(),
+					share_index,
+					&y,
+					&x,
+				)
+				.with_session_id(&self.record.session_id);
+				out.push(env);
+			}
+		}
+		Ok(out)
+	}
+
+	fn try_complete_dkg(&mut self) -> Result<(), Error> {
+		let _ = self.tick_dkg()?;
+		Ok(())
+	}
+
+	fn dkg_dealer_secrets(&self) -> Result<DealerSecrets, Error> {
+		let dkg = self
+			.record
+			.dkg
+			.as_ref()
+			.ok_or_else(|| Error::Multisig("missing dkg state".into()))?;
+		let mut coeffs = Vec::new();
+		for h in &dkg.my_coeff_hexes {
+			coeffs.push(seckey_from_hex(&self.secp, h)?);
+		}
+		Ok(DealerSecrets {
+			actor: self.record.roster[self.record.my_index].clone(),
+			poly: SecretPoly { coeffs },
+		})
+	}
+
+	fn dkg_aggregate_public_poly(&self) -> Result<PublicPoly, Error> {
+		let dkg = self
+			.record
+			.dkg
+			.as_ref()
+			.ok_or_else(|| Error::Multisig("missing dkg state".into()))?;
+		let mut acc: Option<PublicPoly> = None;
+		for c in &dkg.contributions {
+			let c = c
+				.as_ref()
+				.ok_or_else(|| Error::Multisig("missing contribution".into()))?;
+			let coefficients: Result<Vec<Vec<u8>>, Error> = c
+				.commitment_hexes
+				.iter()
+				.map(|h| {
+					crate::grin_util::from_hex(h)
+						.map_err(|e| Error::Multisig(format!("hex: {}", e)))
+				})
+				.collect();
+			let pp = PublicPoly {
+				coefficients: coefficients?,
+			};
+			acc = Some(match acc {
+				None => pp,
+				Some(a) => a.add(&self.secp, &pp)?,
+			});
+		}
+		acc.ok_or_else(|| Error::Multisig("no contributions".into()))
+	}
+
 	fn frost_commitments(&self) -> Result<Vec<SigningCommitment>, Error> {
 		let mut out = Vec::new();
 		for j in 0..self.quorum.len() {
@@ -1636,6 +2184,102 @@ mod tests {
 			verify_rangeproof(&secp, c, p, None).unwrap();
 		}
 		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn dkg_two_party_session_completes() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let roster: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let ceremony = CeremonyId::new();
+		let (mut n0, e0) = Negotiator::create_dkg(
+			&secp,
+			ceremony.clone(),
+			params.clone(),
+			roster.clone(),
+			0,
+			b"dkg-sess",
+		)
+		.unwrap();
+		let (mut n1, e1) = Negotiator::create_dkg(
+			&secp,
+			ceremony,
+			params,
+			roster,
+			1,
+			b"dkg-sess",
+		)
+		.unwrap();
+		// Exchange contributions
+		let mut o0 = n0.apply(&e1).unwrap();
+		let mut o1 = n1.apply(&e0).unwrap();
+		// Deliver partial shares (may have been emitted on contrib apply)
+		let mut pending: VecDeque<(usize, MultisigEnvelope)> = o0
+			.drain(..)
+			.map(|m| (1usize, m))
+			.chain(o1.drain(..).map(|m| (0usize, m)))
+			.collect();
+		// Also tick in case
+		for m in n0.tick().unwrap() {
+			pending.push_back((1, m));
+		}
+		for m in n1.tick().unwrap() {
+			pending.push_back((0, m));
+		}
+		while let Some((i, env)) = pending.pop_front() {
+			let more = if i == 0 {
+				n0.apply(&env).unwrap()
+			} else {
+				n1.apply(&env).unwrap()
+			};
+			for m in more {
+				pending.push_back((1 - i, m));
+			}
+		}
+		assert_eq!(n0.record.phase, SessionPhase::Complete);
+		assert_eq!(n1.record.phase, SessionPhase::Complete);
+		let s0 = n0.finalize_dkg_state().unwrap();
+		let s1 = n1.finalize_dkg_state().unwrap();
+		assert_eq!(s0.config.public_poly.coefficients, s1.config.public_poly.coefficients);
+		assert!(!s0.shares.is_empty());
+	}
+
+	#[test]
+	fn dkg_share_replay_rejected() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let roster: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let ceremony = CeremonyId::new();
+		let (mut n0, _e0) = Negotiator::create_dkg(
+			&secp,
+			ceremony.clone(),
+			params.clone(),
+			roster.clone(),
+			0,
+			b"dkg-replay",
+		)
+		.unwrap();
+		let (mut n1, e1) =
+			Negotiator::create_dkg(&secp, ceremony, params, roster, 1, b"dkg-replay").unwrap();
+		// n0 gets n1's contribution → emits partials to n1
+		let outs0 = n0.apply(&e1).unwrap();
+		let shares: Vec<_> = outs0
+			.into_iter()
+			.filter(|e| matches!(e.body, MultisigBody::DkgPartialShare(_)))
+			.collect();
+		assert!(!shares.is_empty());
+		// First apply accepted
+		n1.apply(&shares[0]).unwrap();
+		// Body-hash cache: exact re-apply is silent no-op
+		assert!(n1.apply(&shares[0]).unwrap().is_empty());
+		// Clear cache → dealer-index replay guard must fire
+		n1.record.seen_body_hashes.clear();
+		let err = n1.apply(&shares[0]).unwrap_err();
+		assert!(
+			format!("{}", err).contains("duplicate") || format!("{}", err).contains("replay"),
+			"got {}",
+			err
+		);
 	}
 
 	#[test]

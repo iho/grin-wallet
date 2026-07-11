@@ -11,7 +11,7 @@ This is the first implementation slice of RFC-0023 style multisig:
 
 | Done | Not done |
 | --- | --- |
-| Joint Feldman DKG (degree = threshold−1) | DKG-as-session |
+| Joint Feldman DKG (degree = threshold−1) | Address-roster DKG session (age shares) |
 | PoP on coefficient commitments | Cross-epoch MultiTx (two polys) |
 | Share verify against public poly | External crypto audit |
 | Lagrange partial keys + reconstruction | Multi-process soak |
@@ -283,6 +283,8 @@ Owner JSON-RPC (experimental, token required):
 | `multisig_plan_epoch_sweep` | List Unspent coins for epoch migration |
 | `multisig_expire_sessions` | Abort sessions past 24h deadline |
 | `multisig_assemble_tx` | Assemble postable tx hex from completed Spend |
+| `multisig_session_dkg_create` | Durable DKG session (index roster) |
+| `multisig_session_dkg_finalize` | Finalize DKG session → LMDB |
 
 ## Multisig UTXOs (WS6)
 
@@ -306,6 +308,21 @@ Session lifecycle auto-links UTXOs: CreateOutput registers/links the coin;
 Spend locks inputs and marks them Spent on Complete; Abort unlocks inputs.
 Sessions default to a **24h deadline**; `apply` after expiry aborts and unlocks.
 The owner updater also runs light refresh + session expiry each cycle.
+
+## Durable DKG session (WS4)
+
+Index-roster DKG can run as a sealed session (same engine as CreateOutput/Spend):
+
+```bash
+# All parties use the same --session-tag and ceremony UUID (or let one pick and share it).
+grin-wallet multisig session-dkg-create -t 2 -n 3 -i 0 --session-tag my-dkg -o c0.json
+grin-wallet multisig session-apply -s <session-id> -i c1.json -d out/
+# … exchange contributions, then partial-share envelopes from tick …
+grin-wallet multisig session-dkg-finalize -s <session-id> --delete
+```
+
+The classic `dkg-start` / `dkg-import-*` / `dkg-export-shares` path remains for
+**address-based** rosters with age-encrypted slatepack share delivery (C-02).
 
 ## Wire format freeze (v1, experimental)
 
@@ -358,5 +375,5 @@ A removed actor who still holds the old public poly can rewind old-epoch rangepr
 9. ~~Durable session negotiator + session CLI.~~
 10. ~~Owner RPC for session lifecycle.~~
 11. ~~UTXO track/select/refresh/assemble.~~
-12. Multi-process soak tests + DKG-as-session
+12. Multi-process soak tests + address-roster DKG session (encrypted shares)
 13. External audit

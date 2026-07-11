@@ -81,9 +81,10 @@ pub use ops::{
 	recognize_and_register, refresh_multisig_utxos, register_utxo, scan_ceremony_utxos,
 	select_spendable_utxos, session_abort, session_apply, session_apply_raw,
 	session_create_output, session_create_output_raw, session_create_spend,
-	session_create_spend_raw, session_list, session_status, set_utxo_status, wallet_data_dir,
-	write_envelope_file, CeremonySummary, EpochSweepPlan, MultisigRefreshResult,
-	MultisigSessionApplyResult, MultisigSessionStartResult, PendingDkg, PendingKey,
+	session_create_spend_raw, session_dkg_create_raw, session_dkg_finalize, session_list,
+	session_status, set_utxo_status, wallet_data_dir, write_envelope_file, CeremonySummary,
+	EpochSweepPlan, MultisigRefreshResult, MultisigSessionApplyResult,
+	MultisigSessionStartResult, PendingDkg, PendingKey,
 };
 pub use poly::{eval_public_poly, eval_secret_poly, verify_share, PublicPoly, SecretPoly};
 pub use rangeproof::{

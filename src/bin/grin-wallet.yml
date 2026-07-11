@@ -477,6 +477,60 @@ subcommands:
                   short: o
                   long: out
                   takes_value: true
+        - session-dkg-create:
+            about: Start durable DKG session (index roster); write contribution envelope
+            args:
+              - threshold:
+                  help: Threshold M
+                  short: t
+                  long: threshold
+                  takes_value: true
+                  required: true
+              - total:
+                  help: Total actors N
+                  short: n
+                  long: total
+                  takes_value: true
+                  required: true
+              - index:
+                  help: This actor index 0..N-1
+                  short: i
+                  long: index
+                  takes_value: true
+                  required: true
+              - shares:
+                  help: Shares per actor (default recommended)
+                  long: shares
+                  takes_value: true
+              - ceremony:
+                  help: Optional ceremony UUID (default random)
+                  short: c
+                  long: ceremony
+                  takes_value: true
+              - session_tag:
+                  help: Shared session tag (all parties must match)
+                  long: session-tag
+                  takes_value: true
+                  default_value: "dkg"
+              - out:
+                  help: Contribution envelope path
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_dkg_contrib.json"
+        - session-dkg-finalize:
+            about: Finalize completed DKG session into wallet LMDB
+            args:
+              - session:
+                  help: DKG session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - delete:
+                  help: Delete sealed session file after finalize
+                  long: delete
+                  takes_value: false
 
   - rewind_hash:
       about: Return the hash of the wallet root public key.

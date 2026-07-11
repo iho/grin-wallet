@@ -263,10 +263,10 @@ Negotiator
 **Tests (in-module):** 2-of-2 CreateOutput + Spend complete; crash-resume mid-CreateOutput after R1; abort wipes secrets; exact-message replay is idempotent.
 
 **Still open for full WS4 exit:**
-- DKG as a session kind (still uses PendingDkg file API)
-- Multi-process CLI (`session create/advance/status/abort`) + Owner RPC
+- ✅ DKG as session kind (index roster; address-roster still via PendingDkg + age shares)
+- ✅ Multi-process CLI session create/apply/status/abort + Owner RPC (+ session-dkg-*)
 - 3-process slatepack file/socket integration with kill-resume at every boundary
-- Deadlines / timeout abort; LMDB session store (optional; files are AEAD today)
+- ✅ Deadlines / timeout abort; files are AEAD (LMDB session store optional)
 - Combined CreateOutput+Spend single multi-round MultiTx
 
 ### WS5 — Wire format & transport (3–5 weeks, overlaps WS4)
@@ -288,7 +288,8 @@ Negotiator
 8. ✅ `select_spendable_utxos` greedy selection; `plan_epoch_sweep` for re-DKG migration inventory.
 9. ✅ Tx assembly from completed Spend + proofs (`assemble_from_kernel_results` / `assemble-tx`); local `build_epoch_sweep_local` consolidation.
 10. ✅ Envelope fuzz targets under `libwallet/fuzz`; v1 JSON wire freeze notes + ops runbook in `doc/multisig.md`.
-11. Residual: concurrent multi-process reservation soak; DKG-as-session; automated cross-epoch MultiTx (two polys) builder; send/receive nesting in standard slate flow.
+11. ✅ DKG-as-session (index roster) + share replay guard tests.
+12. Residual: concurrent multi-process soak; address-roster DKG session with age share envelopes; cross-epoch MultiTx; slate nesting.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 
@@ -311,7 +312,7 @@ Negotiator
 5. ✅ C-05 FROST kernel (binding factors + excess poly check).
 6. ✅ C-06 verifiable multiparty τ (identifiable abort).
 7. ✅ C-09/C-10 v1 product decisions documented (public offset; strategy A view). Residual: formal RFC freeze text.
-8. ✅ WS4 negotiator + CLI + Owner RPC session methods. Residual: multi-process soak + DKG-as-session.
+8. ✅ WS4 negotiator + CLI + Owner RPC + DKG session (index). Residual: multi-process soak.
 9. ✅ C-12 envelope DoS caps.
 9b. ✅ Session TTL/deadline + expire path; updater light refresh.
 

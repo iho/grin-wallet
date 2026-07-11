@@ -2190,6 +2190,26 @@ pub trait OwnerRpc {
 		token: Token,
 		session_id_hex: String,
 	) -> Result<String, Error>;
+
+	/// Experimental: start durable DKG session (index roster).
+	fn multisig_session_dkg_create(
+		&self,
+		token: Token,
+		threshold: usize,
+		total: usize,
+		my_index: usize,
+		shares_per_actor: Option<usize>,
+		ceremony_id: Option<String>,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: finalize completed DKG session into LMDB.
+	fn multisig_session_dkg_finalize(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		delete_session_file: bool,
+	) -> Result<crate::libwallet::multisig::MultisigWalletState, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2894,6 +2914,42 @@ where
 		session_id_hex: String,
 	) -> Result<String, Error> {
 		Owner::multisig_assemble_tx(self, (&token.keychain_mask).as_ref(), session_id_hex)
+	}
+
+	fn multisig_session_dkg_create(
+		&self,
+		token: Token,
+		threshold: usize,
+		total: usize,
+		my_index: usize,
+		shares_per_actor: Option<usize>,
+		ceremony_id: Option<String>,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_dkg_create(
+			self,
+			(&token.keychain_mask).as_ref(),
+			threshold,
+			total,
+			my_index,
+			shares_per_actor,
+			ceremony_id,
+			session_tag,
+		)
+	}
+
+	fn multisig_session_dkg_finalize(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		delete_session_file: bool,
+	) -> Result<crate::libwallet::multisig::MultisigWalletState, Error> {
+		Owner::multisig_session_dkg_finalize(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			delete_session_file,
+		)
 	}
 }
 

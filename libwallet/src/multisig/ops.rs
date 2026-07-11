@@ -1251,16 +1251,21 @@ where
 	C: crate::types::NodeClient + 'a,
 	K: Keychain + 'a,
 {
+	use super::session::SessionKind;
 	let session_id = crate::grin_util::from_hex(session_id_hex)
 		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
 	let keychain = w.keychain(keychain_mask)?;
 	let session_key = derive_session_key(&keychain)?;
 	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
-	let ceremony_id = record.ceremony_id.clone();
-	let state = get_state(w, keychain_mask, &ceremony_id)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
-	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
-	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
+	let mut neg = if record.kind == SessionKind::Dkg {
+		Negotiator::resume_dkg(&secp, record)?
+	} else {
+		let ceremony_id = record.ceremony_id.clone();
+		let state = get_state(w, keychain_mask, &ceremony_id)?;
+		let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
+		Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?
+	};
 	let env = MultisigEnvelope::from_json_str(peer_envelope_json)?;
 	let outbound = match neg.apply(&env) {
 		Ok(o) => o,
@@ -1275,7 +1280,9 @@ where
 	};
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	// UTXO side-effects on Complete / still mid-flight (WS6).
-	apply_session_utxo_effects(w, keychain_mask, &neg)?;
+	if neg.record.kind != SessionKind::Dkg {
+		apply_session_utxo_effects(w, keychain_mask, &neg)?;
+	}
 	let mut outbound_json = Vec::new();
 	for oenv in &outbound {
 		outbound_json.push(
@@ -1287,6 +1294,85 @@ where
 		status: neg.status(),
 		outbound_json,
 	})
+}
+
+/// Start a durable DKG session; returns status + contribution envelope JSON.
+pub fn session_dkg_create_raw<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	threshold: usize,
+	total: usize,
+	my_index: usize,
+	shares_per_actor: Option<usize>,
+	ceremony_id: Option<CeremonyId>,
+	session_tag: &str,
+) -> Result<MultisigSessionStartResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	if my_index >= total {
+		return Err(Error::Multisig("my_index out of range".into()));
+	}
+	let spa = shares_per_actor
+		.unwrap_or_else(|| ThresholdParams::recommended_shares_per_actor(threshold));
+	let params = ThresholdParams::with_shares_per_actor(threshold, total, spa)?;
+	let ceremony = ceremony_id.unwrap_or_else(CeremonyId::new);
+	let roster: Vec<ActorId> = (0..total as u32).map(ActorId::from_index).collect();
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let (neg, env) = Negotiator::create_dkg(
+		&secp,
+		ceremony,
+		params,
+		roster,
+		my_index,
+		session_tag.as_bytes(),
+	)?;
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	let envelope_json = serde_json::to_string_pretty(&env)
+		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
+	Ok(MultisigSessionStartResult {
+		status: neg.status(),
+		envelope_json,
+	})
+}
+
+/// Finalize a completed DKG session into LMDB ceremony state.
+pub fn session_dkg_finalize<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	delete_session_file: bool,
+) -> Result<MultisigWalletState, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let session_id = crate::grin_util::from_hex(session_id_hex)
+		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let mut neg = Negotiator::resume_dkg(&secp, record)?;
+	let state = neg.finalize_dkg_state()?;
+	{
+		let mut batch = w.batch(keychain_mask)?;
+		batch.save_multisig_state(&state)?;
+		batch.commit()?;
+	}
+	if delete_session_file {
+		delete_session(wallet_data_dir, &session_id)?;
+	} else {
+		save_session(wallet_data_dir, &session_key, &neg.record)?;
+	}
+	Ok(state)
 }
 
 /// Apply a peer envelope file; write any new outbound messages to `out_dir`.
@@ -1379,16 +1465,21 @@ where
 	C: crate::types::NodeClient + 'a,
 	K: Keychain + 'a,
 {
+	use super::session::SessionKind;
 	let session_id = crate::grin_util::from_hex(session_id_hex)
 		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
 	let keychain = w.keychain(keychain_mask)?;
 	let session_key = derive_session_key(&keychain)?;
 	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
-	let ceremony_id = record.ceremony_id.clone();
-	let state = get_state(w, keychain_mask, &ceremony_id)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
-	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
-	let neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
+	let neg = if record.kind == SessionKind::Dkg {
+		Negotiator::resume_dkg(&secp, record)?
+	} else {
+		let ceremony_id = record.ceremony_id.clone();
+		let state = get_state(w, keychain_mask, &ceremony_id)?;
+		let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
+		Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?
+	};
 	Ok(neg.status())
 }
 
@@ -1406,19 +1497,26 @@ where
 	C: crate::types::NodeClient + 'a,
 	K: Keychain + 'a,
 {
+	use super::session::SessionKind;
 	let session_id = crate::grin_util::from_hex(session_id_hex)
 		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
 	let keychain = w.keychain(keychain_mask)?;
 	let session_key = derive_session_key(&keychain)?;
 	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
-	let ceremony_id = record.ceremony_id.clone();
-	let state = get_state(w, keychain_mask, &ceremony_id)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
-	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
-	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
+	let mut neg = if record.kind == SessionKind::Dkg {
+		Negotiator::resume_dkg(&secp, record)?
+	} else {
+		let ceremony_id = record.ceremony_id.clone();
+		let state = get_state(w, keychain_mask, &ceremony_id)?;
+		let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
+		Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?
+	};
 	neg.abort(reason);
 	// Unlock any UTXOs locked by this session.
-	unlock_session_utxos(w, keychain_mask, &neg)?;
+	if neg.record.kind != SessionKind::Dkg {
+		unlock_session_utxos(w, keychain_mask, &neg)?;
+	}
 	let st = neg.status();
 	if delete_file {
 		delete_session(wallet_data_dir, &session_id)?;

@@ -2470,6 +2470,81 @@ where
 				Ok(())
 			})?;
 		}
+		"session-dkg-create" => {
+			let threshold = args
+				.threshold
+				.ok_or_else(|| Error::ArgumentError("--threshold required".into()))?;
+			let total = args
+				.total
+				.ok_or_else(|| Error::ArgumentError("--total required".into()))?;
+			let my_index = args
+				.my_index
+				.ok_or_else(|| Error::ArgumentError("--index required".into()))?;
+			let tag = args
+				.session_tag
+				.clone()
+				.unwrap_or_else(|| "dkg".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_dkg_contrib.json".into());
+			let ceremony = match args.ceremony_id.as_ref() {
+				Some(c) => Some(
+					Uuid::parse_str(c)
+						.map(libwallet::multisig::CeremonyId)
+						.map_err(|e| Error::ArgumentError(format!("bad ceremony: {}", e)))?,
+				),
+				None => None,
+			};
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let res = libwallet::multisig::session_dkg_create_raw(
+					&mut **w,
+					m,
+					&wdata,
+					threshold,
+					total,
+					my_index,
+					args.shares_per_actor,
+					ceremony,
+					&tag,
+				)?;
+				std::fs::write(&out, res.envelope_json.as_bytes())
+					.map_err(|e| libwallet::Error::Multisig(format!("write: {}", e)))?;
+				println!(
+					"DKG session {} phase={:?}",
+					res.status.session_id_hex, res.status.phase
+				);
+				println!("Contribution → {}", out);
+				Ok(())
+			})?;
+		}
+		"session-dkg-finalize" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let state = libwallet::multisig::session_dkg_finalize(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					args.delete,
+				)?;
+				println!(
+					"DKG finalized ceremony {} ({}-of-{})",
+					state.config.ceremony_id.0,
+					state.config.params.threshold,
+					state.config.params.total_actors
+				);
+				Ok(())
+			})?;
+		}
 		other => {
 			return Err(Error::ArgumentError(format!(
 				"unknown multisig subcommand '{}'",
