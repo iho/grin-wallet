@@ -277,6 +277,7 @@ Owner JSON-RPC (experimental, token required):
 | `multisig_allocate_coin` | Reserve next coin number |
 | `multisig_register_utxo` | Register after CreateOutput |
 | `multisig_recognize_utxo` | Shared-nonce rewind + optional register |
+| `multisig_scan_utxos` | PMMR scan + shared-nonce recognition |
 
 ## Multisig UTXOs (WS6)
 
@@ -285,7 +286,12 @@ grin-wallet multisig allocate-coin -c <ceremony> --coin-value 1000000000
 grin-wallet multisig register-utxo -c <ceremony> --coin-number 1 --coin-value 1000000000
 grin-wallet multisig list-utxos -c <ceremony>
 grin-wallet multisig recognize-utxo -c <ceremony> --commit <hex> --proof proof.hex --height 100 --register
+# Chain scan (node must be reachable):
+grin-wallet multisig scan-utxos -c <ceremony> --start-index 1 --max 1000
 ```
+
+Session lifecycle auto-links UTXOs: CreateOutput registers/links the coin;
+Spend locks inputs and marks them Spent on Complete; Abort unlocks inputs.
 
 ## Next implementation steps
 

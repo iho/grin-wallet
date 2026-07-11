@@ -2830,6 +2830,30 @@ where
 			register,
 		)
 	}
+
+	/// Scan the node UTXO PMMR for outputs belonging to a ceremony (shared-nonce
+	/// rewind). Recognized outputs are registered/updated as Unspent.
+	pub fn multisig_scan_utxos(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		start_index: u64,
+		end_index: Option<u64>,
+		max_outputs: u64,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::scan_ceremony_utxos(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			start_index,
+			end_index,
+			max_outputs,
+		)
+	}
 }
 
 /// attempt to send slate synchronously with TOR

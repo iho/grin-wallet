@@ -1523,6 +1523,12 @@ pub struct MultisigArgs {
 	pub height: Option<u64>,
 	/// Register if recognized.
 	pub register: bool,
+	/// Start PMMR index (scan-utxos).
+	pub start_index: Option<u64>,
+	/// End PMMR index (scan-utxos).
+	pub end_index: Option<u64>,
+	/// Max outputs per batch (scan-utxos).
+	pub max_outputs: Option<u64>,
 }
 
 fn msig_wallet_data_dir<L, C, K>(owner_api: &Owner<L, C, K>) -> Result<String, Error>
@@ -2277,6 +2283,40 @@ where
 						}
 					}
 					None => println!("Not recognized under this ceremony view key."),
+				}
+				Ok(())
+			})?;
+		}
+		"scan-utxos" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let start = args.start_index.unwrap_or(1);
+			let end = args.end_index;
+			let max = args.max_outputs.unwrap_or(1000);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let found = libwallet::multisig::scan_ceremony_utxos(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					start,
+					end,
+					max,
+				)?;
+				if found.is_empty() {
+					println!("No multisig outputs recognized in scanned range.");
+				} else {
+					println!("Recognized {} multisig UTXO(s):", found.len());
+					for u in found {
+						println!(
+							"  coin #{} value={} status={:?} height={} mmr={:?}",
+							u.coin.number, u.coin.value, u.status, u.height, u.mmr_index
+						);
+					}
 				}
 				Ok(())
 			})?;

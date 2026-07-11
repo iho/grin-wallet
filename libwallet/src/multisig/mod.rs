@@ -77,10 +77,11 @@ pub use ops::{
 	dkg_finalize, dkg_import_contrib, dkg_import_share, dkg_start, export_state_json,
 	export_state_sealed, get_state, import_state_json, import_state_sealed, init_local_sim,
 	list_ceremonies, list_utxos, load_pending, read_encrypted_share_file, read_envelope_file,
-	recognize_and_register, register_utxo, session_abort, session_apply, session_apply_raw,
-	session_create_output, session_create_output_raw, session_create_spend, session_create_spend_raw,
-	session_list, session_status, set_utxo_status, wallet_data_dir, write_envelope_file,
-	CeremonySummary, MultisigSessionApplyResult, MultisigSessionStartResult, PendingDkg, PendingKey,
+	recognize_and_register, register_utxo, scan_ceremony_utxos, session_abort, session_apply,
+	session_apply_raw, session_create_output, session_create_output_raw, session_create_spend,
+	session_create_spend_raw, session_list, session_status, set_utxo_status, wallet_data_dir,
+	write_envelope_file, CeremonySummary, MultisigSessionApplyResult, MultisigSessionStartResult,
+	PendingDkg, PendingKey,
 };
 pub use poly::{eval_public_poly, eval_secret_poly, verify_share, PublicPoly, SecretPoly};
 pub use rangeproof::{

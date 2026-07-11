@@ -1102,6 +1102,14 @@ where
 		session_tag.as_bytes(),
 	)?;
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	// Link/allocate UTXO row for this coin + session (WS6).
+	link_create_output_utxo(
+		w,
+		keychain_mask,
+		ceremony_id,
+		&CoinId::new(coin_number, coin_value),
+		&neg.record.session_id.to_hex(),
+	)?;
 	let envelope_json = serde_json::to_string_pretty(&env)
 		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
 	Ok(MultisigSessionStartResult {
@@ -1178,6 +1186,15 @@ where
 		session_tag.as_bytes(),
 	)?;
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	// Lock input UTXOs for this spend session (WS6).
+	let sid = neg.record.session_id.to_hex();
+	lock_spend_inputs(
+		w,
+		keychain_mask,
+		ceremony_id,
+		&neg.record.inputs,
+		&sid,
+	)?;
 	let envelope_json = serde_json::to_string_pretty(&env)
 		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
 	Ok(MultisigSessionStartResult {
@@ -1247,6 +1264,8 @@ where
 	let env = MultisigEnvelope::from_json_str(peer_envelope_json)?;
 	let outbound = neg.apply(&env)?;
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	// UTXO side-effects on Complete / still mid-flight (WS6).
+	apply_session_utxo_effects(w, keychain_mask, &neg)?;
 	let mut outbound_json = Vec::new();
 	for oenv in &outbound {
 		outbound_json.push(
@@ -1388,6 +1407,8 @@ where
 	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
 	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
 	neg.abort(reason);
+	// Unlock any UTXOs locked by this session.
+	unlock_session_utxos(w, keychain_mask, &neg)?;
 	let st = neg.status();
 	if delete_file {
 		delete_session(wallet_data_dir, &session_id)?;
@@ -1395,6 +1416,344 @@ where
 		save_session(wallet_data_dir, &session_key, &neg.record)?;
 	}
 	Ok(st)
+}
+
+// ---------------------------------------------------------------------------
+// Session ↔ UTXO coupling helpers (WS6)
+// ---------------------------------------------------------------------------
+
+fn link_create_output_utxo<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	coin: &CoinId,
+	session_id_hex: &str,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let commit =
+		super::rangeproof::coin_pedersen_commit_public(&secp, &state.config.public_poly, coin)?;
+	let mut utxo = match w.get_multisig_utxo(ceremony_id, coin.number) {
+		Ok(mut u) => {
+			if u.coin.value != coin.value {
+				return Err(Error::Multisig(format!(
+					"coin #{} reserved with value {}, session uses {}",
+					coin.number, u.coin.value, coin.value
+				)));
+			}
+			if u.status == MultisigUtxoStatus::Spent {
+				return Err(Error::Multisig("coin already spent".into()));
+			}
+			u.session_id_hex = Some(session_id_hex.to_string());
+			if u.status == MultisigUtxoStatus::Reserved {
+				u.status = MultisigUtxoStatus::Unconfirmed;
+			}
+			u
+		}
+		Err(_) => {
+			let mut u = MultisigUtxo::new_unconfirmed(
+				ceremony_id.clone(),
+				coin.clone(),
+				&commit,
+				None,
+				Some(session_id_hex.to_string()),
+			);
+			u.status = MultisigUtxoStatus::Unconfirmed;
+			u
+		}
+	};
+	utxo.commit_hex = commit.0.to_vec().to_hex();
+	let meta = w.get_multisig_coin_meta(ceremony_id)?;
+	let new_meta = CoinNumberMeta {
+		high_water: meta.high_water.max(coin.number),
+	};
+	let mut batch = w.batch(keychain_mask)?;
+	batch.save_multisig_utxo(&utxo)?;
+	batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+	batch.commit()?;
+	Ok(())
+}
+
+fn lock_spend_inputs<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	inputs: &[CoinId],
+	session_id_hex: &str,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	// Soft-skip untracked coins (caller may register later). Hard-fail if
+	// already locked by another session or not spendable.
+	for coin in inputs {
+		match w.get_multisig_utxo(ceremony_id, coin.number) {
+			Ok(mut u) => {
+				if u.coin.value != coin.value {
+					return Err(Error::Multisig(format!(
+						"input coin #{} value mismatch (tracked {}, spend {})",
+						coin.number, u.coin.value, coin.value
+					)));
+				}
+				match u.status {
+					MultisigUtxoStatus::Unspent | MultisigUtxoStatus::Unconfirmed => {
+						u.status = MultisigUtxoStatus::Locked;
+						u.session_id_hex = Some(session_id_hex.to_string());
+						let mut batch = w.batch(keychain_mask)?;
+						batch.save_multisig_utxo(&u)?;
+						batch.commit()?;
+					}
+					MultisigUtxoStatus::Locked => {
+						if u.session_id_hex.as_deref() != Some(session_id_hex) {
+							return Err(Error::Multisig(format!(
+								"coin #{} already locked by another session",
+								coin.number
+							)));
+						}
+					}
+					other => {
+						return Err(Error::Multisig(format!(
+							"coin #{} not spendable ({:?})",
+							coin.number, other
+						)));
+					}
+				}
+			}
+			Err(_) => {
+				// Not tracked: leave unlocked; spend may still proceed cryptographically.
+			}
+		}
+	}
+	Ok(())
+}
+
+fn apply_session_utxo_effects<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	neg: &super::session::Negotiator,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	use super::session::{SessionKind, SessionPhase};
+	let rec = &neg.record;
+	let ceremony_id = &rec.ceremony_id;
+	let sid = rec.session_id.to_hex();
+
+	match (&rec.kind, &rec.phase) {
+		(SessionKind::CreateOutput, SessionPhase::Complete) => {
+			if let (Some(coin), Some(proof_hex), Some(commit_hex)) =
+				(&rec.coin, &rec.result_proof_hex, &rec.result_commit_hex)
+			{
+				let proof = super::messages::proof_from_hex(proof_hex)?;
+				let mut utxo = match w.get_multisig_utxo(ceremony_id, coin.number) {
+					Ok(u) => u,
+					Err(_) => MultisigUtxo::new_unconfirmed(
+						ceremony_id.clone(),
+						coin.clone(),
+						&{
+							let b = crate::grin_util::from_hex(commit_hex).map_err(|e| {
+								Error::Multisig(format!("commit hex: {}", e))
+							})?;
+							let mut a = [0u8; 33];
+							if b.len() != 33 {
+								return Err(Error::Multisig("commit must be 33 bytes".into()));
+							}
+							a.copy_from_slice(&b);
+							crate::grin_util::secp::pedersen::Commitment(a)
+						},
+						Some(&proof),
+						Some(sid.clone()),
+					),
+				};
+				utxo.coin = coin.clone();
+				utxo.commit_hex = commit_hex.clone();
+				utxo.proof_hex = Some(proof_hex.clone());
+				utxo.session_id_hex = Some(sid);
+				if utxo.status == MultisigUtxoStatus::Reserved
+					|| utxo.status == MultisigUtxoStatus::Unconfirmed
+				{
+					utxo.status = MultisigUtxoStatus::Unconfirmed;
+				}
+				let meta = w.get_multisig_coin_meta(ceremony_id)?;
+				let new_meta = CoinNumberMeta {
+					high_water: meta.high_water.max(coin.number),
+				};
+				let mut batch = w.batch(keychain_mask)?;
+				batch.save_multisig_utxo(&utxo)?;
+				batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+				batch.commit()?;
+			}
+		}
+		(SessionKind::Spend, SessionPhase::Complete) => {
+			for coin in &rec.inputs {
+				if let Ok(mut u) = w.get_multisig_utxo(ceremony_id, coin.number) {
+					u.status = MultisigUtxoStatus::Spent;
+					let mut batch = w.batch(keychain_mask)?;
+					batch.save_multisig_utxo(&u)?;
+					batch.commit()?;
+				}
+			}
+			// Register any new outputs as Unconfirmed (proofs not in kernel session).
+			for coin in &rec.outputs {
+				if w.get_multisig_utxo(ceremony_id, coin.number).is_err() {
+					let state = get_state(w, keychain_mask, ceremony_id)?;
+					let secp = Secp256k1::with_caps(ContextFlag::Commit);
+					let commit = super::rangeproof::coin_pedersen_commit_public(
+						&secp,
+						&state.config.public_poly,
+						coin,
+					)?;
+					let mut u = MultisigUtxo::new_unconfirmed(
+						ceremony_id.clone(),
+						coin.clone(),
+						&commit,
+						None,
+						Some(sid.clone()),
+					);
+					u.status = MultisigUtxoStatus::Unconfirmed;
+					let meta = w.get_multisig_coin_meta(ceremony_id)?;
+					let new_meta = CoinNumberMeta {
+						high_water: meta.high_water.max(coin.number),
+					};
+					let mut batch = w.batch(keychain_mask)?;
+					batch.save_multisig_utxo(&u)?;
+					batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+					batch.commit()?;
+				}
+			}
+		}
+		_ => {}
+	}
+	Ok(())
+}
+
+fn unlock_session_utxos<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	neg: &super::session::Negotiator,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let sid = neg.record.session_id.to_hex();
+	let ceremony_id = &neg.record.ceremony_id;
+	// Unlock inputs locked by this spend session.
+	for coin in &neg.record.inputs {
+		if let Ok(mut u) = w.get_multisig_utxo(ceremony_id, coin.number) {
+			if u.status == MultisigUtxoStatus::Locked
+				&& u.session_id_hex.as_deref() == Some(sid.as_str())
+			{
+				u.status = MultisigUtxoStatus::Unspent;
+				let mut batch = w.batch(keychain_mask)?;
+				batch.save_multisig_utxo(&u)?;
+				batch.commit()?;
+			}
+		}
+	}
+	// CreateOutput abort: leave Reserved/Unconfirmed (no proof) as-is.
+	Ok(())
+}
+
+/// Scan the node's UTXO PMMR for outputs belonging to a ceremony (shared-nonce rewind).
+///
+/// Newly recognized outputs are registered as Unspent with chain height/mmr index.
+/// Existing rows keep session/label; status is upgraded to Unspent when confirmed on
+/// chain (unless already Spent/Locked).
+///
+/// Returns all UTXOs registered or updated during this scan.
+pub fn scan_ceremony_utxos<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	start_index: u64,
+	end_index: Option<u64>,
+	max_outputs: u64,
+) -> Result<Vec<MultisigUtxo>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let client = w.w2n_client().clone();
+	let mut start = start_index.max(1);
+	let mut found = Vec::new();
+	// Cap per-batch size similarly to ordinary wallet scan.
+	let batch_size = max_outputs.max(1).min(1000);
+
+	loop {
+		let (highest, last, outputs) =
+			client.get_outputs_by_pmmr_index(start, end_index, batch_size)?;
+		for (commit, proof, _is_cb, height, mmr_index) in outputs {
+			// RangeProof is Copy; capture hex before rewind for storage.
+			let proof_hex = super::messages::proof_to_hex(&proof);
+			let rec = match try_recognize_output(
+				&secp,
+				&state.config.public_poly,
+				commit,
+				proof,
+				None,
+			) {
+				Ok(Some(r)) => r,
+				_ => continue,
+			};
+			let mut utxo = MultisigUtxo::new_unconfirmed(
+				ceremony_id.clone(),
+				rec.coin.clone(),
+				&rec.commit,
+				None,
+				None,
+			);
+			utxo.proof_hex = Some(proof_hex);
+			utxo.status = MultisigUtxoStatus::Unspent;
+			utxo.height = height;
+			utxo.mmr_index = Some(mmr_index);
+			// Merge metadata from an existing row (session link / label / status).
+			if let Ok(existing) = w.get_multisig_utxo(ceremony_id, rec.coin.number) {
+				utxo.session_id_hex = existing.session_id_hex;
+				utxo.label = existing.label;
+				// Do not clobber Spent/Locked with Unspent.
+				match existing.status {
+					MultisigUtxoStatus::Spent | MultisigUtxoStatus::Locked => {
+						utxo.status = existing.status;
+					}
+					_ => {}
+				}
+				if existing.proof_hex.is_some() && utxo.proof_hex.is_none() {
+					utxo.proof_hex = existing.proof_hex;
+				}
+			}
+			let meta = w.get_multisig_coin_meta(ceremony_id)?;
+			let new_meta = CoinNumberMeta {
+				high_water: meta.high_water.max(rec.coin.number),
+			};
+			{
+				let mut batch = w.batch(keychain_mask)?;
+				batch.save_multisig_utxo(&utxo)?;
+				batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+				batch.commit()?;
+			}
+			found.push(utxo);
+		}
+		if highest <= last {
+			break;
+		}
+		start = last + 1;
+	}
+	Ok(found)
 }
 
 fn rebuild_quorum_from_record(

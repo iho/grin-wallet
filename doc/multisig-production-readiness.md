@@ -279,10 +279,11 @@ Negotiator
 ### WS6 — Wallet & API integration (6–12 weeks) — **UTXO foundation landed**
 
 1. ✅ C-01 removed earlier.
-2. ✅ Multisig UTXO tracking: `MultisigUtxo` in LMDB (`U` prefix), status lifecycle, height/mmr fields; CLI `list-utxos` / `register-utxo` / `recognize-utxo`; Owner RPC counterparts.
+2. ✅ Multisig UTXO tracking: `MultisigUtxo` in LMDB (`U` prefix), status lifecycle, height/mmr fields; CLI `list-utxos` / `register-utxo` / `recognize-utxo` / `scan-utxos`; Owner RPC counterparts.
 3. ✅ Coin-number allocator: high-water meta (`N` prefix) + `allocate_coin` → Reserved UTXO; next = max(known, high_water)+1.
 4. ✅ Recognition via shared-nonce rewind (`try_recognize_output`) without enumerating coin numbers.
-5. Residual: full chain scan loop hook into `owner_updater`; concurrent-session reservation locks in session transcript; send/receive nesting in standard slate flow; epoch rotation sweep.
+5. ✅ Session ↔ UTXO coupling: CreateOutput links/registers on start+complete; Spend locks inputs and marks Spent on complete; Abort unlocks; `scan_ceremony_utxos` PMMR walk via node client.
+6. Residual: hook scan into `owner_updater` background loop; concurrent multi-process reservation; send/receive nesting in standard slate flow; epoch rotation sweep.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 

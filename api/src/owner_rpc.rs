@@ -2144,6 +2144,16 @@ pub trait OwnerRpc {
 		height: u64,
 		register: bool,
 	) -> Result<Option<RecognizedMultisigOutput>, Error>;
+
+	/// Experimental: scan node PMMR for multisig outputs of a ceremony (WS6).
+	fn multisig_scan_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		start_index: u64,
+		end_index: Option<u64>,
+		max_outputs: u64,
+	) -> Result<Vec<MultisigUtxo>, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2777,6 +2787,24 @@ where
 			proof_hex,
 			height,
 			register,
+		)
+	}
+
+	fn multisig_scan_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		start_index: u64,
+		end_index: Option<u64>,
+		max_outputs: u64,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		Owner::multisig_scan_utxos(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			start_index,
+			end_index,
+			max_outputs,
 		)
 	}
 }

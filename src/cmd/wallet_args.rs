@@ -1044,6 +1044,18 @@ pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, P
 			.map(|v| parse_u64(v, "height"))
 			.transpose()?,
 		register: sub_args.is_present("register"),
+		start_index: sub_args
+			.value_of("start_index")
+			.map(|v| parse_u64(v, "start-index"))
+			.transpose()?,
+		end_index: sub_args
+			.value_of("end_index")
+			.map(|v| parse_u64(v, "end-index"))
+			.transpose()?,
+		max_outputs: sub_args
+			.value_of("max")
+			.map(|v| parse_u64(v, "max"))
+			.transpose()?,
 	})
 }
 

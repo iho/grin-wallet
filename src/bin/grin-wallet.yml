@@ -398,6 +398,29 @@ subcommands:
                   help: Persist as Unspent if recognized
                   long: register
                   takes_value: false
+        - scan-utxos:
+            about: Scan node UTXO PMMR for outputs of a ceremony (shared-nonce rewind)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - start_index:
+                  help: Start PMMR index (default 1)
+                  long: start-index
+                  takes_value: true
+                  default_value: "1"
+              - end_index:
+                  help: Optional end PMMR index
+                  long: end-index
+                  takes_value: true
+              - max:
+                  help: Max outputs per batch (capped at 1000)
+                  long: max
+                  takes_value: true
+                  default_value: "1000"
 
   - rewind_hash:
       about: Return the hash of the wallet root public key.
