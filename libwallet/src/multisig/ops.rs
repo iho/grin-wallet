@@ -1204,6 +1204,61 @@ where
 	})
 }
 
+/// Start a MultiTx session (RP each output, then FROST); returns status + first envelope.
+pub fn session_create_multitx_raw<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	ceremony_id: &CeremonyId,
+	inputs: Vec<CoinId>,
+	outputs: Vec<CoinId>,
+	fee: u64,
+	session_tag: &str,
+	quorum_indices: Option<&[usize]>,
+) -> Result<MultisigSessionStartResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let quorum = quorum_points_from_state(&secp, &state, quorum_indices)?;
+	let (neg, env) = Negotiator::create_multitx(
+		&secp,
+		&state.config.public_poly,
+		&quorum,
+		state.config.ceremony_id.clone(),
+		state.config.actors.clone(),
+		state.my_actor.clone(),
+		inputs,
+		outputs,
+		fee,
+		session_tag.as_bytes(),
+	)?;
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	let sid = neg.record.session_id.to_hex();
+	lock_spend_inputs(
+		w,
+		keychain_mask,
+		ceremony_id,
+		&neg.record.inputs,
+		&sid,
+	)?;
+	// Link each output coin as Unconfirmed.
+	for coin in &neg.record.outputs {
+		link_create_output_utxo(w, keychain_mask, ceremony_id, coin, &sid)?;
+	}
+	let envelope_json = serde_json::to_string_pretty(&env)
+		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
+	Ok(MultisigSessionStartResult {
+		status: neg.status(),
+		envelope_json,
+	})
+}
+
 /// Start a Spend session; write our FROST commit to `out_path`.
 pub fn session_create_spend<'a, T: ?Sized, C, K>(
 	w: &mut T,
@@ -1901,7 +1956,8 @@ where
 				batch.commit()?;
 			}
 		}
-		(SessionKind::Spend, SessionPhase::Complete) => {
+		(SessionKind::Spend, SessionPhase::Complete)
+		| (SessionKind::MultiTx, SessionPhase::Complete) => {
 			for coin in &rec.inputs {
 				if let Ok(mut u) = w.get_multisig_utxo(ceremony_id, coin.number) {
 					u.status = MultisigUtxoStatus::Spent;
@@ -1910,32 +1966,76 @@ where
 					batch.commit()?;
 				}
 			}
-			// Register any new outputs as Unconfirmed (proofs not in kernel session).
-			for coin in &rec.outputs {
-				if w.get_multisig_utxo(ceremony_id, coin.number).is_err() {
-					let state = get_state(w, keychain_mask, ceremony_id)?;
-					let secp = Secp256k1::with_caps(ContextFlag::Commit);
-					let commit = super::rangeproof::coin_pedersen_commit_public(
-						&secp,
-						&state.config.public_poly,
-						coin,
-					)?;
-					let mut u = MultisigUtxo::new_unconfirmed(
-						ceremony_id.clone(),
-						coin.clone(),
-						&commit,
-						None,
-						Some(sid.clone()),
-					);
-					u.status = MultisigUtxoStatus::Unconfirmed;
+			// MultiTx: attach proven proofs; Spend: register bare outputs if missing.
+			if rec.kind == SessionKind::MultiTx && !rec.multitx_output_proofs.is_empty() {
+				for p in &rec.multitx_output_proofs {
+					let proof = super::messages::proof_from_hex(&p.proof_hex)?;
+					let mut utxo = match w.get_multisig_utxo(ceremony_id, p.coin.number) {
+						Ok(u) => u,
+						Err(_) => MultisigUtxo::new_unconfirmed(
+							ceremony_id.clone(),
+							p.coin.clone(),
+							&{
+								let b = crate::grin_util::from_hex(&p.commit_hex).map_err(
+									|e| Error::Multisig(format!("commit hex: {}", e)),
+								)?;
+								let mut a = [0u8; 33];
+								if b.len() != 33 {
+									return Err(Error::Multisig("commit must be 33 bytes".into()));
+								}
+								a.copy_from_slice(&b);
+								crate::grin_util::secp::pedersen::Commitment(a)
+							},
+							Some(&proof),
+							Some(sid.clone()),
+						),
+					};
+					utxo.coin = p.coin.clone();
+					utxo.commit_hex = p.commit_hex.clone();
+					utxo.proof_hex = Some(p.proof_hex.clone());
+					utxo.session_id_hex = Some(sid.clone());
+					if matches!(
+						utxo.status,
+						MultisigUtxoStatus::Reserved | MultisigUtxoStatus::Unconfirmed
+					) {
+						utxo.status = MultisigUtxoStatus::Unconfirmed;
+					}
 					let meta = w.get_multisig_coin_meta(ceremony_id)?;
 					let new_meta = CoinNumberMeta {
-						high_water: meta.high_water.max(coin.number),
+						high_water: meta.high_water.max(p.coin.number),
 					};
 					let mut batch = w.batch(keychain_mask)?;
-					batch.save_multisig_utxo(&u)?;
+					batch.save_multisig_utxo(&utxo)?;
 					batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
 					batch.commit()?;
+				}
+			} else {
+				for coin in &rec.outputs {
+					if w.get_multisig_utxo(ceremony_id, coin.number).is_err() {
+						let state = get_state(w, keychain_mask, ceremony_id)?;
+						let secp = Secp256k1::with_caps(ContextFlag::Commit);
+						let commit = super::rangeproof::coin_pedersen_commit_public(
+							&secp,
+							&state.config.public_poly,
+							coin,
+						)?;
+						let mut u = MultisigUtxo::new_unconfirmed(
+							ceremony_id.clone(),
+							coin.clone(),
+							&commit,
+							None,
+							Some(sid.clone()),
+						);
+						u.status = MultisigUtxoStatus::Unconfirmed;
+						let meta = w.get_multisig_coin_meta(ceremony_id)?;
+						let new_meta = CoinNumberMeta {
+							high_water: meta.high_water.max(coin.number),
+						};
+						let mut batch = w.batch(keychain_mask)?;
+						batch.save_multisig_utxo(&u)?;
+						batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+						batch.commit()?;
+					}
 				}
 			}
 		}

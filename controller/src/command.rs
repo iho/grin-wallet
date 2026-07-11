@@ -2012,6 +2012,80 @@ where
 				Ok(())
 			})?;
 		}
+		"session-create-multitx" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let parse_coin = |s: &str| -> Result<libwallet::multisig::CoinId, Error> {
+				let parts: Vec<_> = s.split(':').collect();
+				if parts.len() != 2 {
+					return Err(Error::ArgumentError(
+						"coin must be number:value".into(),
+					));
+				}
+				let n = parts[0]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin number: {}", e)))?;
+				let v = parts[1]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin value: {}", e)))?;
+				Ok(libwallet::multisig::CoinId::new(n, v))
+			};
+			let inputs = args
+				.inputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			let outputs = args
+				.outputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			if inputs.is_empty() || outputs.is_empty() {
+				return Err(Error::ArgumentError(
+					"--input and --output required".into(),
+				));
+			}
+			let fee = args.fee.unwrap_or(1_000_000);
+			let tag = args
+				.session_tag
+				.clone()
+				.unwrap_or_else(|| "multitx".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out.json".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let res = libwallet::multisig::session_create_multitx_raw(
+					&mut **w,
+					m,
+					&wdata,
+					&libwallet::multisig::CeremonyId(uuid),
+					inputs,
+					outputs,
+					fee,
+					&tag,
+					None,
+				)?;
+				std::fs::write(&out, res.envelope_json.as_bytes())
+					.map_err(|e| libwallet::Error::Multisig(format!("write: {}", e)))?;
+				println!(
+					"MultiTx session {} phase={:?}",
+					res.status.session_id_hex, res.status.phase
+				);
+				println!("  Wrote: {}", out);
+				Ok(())
+			})?;
+		}
 		"session-create-spend" => {
 			let ceremony = args
 				.ceremony_id

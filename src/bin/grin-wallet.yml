@@ -278,6 +278,43 @@ subcommands:
                   long: out
                   takes_value: true
                   default_value: "msig_sess_out.json"
+        - session-create-multitx:
+            about: Start MultiTx (RP each output then FROST); write first envelope
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - input:
+                  help: "Input coin as number:value (repeatable)"
+                  long: input
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - output:
+                  help: "Output coin as number:value (repeatable)"
+                  long: output
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - fee:
+                  help: Fee in nanogrins
+                  long: fee
+                  takes_value: true
+                  default_value: "1000000"
+              - session_tag:
+                  help: Shared session tag
+                  long: session-tag
+                  takes_value: true
+                  default_value: "multitx"
+              - out:
+                  help: Path for first outbound envelope JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_sess_out.json"
         - session-apply:
             about: Apply a peer envelope to a session; write new outbound envelopes
             args:

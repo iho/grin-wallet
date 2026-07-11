@@ -267,7 +267,7 @@ Negotiator
 - ✅ Multi-process CLI session create/apply/status/abort + Owner RPC (+ session-dkg-*)
 - 3-process slatepack file/socket integration with kill-resume at every boundary
 - ✅ Deadlines / timeout abort; files are AEAD (LMDB session store optional)
-- Combined CreateOutput+Spend single multi-round MultiTx
+- ✅ Combined CreateOutput+Spend MultiTx session (`SessionKind::MultiTx`)
 
 ### WS5 — Wire format & transport (3–5 weeks, overlaps WS4)
 
@@ -290,7 +290,8 @@ Negotiator
 10. ✅ Envelope fuzz targets under `libwallet/fuzz`; v1 JSON wire freeze notes + ops runbook in `doc/multisig.md`.
 11. ✅ DKG-as-session (index + address roster, signed contribs, age share export) + file harness crash-resume + share replay/equivocation tests.
 12. ✅ Cross-epoch MultiTx local builder (`build_cross_epoch_spend` / FROST with dual polys) + multiparty soak unit rounds.
-13. Residual: multi-process soak on real wallets; networked cross-epoch session kind; slate nesting in standard send flow.
+13. ✅ MultiTx durable session + 2-of-3 sealed-file MultiTx soak harness.
+14. Residual: multi-process soak on real wallets; networked cross-epoch session kind; slate nesting in standard send flow.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 

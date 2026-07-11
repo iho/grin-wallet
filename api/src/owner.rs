@@ -2953,6 +2953,45 @@ where
 		)
 	}
 
+	/// Start a MultiTx session (RP each output then FROST kernel).
+	pub fn multisig_session_create_multitx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+		quorum_indices: Option<Vec<usize>>,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let inputs: Vec<CoinId> = inputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let outputs: Vec<CoinId> = outputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let qi = quorum_indices.as_ref().map(|v| v.as_slice());
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_create_multitx_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&multisig::CeremonyId(uuid),
+			inputs,
+			outputs,
+			fee,
+			&session_tag,
+			qi,
+		)
+	}
+
 	/// Start a durable DKG session (index or address roster; experimental).
 	pub fn multisig_session_dkg_create(
 		&self,

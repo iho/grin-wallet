@@ -164,6 +164,19 @@ pub enum SessionKind {
 	Spend,
 	/// Joint Feldman DKG (contributions + private partial shares).
 	Dkg,
+	/// Full multiparty transaction: rangeproof each new output, then FROST kernel.
+	MultiTx,
+}
+
+/// One proven MultiTx output stored mid-session after its RP completes.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultitxOutputProof {
+	/// Output coin.
+	pub coin: CoinId,
+	/// Commitment hex.
+	pub commit_hex: String,
+	/// Rangeproof hex.
+	pub proof_hex: String,
 }
 
 /// Protocol phase (ordered).
@@ -333,6 +346,12 @@ pub struct SessionRecord {
 	/// Nested DKG state (only for [`SessionKind::Dkg`]).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub dkg: Option<DkgSessionState>,
+	/// MultiTx: proven outputs so far (RP complete for each).
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub multitx_output_proofs: Vec<MultitxOutputProof>,
+	/// MultiTx: index into `outputs` currently being rangeproofed.
+	#[serde(default)]
+	pub multitx_rp_index: usize,
 }
 
 impl SessionRecord {
@@ -620,6 +639,8 @@ impl Negotiator {
 			created_unix: now,
 			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
 			dkg: None,
+			multitx_output_proofs: Vec::new(),
+			multitx_rp_index: 0,
 		};
 		// Record our own round-1 contribution.
 		record.rp_r1.insert(
@@ -734,6 +755,8 @@ impl Negotiator {
 			created_unix: now,
 			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
 			dkg: None,
+			multitx_output_proofs: Vec::new(),
+			multitx_rp_index: 0,
 		};
 		record.kern_commits.insert(
 			my_index,
@@ -752,6 +775,125 @@ impl Negotiator {
 			my_index,
 			&secrets.commitment,
 		);
+
+		Ok((
+			Self {
+				record,
+				public_poly: public_poly.clone(),
+				quorum,
+				secp: clone_secp(secp),
+			},
+			env,
+		))
+	}
+
+	/// Open a MultiTx session: multiparty RP for each new output, then FROST kernel.
+	///
+	/// Emits the first RpRound1 for `outputs[0]`. Value must balance:
+	/// `sum(inputs) == sum(outputs) + fee`.
+	pub fn create_multitx(
+		secp: &Secp256k1,
+		public_poly: &PublicPoly,
+		quorum: &[ActorPoint],
+		ceremony_id: CeremonyId,
+		roster: Vec<ActorId>,
+		my_actor: ActorId,
+		inputs: Vec<CoinId>,
+		outputs: Vec<CoinId>,
+		fee: u64,
+		session_id: impl AsRef<[u8]>,
+	) -> Result<(Self, MultisigEnvelope), Error> {
+		let quorum = canonical_quorum(quorum)?;
+		if quorum.len() > MAX_SESSION_ACTORS {
+			return Err(Error::Multisig("quorum too large".into()));
+		}
+		if inputs.is_empty() || outputs.is_empty() {
+			return Err(Error::Multisig("MultiTx needs inputs and outputs".into()));
+		}
+		let in_sum: u64 = inputs.iter().map(|c| c.value).sum();
+		let out_sum: u64 = outputs.iter().map(|c| c.value).sum();
+		if in_sum != out_sum.saturating_add(fee) {
+			return Err(Error::Multisig(format!(
+				"value imbalance: inputs {} != outputs {} + fee {}",
+				in_sum, out_sum, fee
+			)));
+		}
+		let my_index = find_my_index(secp, &quorum, &my_actor)?;
+		let first = outputs[0].clone();
+		let my_blind = super::rangeproof::partial_blind_for_actor(
+			secp,
+			public_poly,
+			&quorum,
+			my_index,
+			&first,
+		)?;
+		let params = rangeproof_params_for_coin(secp, public_poly, &first, None)?;
+		let (secrets, share) = rangeproof_round1(secp, &params, &my_blind)?;
+
+		let mut sid = session_id.as_ref().to_vec();
+		sid.extend_from_slice(b"|mtx|");
+		sid.extend_from_slice(&quorum_transcript(&quorum)?);
+
+		let secrets_wire = SessionSecretsWire {
+			partial_hex: seckey_to_hex(&secrets.partial_blind),
+			nonce_a_hex: seckey_to_hex(&secrets.private_nonce),
+			nonce_b_hex: String::new(),
+			pub_a_hex: pubkey_to_hex_local(secp, &secrets.t_one),
+			pub_b_hex: pubkey_to_hex_local(secp, &secrets.t_two),
+			pub_excess_hex: String::new(),
+		};
+
+		let now = unix_now();
+		let mut record = SessionRecord {
+			session_id: sid.clone(),
+			ceremony_id: ceremony_id.clone(),
+			kind: SessionKind::MultiTx,
+			phase: SessionPhase::RpRound1,
+			my_actor: my_actor.clone(),
+			roster,
+			quorum_x_hexes: quorum.iter().map(|p| seckey_to_hex(&p.x)).collect(),
+			my_index,
+			coin: Some(first.clone()),
+			fee: Some(fee),
+			inputs,
+			outputs,
+			secrets: Some(secrets_wire),
+			rp_r1: BTreeMap::new(),
+			rp_tau: BTreeMap::new(),
+			kern_commits: BTreeMap::new(),
+			kern_partials: BTreeMap::new(),
+			emitted_for_phase: true,
+			seen_body_hashes: BTreeSet::new(),
+			abort_reason: None,
+			result_proof_hex: None,
+			result_commit_hex: None,
+			result_sig_hex: None,
+			result_excess_hex: None,
+			result_nonce_hex: None,
+			created_unix: now,
+			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
+			dkg: None,
+			multitx_output_proofs: Vec::new(),
+			multitx_rp_index: 0,
+		};
+		record.rp_r1.insert(
+			my_index,
+			RpR1Wire {
+				t_one_hex: pubkey_to_hex_local(secp, &share.t_one),
+				t_two_hex: pubkey_to_hex_local(secp, &share.t_two),
+			},
+		);
+
+		let env = build_rp_round1(
+			secp,
+			ceremony_id,
+			my_actor,
+			&params,
+			&first,
+			my_index,
+			&share,
+		)
+		.with_session_id(&sid);
 
 		Ok((
 			Self {
@@ -917,6 +1059,8 @@ impl Negotiator {
 			created_unix: now,
 			deadline_unix: Some(now.saturating_add(DEFAULT_SESSION_TTL_SECS)),
 			dkg: Some(dkg),
+			multitx_output_proofs: Vec::new(),
+			multitx_rp_index: 0,
 		};
 
 		let env = build_dkg_contribution(secp, ceremony_id, my_actor, params, &contrib)?
@@ -1094,6 +1238,17 @@ impl Negotiator {
 			SessionKind::CreateOutput => self.tick_create_output(),
 			SessionKind::Spend => self.tick_spend(),
 			SessionKind::Dkg => self.tick_dkg(),
+			SessionKind::MultiTx => {
+				// RP phase for successive outputs, then kernel.
+				if matches!(
+					self.record.phase,
+					SessionPhase::RpRound1 | SessionPhase::RpRound2
+				) {
+					self.tick_create_output()
+				} else {
+					self.tick_spend()
+				}
+			}
 		}
 	}
 
@@ -1139,13 +1294,27 @@ impl Negotiator {
 
 	// ----- CreateOutput internals -----
 
+	fn allows_rp(&self) -> bool {
+		matches!(
+			self.record.kind,
+			SessionKind::CreateOutput | SessionKind::MultiTx
+		)
+	}
+
+	fn allows_kernel(&self) -> bool {
+		matches!(
+			self.record.kind,
+			SessionKind::Spend | SessionKind::MultiTx
+		)
+	}
+
 	fn apply_rp_round1(
 		&mut self,
 		env: &MultisigEnvelope,
 		msg: &super::messages::RpRound1Msg,
 	) -> Result<(), Error> {
-		if self.record.kind != SessionKind::CreateOutput {
-			return Err(Error::Multisig("RpRound1 not valid for Spend session".into()));
+		if !self.allows_rp() {
+			return Err(Error::Multisig("RpRound1 not valid for this session kind".into()));
 		}
 		if self.record.phase != SessionPhase::RpRound1
 			&& self.record.phase != SessionPhase::RpRound2
@@ -1184,8 +1353,8 @@ impl Negotiator {
 		env: &MultisigEnvelope,
 		msg: &super::messages::RpRound2Msg,
 	) -> Result<(), Error> {
-		if self.record.kind != SessionKind::CreateOutput {
-			return Err(Error::Multisig("RpRound2 not valid for Spend session".into()));
+		if !self.allows_rp() {
+			return Err(Error::Multisig("RpRound2 not valid for this session kind".into()));
 		}
 		if self.record.phase != SessionPhase::RpRound2 {
 			return Err(Error::Multisig("RpRound2 not expected in this phase".into()));
@@ -1212,8 +1381,16 @@ impl Negotiator {
 		_env: &MultisigEnvelope,
 		msg: &super::messages::RpFinalMsg,
 	) -> Result<(), Error> {
-		if self.record.kind != SessionKind::CreateOutput {
-			return Err(Error::Multisig("RpFinal not valid for Spend session".into()));
+		if !self.allows_rp() {
+			return Err(Error::Multisig("RpFinal not valid for this session kind".into()));
+		}
+		// MultiTx may already be past RP (local finalize advanced); accept as no-op.
+		if self.record.kind == SessionKind::MultiTx
+			&& matches!(
+				self.record.phase,
+				SessionPhase::KernelRound1 | SessionPhase::KernelRound2 | SessionPhase::Complete
+			) {
+			return Ok(());
 		}
 		let commit = commit_from_hex(&msg.commit_hex)?;
 		let proof = proof_from_hex(&msg.proof_hex)?;
@@ -1230,9 +1407,12 @@ impl Negotiator {
 		verify_rangeproof(&self.secp, commit, proof, params.extra_data.clone())?;
 		self.record.result_commit_hex = Some(msg.commit_hex.clone());
 		self.record.result_proof_hex = Some(msg.proof_hex.clone());
-		self.record.phase = SessionPhase::Complete;
-		self.record.secrets = None;
-		self.record.emitted_for_phase = true;
+		if self.record.kind == SessionKind::CreateOutput {
+			self.record.phase = SessionPhase::Complete;
+			self.record.secrets = None;
+			self.record.emitted_for_phase = true;
+		}
+		// MultiTx: local tick/finalize drives advancement; peer RpFinal is informational.
 		Ok(())
 	}
 
@@ -1341,20 +1521,150 @@ impl Negotiator {
 			params.extra_data.clone(),
 		)?;
 
-		self.record.result_commit_hex = Some(params.commit.0.to_vec().to_hex());
-		self.record.result_proof_hex = Some(proof_to_hex(&proof));
-		self.record.phase = SessionPhase::Complete;
-		self.record.secrets = None;
-		self.record.emitted_for_phase = true;
+		let commit_hex = params.commit.0.to_vec().to_hex();
+		let proof_hex = proof_to_hex(&proof);
+		self.record.result_commit_hex = Some(commit_hex.clone());
+		self.record.result_proof_hex = Some(proof_hex.clone());
 
-		Ok(build_rp_final(
+		let rp_final = build_rp_final(
 			self.record.ceremony_id.clone(),
 			self.record.my_actor.clone(),
 			&coin,
 			&params.commit,
 			&proof,
 		)
+		.with_session_id(&self.record.session_id);
+
+		if self.record.kind == SessionKind::MultiTx {
+			self.record.multitx_output_proofs.push(MultitxOutputProof {
+				coin: coin.clone(),
+				commit_hex,
+				proof_hex,
+			});
+			self.record.rp_r1.clear();
+			self.record.rp_tau.clear();
+			self.record.multitx_rp_index += 1;
+			if self.record.multitx_rp_index < self.record.outputs.len() {
+				// Next output RP.
+				return self.start_next_multitx_rp();
+			}
+			// All outputs proven → begin FROST kernel.
+			return self.start_multitx_kernel();
+		}
+
+		self.record.phase = SessionPhase::Complete;
+		self.record.secrets = None;
+		self.record.emitted_for_phase = true;
+		Ok(rp_final)
+	}
+
+	/// Begin RP for the next MultiTx output; returns first RpRound1.
+	fn start_next_multitx_rp(&mut self) -> Result<MultisigEnvelope, Error> {
+		let idx = self.record.multitx_rp_index;
+		let coin = self
+			.record
+			.outputs
+			.get(idx)
+			.cloned()
+			.ok_or_else(|| Error::Multisig("multitx_rp_index out of range".into()))?;
+		self.record.coin = Some(coin.clone());
+		let my_blind = super::rangeproof::partial_blind_for_actor(
+			&self.secp,
+			&self.public_poly,
+			&self.quorum,
+			self.record.my_index,
+			&coin,
+		)?;
+		let params =
+			rangeproof_params_for_coin(&self.secp, &self.public_poly, &coin, None)?;
+		let (secrets, share) = rangeproof_round1(&self.secp, &params, &my_blind)?;
+		self.record.secrets = Some(SessionSecretsWire {
+			partial_hex: seckey_to_hex(&secrets.partial_blind),
+			nonce_a_hex: seckey_to_hex(&secrets.private_nonce),
+			nonce_b_hex: String::new(),
+			pub_a_hex: pubkey_to_hex_local(&self.secp, &secrets.t_one),
+			pub_b_hex: pubkey_to_hex_local(&self.secp, &secrets.t_two),
+			pub_excess_hex: String::new(),
+		});
+		self.record.phase = SessionPhase::RpRound1;
+		self.record.emitted_for_phase = true;
+		self.record.rp_r1.insert(
+			self.record.my_index,
+			RpR1Wire {
+				t_one_hex: pubkey_to_hex_local(&self.secp, &share.t_one),
+				t_two_hex: pubkey_to_hex_local(&self.secp, &share.t_two),
+			},
+		);
+		Ok(build_rp_round1(
+			&self.secp,
+			self.record.ceremony_id.clone(),
+			self.record.my_actor.clone(),
+			&params,
+			&coin,
+			self.record.my_index,
+			&share,
+		)
 		.with_session_id(&self.record.session_id))
+	}
+
+	/// After all MultiTx RPs, open kernel round-1 and emit our FROST commit.
+	fn start_multitx_kernel(&mut self) -> Result<MultisigEnvelope, Error> {
+		let fee = self
+			.record
+			.fee
+			.ok_or_else(|| Error::Multisig("MultiTx missing fee".into()))?;
+		let features = plain_features(fee)?;
+		let session = create_kernel_session(
+			&self.secp,
+			&self.public_poly,
+			&self.record.session_id,
+			features,
+			self.record.inputs.clone(),
+			self.record.outputs.clone(),
+		)?;
+		let secrets = kernel_round1(
+			&self.secp,
+			&self.public_poly,
+			&self.quorum,
+			self.record.my_index,
+			&session,
+		)?;
+		verify_partial_excess(
+			&self.secp,
+			&self.public_poly,
+			&self.quorum,
+			self.record.my_index,
+			&session,
+			&secrets.commitment.pub_excess,
+		)?;
+		self.record.secrets = Some(SessionSecretsWire {
+			partial_hex: seckey_to_hex(&secrets.partial_excess),
+			nonce_a_hex: seckey_to_hex(&secrets.d),
+			nonce_b_hex: seckey_to_hex(&secrets.e),
+			pub_a_hex: pubkey_to_hex_local(&self.secp, &secrets.commitment.pub_d),
+			pub_b_hex: pubkey_to_hex_local(&self.secp, &secrets.commitment.pub_e),
+			pub_excess_hex: pubkey_to_hex_local(&self.secp, &secrets.commitment.pub_excess),
+		});
+		self.record.kern_commits.clear();
+		self.record.kern_partials.clear();
+		self.record.kern_commits.insert(
+			self.record.my_index,
+			KernCommitWire {
+				pub_d_hex: pubkey_to_hex_local(&self.secp, &secrets.commitment.pub_d),
+				pub_e_hex: pubkey_to_hex_local(&self.secp, &secrets.commitment.pub_e),
+				pub_excess_hex: pubkey_to_hex_local(&self.secp, &secrets.commitment.pub_excess),
+			},
+		);
+		self.record.phase = SessionPhase::KernelRound1;
+		self.record.emitted_for_phase = true;
+		Ok(build_kernel_signing_commit(
+			&self.secp,
+			self.record.ceremony_id.clone(),
+			self.record.my_actor.clone(),
+			&session,
+			self.record.my_index,
+			&secrets.commitment,
+		))
 	}
 
 	// ----- Spend internals -----
@@ -1364,9 +1674,9 @@ impl Negotiator {
 		env: &MultisigEnvelope,
 		msg: &super::messages::KernelSigningCommitMsg,
 	) -> Result<(), Error> {
-		if self.record.kind != SessionKind::Spend {
+		if !self.allows_kernel() {
 			return Err(Error::Multisig(
-				"KernelSigningCommit not valid for CreateOutput".into(),
+				"KernelSigningCommit not valid for this session kind".into(),
 			));
 		}
 		if self.record.phase != SessionPhase::KernelRound1
@@ -1417,9 +1727,9 @@ impl Negotiator {
 		env: &MultisigEnvelope,
 		msg: &super::messages::KernelPartialSigMsg,
 	) -> Result<(), Error> {
-		if self.record.kind != SessionKind::Spend {
+		if !self.allows_kernel() {
 			return Err(Error::Multisig(
-				"KernelPartialSig not valid for CreateOutput".into(),
+				"KernelPartialSig not valid for this session kind".into(),
 			));
 		}
 		if self.record.phase != SessionPhase::KernelRound2 {
@@ -1456,9 +1766,9 @@ impl Negotiator {
 		_env: &MultisigEnvelope,
 		msg: &super::messages::KernelFinalMsg,
 	) -> Result<(), Error> {
-		if self.record.kind != SessionKind::Spend {
+		if !self.allows_kernel() {
 			return Err(Error::Multisig(
-				"KernelFinal not valid for CreateOutput".into(),
+				"KernelFinal not valid for this session kind".into(),
 			));
 		}
 		let session = self.kernel_session()?;
@@ -2552,6 +2862,201 @@ mod tests {
 		assert!(format!("{}", err).contains("deadline"));
 		assert_eq!(n1.record.phase, SessionPhase::Aborted);
 		assert!(n1.record.secrets.is_none());
+	}
+
+	#[test]
+	fn three_party_file_soak_multitx() {
+		// 2-of-3 sealed-file MultiTx with mid-protocol crash (soak-style).
+		use crate::grin_core::global;
+		use crate::multisig::tx::create_multisig_output;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 3).unwrap();
+		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
+		let ceremony = CeremonyId::new();
+		let states = run_dkg_local(&secp, ceremony.clone(), params, actors.clone()).unwrap();
+		let pp = states[0].config.public_poly.clone();
+		let q = canonical_quorum(&[
+			ActorPoint::from(&states[0].shares[0]),
+			ActorPoint::from(&states[1].shares[0]),
+		])
+		.unwrap();
+		let roster = vec![actors[0].clone(), actors[1].clone()];
+		let funding =
+			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 2_000_000)).unwrap();
+		let fee = 1_000u64;
+		let key = [3u8; 32];
+		let dir = std::env::temp_dir().join(format!("msig_soak_{}", uuid::Uuid::new_v4()));
+		let d0 = dir.join("a0");
+		let d1 = dir.join("a1");
+		fs::create_dir_all(&d0).unwrap();
+		fs::create_dir_all(&d1).unwrap();
+
+		let (n0, e0) = Negotiator::create_multitx(
+			&secp,
+			&pp,
+			&q,
+			ceremony.clone(),
+			roster.clone(),
+			roster[0].clone(),
+			vec![funding.coin.clone()],
+			vec![CoinId::new(2, 2_000_000 - fee)],
+			fee,
+			b"soak-mtx",
+		)
+		.unwrap();
+		let (n1, e1) = Negotiator::create_multitx(
+			&secp,
+			&pp,
+			&q,
+			ceremony,
+			roster.clone(),
+			roster[1].clone(),
+			vec![funding.coin.clone()],
+			vec![CoinId::new(2, 2_000_000 - fee)],
+			fee,
+			b"soak-mtx",
+		)
+		.unwrap();
+		save_session(d0.to_str().unwrap(), &key, &n0.record).unwrap();
+		save_session(d1.to_str().unwrap(), &key, &n1.record).unwrap();
+		let sid0 = n0.record.session_id.clone();
+		let sid1 = n1.record.session_id.clone();
+		// Crash after seal of initial sessions
+		drop(n0);
+		drop(n1);
+
+		let mut n0 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d0.to_str().unwrap(), &key, &sid0).unwrap(),
+		)
+		.unwrap();
+		let mut n1 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d1.to_str().unwrap(), &key, &sid1).unwrap(),
+		)
+		.unwrap();
+		// Cross-deliver first envelopes
+		let mut pending: VecDeque<(usize, MultisigEnvelope)> = VecDeque::new();
+		let m0 = n0.apply(&e1).unwrap();
+		let m1 = n1.apply(&e0).unwrap();
+		// Crash mid-protocol
+		save_session(d0.to_str().unwrap(), &key, &n0.record).unwrap();
+		save_session(d1.to_str().unwrap(), &key, &n1.record).unwrap();
+		for m in m0 {
+			pending.push_back((1, m));
+		}
+		for m in m1 {
+			pending.push_back((0, m));
+		}
+		drop(n0);
+		drop(n1);
+
+		let mut n0 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d0.to_str().unwrap(), &key, &sid0).unwrap(),
+		)
+		.unwrap();
+		let mut n1 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d1.to_str().unwrap(), &key, &sid1).unwrap(),
+		)
+		.unwrap();
+		// Re-tick after resume (idempotent emit)
+		for m in n0.tick().unwrap() {
+			pending.push_back((1, m));
+		}
+		for m in n1.tick().unwrap() {
+			pending.push_back((0, m));
+		}
+		while let Some((i, env)) = pending.pop_front() {
+			let more = if i == 0 {
+				n0.apply(&env).unwrap()
+			} else {
+				n1.apply(&env).unwrap()
+			};
+			for m in more {
+				pending.push_back((1 - i, m));
+			}
+		}
+		assert_eq!(n0.record.phase, SessionPhase::Complete);
+		assert_eq!(n1.record.phase, SessionPhase::Complete);
+		assert_eq!(n0.record.multitx_output_proofs.len(), 1);
+		let _ = fs::remove_dir_all(&dir);
+	}
+
+	#[test]
+	fn multitx_assembles_valid_tx() {
+		use crate::grin_core::core::transaction::Weighting;
+		use crate::grin_core::global;
+		use crate::multisig::tx::{
+			assemble_from_kernel_results, create_multisig_output, MultisigOutput,
+		};
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, roster, ceremony) = setup_2of2(&secp);
+		// Real funded input under the poly
+		let funding =
+			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
+		let fee = 1_000u64;
+		let out_coin = CoinId::new(2, 1_000_000 - fee);
+		let mut negs = Vec::new();
+		let mut first = Vec::new();
+		for actor in roster.iter() {
+			let (n, env) = Negotiator::create_multitx(
+				&secp,
+				&pp,
+				&q,
+				ceremony.clone(),
+				roster.clone(),
+				actor.clone(),
+				vec![funding.coin.clone()],
+				vec![out_coin.clone()],
+				fee,
+				b"multitx-asm",
+			)
+			.unwrap();
+			negs.push(n);
+			first.push(env);
+		}
+		let mut pending = VecDeque::new();
+		for env in first {
+			broadcast(&mut negs, env, &mut pending);
+		}
+		drain(&mut negs, &mut pending);
+		assert_eq!(negs[0].record.phase, SessionPhase::Complete);
+		let (sig, agg) = negs[0].result_kernel().unwrap().unwrap();
+		let p = &negs[0].record.multitx_output_proofs[0];
+		let out = MultisigOutput {
+			coin: p.coin.clone(),
+			commit: {
+				let b = crate::grin_util::from_hex(&p.commit_hex).unwrap();
+				let mut a = [0u8; 33];
+				a.copy_from_slice(&b);
+				crate::grin_util::secp::pedersen::Commitment(a)
+			},
+			proof: proof_from_hex(&p.proof_hex).unwrap(),
+		};
+		let tx = assemble_from_kernel_results(
+			&secp,
+			&pp,
+			&negs[0].record.session_id,
+			fee,
+			&[funding],
+			&[out],
+			sig,
+			&agg,
+		)
+		.unwrap();
+		tx.validate(Weighting::AsTransaction).unwrap();
 	}
 
 	#[test]

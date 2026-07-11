@@ -2191,6 +2191,18 @@ pub trait OwnerRpc {
 		session_id_hex: String,
 	) -> Result<String, Error>;
 
+	/// Experimental: start MultiTx (rangeproofs then FROST kernel).
+	fn multisig_session_create_multitx(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+		quorum_indices: Option<Vec<usize>>,
+	) -> Result<MultisigSessionStartResult, Error>;
+
 	/// Experimental: start durable DKG session (index or address roster).
 	fn multisig_session_dkg_create(
 		&self,
@@ -2923,6 +2935,28 @@ where
 		session_id_hex: String,
 	) -> Result<String, Error> {
 		Owner::multisig_assemble_tx(self, (&token.keychain_mask).as_ref(), session_id_hex)
+	}
+
+	fn multisig_session_create_multitx(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+		quorum_indices: Option<Vec<usize>>,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_create_multitx(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			inputs,
+			outputs,
+			fee,
+			session_tag,
+			quorum_indices,
+		)
 	}
 
 	fn multisig_session_dkg_create(

@@ -261,7 +261,14 @@ grin-wallet multisig session-status -s <session-id-hex>
 grin-wallet multisig session-abort -s <session-id-hex> --reason "cancel" --delete
 ```
 
-Spend: `session-create-spend -c ... --input 1:1000000000 --output 2:999000000 --fee 1000000`
+Spend only (kernel): `session-create-spend -c ... --input 1:1000000000 --output 2:999000000 --fee 1000000`
+
+Full MultiTx (RP + kernel in one session):
+
+```bash
+grin-wallet multisig session-create-multitx -c <ceremony> \
+  --input 1:1000000000 --output 2:999000000 --fee 1000000 --session-tag pay -o r1.json
+```
 
 Owner JSON-RPC (experimental, token required):
 
@@ -271,6 +278,7 @@ Owner JSON-RPC (experimental, token required):
 | `multisig_session_status` | One session status |
 | `multisig_session_create_output` | Start CreateOutput; returns envelope JSON |
 | `multisig_session_create_spend` | Start Spend; returns envelope JSON |
+| `multisig_session_create_multitx` | Start MultiTx (RP then kernel) |
 | `multisig_session_apply` | Apply peer envelope JSON |
 | `multisig_session_abort` | Abort + wipe secrets |
 | `multisig_list_utxos` | Tracked multisig UTXOs |
