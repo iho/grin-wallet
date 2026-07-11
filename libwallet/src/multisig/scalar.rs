@@ -38,6 +38,8 @@ pub enum HashDomain {
 	Hkdf,
 	/// Generic ceremony context: `"grin-msig/ctx"`.
 	Context,
+	/// FROST binding factor ρ: `"grin-msig/frost-rho"`.
+	Frost,
 }
 
 impl HashDomain {
@@ -50,6 +52,7 @@ impl HashDomain {
 			HashDomain::Offset => b"grin-msig/offset",
 			HashDomain::Hkdf => b"grin-msig/hkdf",
 			HashDomain::Context => b"grin-msig/ctx",
+			HashDomain::Frost => b"grin-msig/frost-rho",
 		}
 	}
 }

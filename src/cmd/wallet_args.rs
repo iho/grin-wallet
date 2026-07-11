@@ -977,6 +977,11 @@ pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, P
 			ParseError::ArgumentError(format!("Could not parse {} parameter: {}", name, e))
 		})
 	};
+	let parse_u64 = |v: &str, name: &str| -> Result<u64, ParseError> {
+		v.parse::<u64>().map_err(|e| {
+			ParseError::ArgumentError(format!("Could not parse {} parameter: {}", name, e))
+		})
+	};
 	Ok(command::MultisigArgs {
 		subcommand: sub,
 		threshold: sub_args
@@ -1009,6 +1014,28 @@ pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, P
 				.filter(|a| !a.is_empty())
 				.collect()
 		}),
+		session_id: sub_args.value_of("session").map(|s| s.to_owned()),
+		session_tag: sub_args.value_of("session_tag").map(|s| s.to_owned()),
+		coin_number: sub_args
+			.value_of("coin_number")
+			.map(|v| parse_u64(v, "coin-number"))
+			.transpose()?,
+		coin_value: sub_args
+			.value_of("coin_value")
+			.map(|v| parse_u64(v, "coin-value"))
+			.transpose()?,
+		fee: sub_args
+			.value_of("fee")
+			.map(|v| parse_u64(v, "fee"))
+			.transpose()?,
+		inputs: sub_args.values_of("input").map(|vs| {
+			vs.map(|s| s.to_owned()).collect()
+		}),
+		outputs: sub_args.values_of("output").map(|vs| {
+			vs.map(|s| s.to_owned()).collect()
+		}),
+		reason: sub_args.value_of("reason").map(|s| s.to_owned()),
+		delete: sub_args.is_present("delete"),
 	})
 }
 

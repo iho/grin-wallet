@@ -32,10 +32,11 @@
 //! - [`share`] — Lagrange partial keys, add-actor masking
 //! - [`coin`] — coin blinding-factor derivation
 //! - [`rangeproof`] — multiparty Bulletproof (T1/T2/τ path)
-//! - [`kernel`] — multiparty threshold kernel signing (additive aggsig)
+//! - [`kernel`] — multiparty threshold kernel signing (FROST)
 //! - [`messages`] — slatepack wire format for multi-round protocols
 //! - [`tx`] — end-to-end multisig transaction build (local quorum)
-//! - [`store`] — LMDB persistence helpers
+//! - [`store`] — LMDB / AEAD persistence helpers
+//! - [`session`] — durable multiparty negotiator (WS4)
 
 pub mod coin;
 pub mod dkg;
@@ -45,6 +46,7 @@ pub mod ops;
 pub mod poly;
 pub mod rangeproof;
 pub mod scalar;
+pub mod session;
 pub mod share;
 pub mod store;
 pub mod tx;
@@ -56,38 +58,50 @@ pub use dkg::{
 	run_dkg_local, verify_pop, DealerContribution, DealerSecrets, PopProof,
 };
 pub use kernel::{
-	aggregate_kernel_pubs, commit_nonce, create_kernel_session, kernel_aggregate_sigs,
-	kernel_partial_sign, kernel_prepare, partial_excess_for_actor, plain_features,
-	run_kernel_sign_local, verify_kernel_partial, verify_kernel_sig, verify_nonce_commitment,
-	ActorKernelSecrets, AggregatedKernelPubs, KernelSession, NonceCommitment, NonceReveal,
+	aggregate_frost, binding_factor, create_kernel_session, expected_pub_excess_for_actor,
+	kernel_aggregate_sigs, kernel_partial_sign, kernel_round1, partial_excess_for_actor,
+	plain_features, run_kernel_sign_local, verify_kernel_partial, verify_kernel_sig,
+	verify_partial_excess, ActorKernelSecrets, AggregatedKernelPubs, KernelSession,
+	SigningCommitment,
 };
 pub use messages::{
-	build_dkg_contribution, build_dkg_partial_share, build_kernel_final, build_kernel_nonce_commit,
-	build_kernel_nonce_reveal, build_kernel_partial_sig, build_rp_final, build_rp_round1,
-	build_rp_round2, parse_dkg_contribution, parse_kernel_nonce_reveal, parse_rp_round1,
+	build_dkg_contribution, build_dkg_partial_share, build_kernel_final,
+	build_kernel_partial_sig, build_kernel_signing_commit, build_rp_final, build_rp_round1,
+	build_rp_round2, parse_dkg_contribution, parse_kernel_signing_commit, parse_rp_round1,
 	MultisigBody, MultisigEnvelope, MULTISIG_MSG_VERSION, MULTISIG_PAYLOAD_MAGIC,
 };
 pub use ops::{
-	clear_pending, delete_ceremony, dkg_export_shares, dkg_finalize, dkg_import_contrib,
-	dkg_import_share, dkg_start, export_state_json, get_state, import_state_json, init_local_sim,
-	list_ceremonies, load_pending, read_encrypted_share_file, read_envelope_file, wallet_data_dir,
-	write_envelope_file, CeremonySummary, PendingDkg, PendingKey,
+	clear_pending, delete_ceremony, derive_session_key, dkg_export_shares, dkg_finalize,
+	dkg_import_contrib, dkg_import_share, dkg_start, export_state_json, export_state_sealed,
+	get_state, import_state_json, import_state_sealed, init_local_sim, list_ceremonies, load_pending,
+	read_encrypted_share_file, read_envelope_file, session_abort, session_apply, session_apply_raw,
+	session_create_output, session_create_output_raw, session_create_spend, session_create_spend_raw,
+	session_list, session_status, wallet_data_dir, write_envelope_file, CeremonySummary,
+	MultisigSessionApplyResult, MultisigSessionStartResult, PendingDkg, PendingKey,
 };
 pub use poly::{eval_public_poly, eval_secret_poly, verify_share, PublicPoly, SecretPoly};
 pub use rangeproof::{
-	aggregate_round1, aggregate_tau, coin_pedersen_commit, quorum_partial_blinds,
-	rangeproof_finalize, rangeproof_params_for_coin, rangeproof_round1, rangeproof_round2,
-	rewind_rangeproof, run_rangeproof_local, verify_rangeproof, ActorRpSecrets, AggregatedT,
-	RangeproofParams, Round1Share,
+	aggregate_round1, aggregate_tau, aggregate_tau_verified, coin_pedersen_commit,
+	coin_pedersen_commit_public, derive_tau_challenges, expected_pub_blind_for_actor,
+	partial_blind_for_actor, quorum_partial_blinds, rangeproof_finalize, rangeproof_params_for_coin,
+	rangeproof_round1, rangeproof_round2, rewind_rangeproof, run_rangeproof_local, verify_rangeproof,
+	verify_tau_share, ActorRpSecrets, AggregatedT, RangeproofParams, Round1Share, TauChallenges,
 };
 pub use scalar::{hash_to_scalar, sk_add, sk_from_bytes, sk_mul, sk_neg, sk_sub, HashDomain};
+pub use session::{
+	delete_session, ensure_sessions_dir, list_session_ids, load_session, quorum_points_from_state,
+	save_session, Negotiator, SessionKind, SessionKey, SessionPhase, SessionRecord, SessionStatus,
+	MAX_ENVELOPE_BYTES, MAX_SESSION_ACTORS,
+};
+// MultisigSessionStartResult / ApplyResult exported via ops above
 pub use share::{
-	add_actor_masked_share, delta_mask, lagrange_coefficient, partial_key_at,
+	canonical_quorum, delta_mask, lagrange_coefficient, partial_key_at, quorum_transcript,
 	reconstruct_secret_at, unmask_sum, ActorPoint,
 };
 pub use store::{
-	ceremony_id_from_db_key, decrypt_from_storage, derive_pending_key, encrypt_for_storage,
-	multisig_db_key, open_pending, seal_pending, MULTISIG_PREFIX, PENDING_KEY_SIZE,
+	ceremony_id_from_db_key, decrypt_from_storage, derive_pending_key, derive_state_key,
+	encrypt_for_storage, multisig_db_key, open_pending, seal_pending, EncryptedMultisigState,
+	MULTISIG_PREFIX, PENDING_KEY_SIZE, STATE_KEY_SIZE, STATE_SEAL_MAGIC, STATE_SEAL_VERSION,
 };
 pub use tx::{
 	build_multisig_spend, build_self_send, create_multisig_output, demo_fund_and_spend,

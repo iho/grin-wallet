@@ -200,6 +200,123 @@ subcommands:
                   long: file
                   takes_value: true
                   required: true
+        - session-list:
+            about: List durable multiparty sessions (WS4 negotiator)
+        - session-status:
+            about: Show status of a sealed session
+            args:
+              - session:
+                  help: Session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+        - session-create-output:
+            about: Start CreateOutput session (multiparty rangeproof); write first envelope
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - coin_number:
+                  help: Coin number
+                  long: coin-number
+                  takes_value: true
+                  required: true
+              - coin_value:
+                  help: Coin value (nanogrins)
+                  long: coin-value
+                  takes_value: true
+                  required: true
+              - session_tag:
+                  help: Shared session tag (all parties must use the same string)
+                  long: session-tag
+                  takes_value: true
+                  default_value: "create-output"
+              - out:
+                  help: Path for our first outbound envelope JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_sess_out.json"
+        - session-create-spend:
+            about: Start Spend session (FROST kernel); write first envelope
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - input:
+                  help: "Input coin as number:value (repeatable)"
+                  long: input
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - output:
+                  help: "Output coin as number:value (repeatable)"
+                  long: output
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - fee:
+                  help: Fee in nanogrins
+                  long: fee
+                  takes_value: true
+                  default_value: "1000000"
+              - session_tag:
+                  help: Shared session tag (all parties must use the same string)
+                  long: session-tag
+                  takes_value: true
+                  default_value: "spend"
+              - out:
+                  help: Path for our first outbound envelope JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_sess_out.json"
+        - session-apply:
+            about: Apply a peer envelope to a session; write new outbound envelopes
+            args:
+              - session:
+                  help: Session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - file:
+                  help: Peer envelope JSON path
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+              - dir:
+                  help: Directory for outbound envelopes
+                  short: d
+                  long: dir
+                  takes_value: true
+                  default_value: "msig_sess_out"
+        - session-abort:
+            about: Abort a session and wipe local secrets
+            args:
+              - session:
+                  help: Session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - reason:
+                  help: Abort reason
+                  long: reason
+                  takes_value: true
+                  default_value: "user abort"
+              - delete:
+                  help: Delete sealed session file after abort
+                  long: delete
+                  takes_value: false
 
   - rewind_hash:
       about: Return the hash of the wallet root public key.

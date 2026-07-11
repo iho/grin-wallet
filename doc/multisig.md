@@ -11,19 +11,20 @@ This is the first implementation slice of RFC-0023 style multisig:
 
 | Done | Not done |
 | --- | --- |
-| Joint Feldman DKG (degree = threshold−1) | Owner/Foreign API + CLI |
+| Joint Feldman DKG (degree = threshold−1) | DKG-as-session + multi-process CLI |
 | PoP on coefficient commitments | Production key rotation / epochs |
 | Share verify against public poly | External crypto audit |
-| Lagrange partial keys + reconstruction | Full FROST (optional upgrade) |
-| δ-masked add-actor (local) | End-to-end slatepack orchestration CLI |
+| Lagrange partial keys + reconstruction | Chain-aware UTXO tracking |
+| δ-masked add-actor (local) | Networked multi-wallet slatepack orchestration |
 | Coin id derivation (number + value) | |
-| LMDB persistence (XOR-obfuscated shares) | |
-| Multiparty Bulletproof (T1/T2/τ rounds) | |
-| Threshold kernel signing (additive aggsig + nonce commit) | |
+| LMDB + export AEAD-sealed (C-08); Debug redacts secrets | |
+| Multiparty Bulletproof (T1/T2/τ + verifiable τ) | |
+| Threshold kernel signing (**FROST** + excess check) | |
 | Slatepack wire messages (DKG / RP / kernel) | |
-| CLI (`grin-wallet multisig ...`) | |
+| CLI + Owner API + JSON-RPC + post-tx | Session CLI/RPC lifecycle |
 | E2E tx build (multiparty RP + kernel, validates) | |
-| Owner API + JSON-RPC + post-tx | |
+| Durable negotiator (CreateOutput + Spend, crash-resume) | |
+| Session CLI + Owner RPC (`multisig_session_*`) | Multi-process soak tests |
 | Unit / integration tests | |
 
 ## Design choices vs draft RFC
@@ -37,8 +38,14 @@ This is the first implementation slice of RFC-0023 style multisig:
 3. **View mix is not claimed to hide the polynomial** if full blinds leak  
    (fixes incorrect HKDF security argument).
 
-4. **Add-actor is implemented but documented as dangerous** under near-quorum  
-   collusion; prefer full re-DKG for membership changes.
+4. **Add-actor is not in the v1 public API** (C-13 / F-03). Membership change =
+   full re-DKG + on-chain sweep.
+
+5. **Canonical quorum order** (C-07): actors sorted by x-coordinate; index 0 is
+   the mix/offset role. `canonical_quorum` / `quorum_from_states` enforce this.
+
+6. **PTE degree floor** (C-11): production params require
+   `num_coefficients() ≥ 4`; tests use `new_allow_low_degree`.
 
 ## Quick API
 
@@ -71,9 +78,10 @@ let ids = wallet.list_multisig_ceremonies()?;
 batch.delete_multisig_state(&ceremony_id)?;
 ```
 
-Shares are XOR-obfuscated with a keychain-derived key before LMDB write
-(same idea as private tx context). This is **not** full encryption at rest
-if the seed is unlocked in the same process.
+Ceremony state is **ChaCha20-Poly1305 sealed** under a keychain-derived key
+before LMDB write and for `export-state` (C-08). Pending DKG uses the same
+cipher with a separate domain key (C-03). Debug formatting redacts share
+material.
 
 ## Tests
 
@@ -90,25 +98,31 @@ use grin_wallet_libwallet::multisig::{
     rangeproof_round2, aggregate_tau, rangeproof_finalize, verify_rangeproof,
 };
 
-// In-process (tests / same-host quorum):
+// In-process (tests / same-host quorum); verifies each partial τ (C-06):
 let (proof, params) = run_rangeproof_local(secp, &public_poly, &quorum, &coin, None)?;
 
 // Networked-style rounds (each actor):
 let (secrets, r1) = rangeproof_round1(secp, &params, &partial_blind)?;
 let agg = aggregate_round1(secp, &all_r1_shares)?;
 let tau_j = rangeproof_round2(secp, &params, &secrets, &agg)?;
-let tau = aggregate_tau(secp, &all_tau)?;
+// Verify before summing — bad τ fails with actor index (identifiable abort):
+let tau = aggregate_tau_verified(
+    secp, &params, &agg, &all_r1_shares, &all_tau, &pub_blinds,
+)?;
 let proof = rangeproof_finalize(secp, &params, &secrets, &agg, &tau)?;
 verify_rangeproof(secp, params.commit, proof, None)?;
 ```
 
 Shared view seed → `shared_nonce` (scan/rewind). Per-actor CSPRNG → `private_nonce`.
+Partial τ check: `τ·G = x·T1 + x²·T2 + z²·P` with `P` from the public poly.
 
 ## Threshold kernel signing API
 
-Uses Grin’s additive aggsig (same family as sender/receiver), with **nonce
-commitments** before reveal. Not full FROST; suitable for a known interactive
-quorum.
+**FROST** (Komlo–Goldberg two-round threshold Schnorr) over Lagrange partial
+excess keys. Each actor samples two nonces `(d, e)`, broadcasts
+`(D, E, X)`, derives binding factors `ρ_j`, and signs with effective nonce
+`k_j = d_j + ρ_j·e_j`. Partials aggregate into an ordinary Grin kernel
+signature that `TxKernel::verify()` accepts unchanged.
 
 ```rust
 use grin_wallet_libwallet::multisig::run_kernel_sign_local;
@@ -119,8 +133,10 @@ let (sig, agg, session) = run_kernel_sign_local(
 // sig verifies against agg.excess_sum for the kernel message
 ```
 
-Per-actor flow: `kernel_prepare` → exchange commitments → reveal nonces →
-`kernel_partial_sign` → `kernel_aggregate_sigs`.
+Per-actor flow: `kernel_round1` → exchange `SigningCommitment`s →
+`aggregate_frost` → `kernel_partial_sign` → `kernel_aggregate_sigs`.
+Rogue-key protection: each claimed `X_j` is checked against the public
+polynomial via `verify_partial_excess` before use.
 
 ## Slatepack wire format
 
@@ -134,7 +150,7 @@ shares) should use age encryption to recipients.
 | `DkgPartialShare` | Private share to one actor (**encrypt**) |
 | `DkgPublicPoly` | Optional joint public poly announce |
 | `RpRound1` / `RpRound2` / `RpFinal` | Multiparty rangeproof rounds |
-| `KernelNonceCommit` / `KernelNonceReveal` | Kernel nonce commit-reveal |
+| `KernelSigningCommit` | FROST round-1 `(D_j, E_j, X_j)` |
 | `KernelPartialSig` / `KernelFinal` | Partial + aggregated kernel sig |
 
 ```rust
@@ -221,15 +237,45 @@ grin-wallet multisig demo-tx -m 2 -n 2 -o /tmp/msig_tx.hex
 grin-wallet multisig post-tx -i /tmp/msig_tx.hex
 ```
 
+## Session negotiator (WS4)
+
+After DKG, multiparty CreateOutput / Spend run as durable sessions:
+
+```bash
+# All parties use the same --session-tag; exchange envelope JSON files.
+grin-wallet multisig session-create-output -c <ceremony-uuid> \
+  --coin-number 1 --coin-value 1000000000 --session-tag my-out -o r1.json
+# Peer applies and may emit the next round:
+grin-wallet multisig session-apply -s <session-id-hex> -i r1.json -d out/
+grin-wallet multisig session-list
+grin-wallet multisig session-status -s <session-id-hex>
+grin-wallet multisig session-abort -s <session-id-hex> --reason "cancel" --delete
+```
+
+Spend: `session-create-spend -c ... --input 1:1000000000 --output 2:999000000 --fee 1000000`
+
+Owner JSON-RPC (experimental, token required):
+
+| Method | Role |
+| --- | --- |
+| `multisig_session_list` | List sealed sessions |
+| `multisig_session_status` | One session status |
+| `multisig_session_create_output` | Start CreateOutput; returns envelope JSON |
+| `multisig_session_create_spend` | Start Spend; returns envelope JSON |
+| `multisig_session_apply` | Apply peer envelope JSON |
+| `multisig_session_abort` | Abort + wipe secrets |
+
 ## Next implementation steps
 
 1. ~~Persist `MultisigWalletState` in the wallet backend.~~
 2. ~~Multiparty rangeproof (τ path).~~
-3. ~~Threshold kernel signing (additive aggsig + nonce commit).~~
+3. ~~Threshold kernel signing (FROST).~~
 4. ~~Slatepack message types for DKG / BP / sign rounds.~~
 5. ~~CLI: `grin-wallet multisig ...`.~~
 6. ~~Owner API JSON-RPC surface.~~
 7. ~~End-to-end send/receive using multisig RP + kernel (local quorum).~~
 8. ~~Post hex tx to node (`multisig_post_tx` / CLI).~~
-9. Chain-aware UTXO selection + wallet output tracking (optional)
-10. Networked multi-wallet orchestration over slatepack messages (optional)
+9. ~~Durable session negotiator + session CLI.~~
+10. ~~Owner RPC for session lifecycle.~~
+11. Chain-aware UTXO selection + wallet output tracking
+12. Multi-process soak tests

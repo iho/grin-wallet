@@ -156,7 +156,7 @@ mod tests {
 	#[test]
 	fn coin_blind_matches_public_components() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 		let q: Vec<ActorPoint> = states
@@ -174,7 +174,7 @@ mod tests {
 	#[test]
 	fn different_values_different_blinds() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 		let q: Vec<ActorPoint> = states

@@ -39,6 +39,7 @@ use super::messages::{
 	build_dkg_contribution, build_dkg_partial_share, parse_dkg_contribution, seckey_from_hex,
 	seckey_to_hex, MultisigBody, MultisigEnvelope,
 };
+// seckey_from_hex also used by rebuild_quorum_from_record
 use super::poly::{verify_share, PublicPoly, SecretPoly};
 use super::types::{
 	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,
@@ -69,7 +70,9 @@ pub struct CeremonySummary {
 }
 
 /// Pending multi-party DKG session (filesystem).
-#[derive(Clone, Debug, Serialize, Deserialize)]
+///
+/// On disk this is always AEAD-encrypted (C-03). Debug redacts secret hex fields (C-08).
+#[derive(Clone, Serialize, Deserialize)]
 pub struct PendingDkg {
 	/// Ceremony id.
 	pub ceremony_id: CeremonyId,
@@ -90,6 +93,21 @@ pub struct PendingDkg {
 	/// shares, which would otherwise double-count into the accumulator (C-04).
 	#[serde(default)]
 	pub applied_share_dealers: Vec<Vec<usize>>,
+}
+
+impl std::fmt::Debug for PendingDkg {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("PendingDkg")
+			.field("ceremony_id", &self.ceremony_id)
+			.field("params", &self.params)
+			.field("actors", &self.actors)
+			.field("my_index", &self.my_index)
+			.field("my_coeff_hexes", &"[redacted]")
+			.field("contributions", &self.contributions)
+			.field("my_share_ys_hex", &"[redacted]")
+			.field("applied_share_dealers", &self.applied_share_dealers)
+			.finish()
+	}
 }
 
 /// Stored public contribution for pending DKG.
@@ -131,9 +149,11 @@ pub fn load_pending(wallet_data_dir: &str, key: &PendingKey) -> Result<Option<Pe
 	let mut blob = Vec::new();
 	f.read_to_end(&mut blob)
 		.map_err(|e| Error::Multisig(format!("read pending: {}", e)))?;
-	let plaintext = super::store::open_pending(key, &blob)?;
+	let mut plaintext = super::store::open_pending(key, &blob)?;
 	let pending: PendingDkg = serde_json::from_slice(&plaintext)
 		.map_err(|e| Error::Multisig(format!("parse pending: {}", e)))?;
+	use zeroize::Zeroize;
+	plaintext.zeroize();
 	Ok(Some(pending))
 }
 
@@ -145,9 +165,11 @@ pub fn save_pending(
 ) -> Result<(), Error> {
 	ensure_multisig_dir(wallet_data_dir)?;
 	let p = pending_path(wallet_data_dir);
-	let plaintext =
+	let mut plaintext =
 		serde_json::to_vec(pending).map_err(|e| Error::Multisig(format!("ser pending: {}", e)))?;
 	let blob = super::store::seal_pending(key, &plaintext)?;
+	use zeroize::Zeroize;
+	plaintext.zeroize();
 	let mut f = File::create(&p).map_err(|e| Error::Multisig(format!("create pending: {}", e)))?;
 	f.write_all(&blob)
 		.map_err(|e| Error::Multisig(format!("write pending: {}", e)))?;
@@ -716,18 +738,31 @@ pub fn read_encrypted_share_file(
 	MultisigEnvelope::from_armored_string(&s, Some(dec_key))
 }
 
-/// Export a completed ceremony state as JSON (plaintext shares — sensitive!).
-pub fn export_state_json(state: &MultisigWalletState, path: &str) -> Result<(), Error> {
-	let s = serde_json::to_string_pretty(state)
-		.map_err(|e| Error::Multisig(format!("ser state: {}", e)))?;
+/// Export a completed ceremony state as an AEAD-sealed blob (C-08).
+///
+/// The file is binary: `MSAE || version || nonce||ciphertext||tag`, sealed under
+/// a keychain-derived state key. **Plaintext share export is no longer offered.**
+pub fn export_state_sealed<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	state: &MultisigWalletState,
+	path: &str,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let keychain = w.keychain(keychain_mask)?;
+	let sealed = super::store::EncryptedMultisigState::seal(&keychain, state)?;
 	let mut f = File::create(path).map_err(|e| Error::Multisig(format!("create: {}", e)))?;
-	f.write_all(s.as_bytes())
+	f.write_all(&sealed.sealed)
 		.map_err(|e| Error::Multisig(format!("write: {}", e)))?;
 	Ok(())
 }
 
-/// Import ceremony state JSON into LMDB.
-pub fn import_state_json<'a, T: ?Sized, C, K>(
+/// Import an AEAD-sealed ceremony state into LMDB (C-08).
+pub fn import_state_sealed<'a, T: ?Sized, C, K>(
 	w: &mut T,
 	keychain_mask: Option<&SecretKey>,
 	path: &str,
@@ -738,11 +773,14 @@ where
 	K: Keychain + 'a,
 {
 	let mut f = File::open(path).map_err(|e| Error::Multisig(format!("open: {}", e)))?;
-	let mut s = String::new();
-	f.read_to_string(&mut s)
+	let mut sealed_bytes = Vec::new();
+	f.read_to_end(&mut sealed_bytes)
 		.map_err(|e| Error::Multisig(format!("read: {}", e)))?;
-	let state: MultisigWalletState =
-		serde_json::from_str(&s).map_err(|e| Error::Multisig(format!("parse state: {}", e)))?;
+	let sealed = super::store::EncryptedMultisigState {
+		sealed: sealed_bytes,
+	};
+	let keychain = w.keychain(keychain_mask)?;
+	let state = sealed.open(&keychain)?;
 	state.config.validate()?;
 	let mut batch = w.batch(keychain_mask)?;
 	batch.save_multisig_state(&state)?;
@@ -750,10 +788,439 @@ where
 	Ok(state)
 }
 
+/// Backward-compatible name: sealed export (C-08). Prefer [`export_state_sealed`].
+pub fn export_state_json<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	state: &MultisigWalletState,
+	path: &str,
+) -> Result<(), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	export_state_sealed(w, keychain_mask, state, path)
+}
+
+/// Backward-compatible name: sealed import (C-08). Prefer [`import_state_sealed`].
+pub fn import_state_json<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	path: &str,
+) -> Result<MultisigWalletState, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	import_state_sealed(w, keychain_mask, path)
+}
+
 /// Resolve wallet_data directory from top-level directory.
 pub fn wallet_data_dir(top_level: &str) -> PathBuf {
 	// Match GRIN_WALLET_DIR constant used by lifecycle
 	Path::new(top_level).join("wallet_data")
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle (WS4 CLI / API surface)
+// ---------------------------------------------------------------------------
+
+use super::session::{
+	delete_session, list_session_ids, load_session, quorum_points_from_state, save_session,
+	Negotiator, SessionKey, SessionStatus,
+};
+use super::store::derive_state_key;
+use super::coin::CoinId;
+
+/// Derive the session AEAD key (reuses state-key domain material).
+pub fn derive_session_key<K: Keychain>(keychain: &K) -> Result<SessionKey, Error> {
+	derive_state_key(keychain)
+}
+
+/// Result of starting a multiparty session (CreateOutput / Spend).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultisigSessionStartResult {
+	/// Session status snapshot.
+	pub status: SessionStatus,
+	/// First outbound envelope as pretty JSON (exchange with peers).
+	pub envelope_json: String,
+}
+
+/// Result of applying a peer envelope.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct MultisigSessionApplyResult {
+	/// Updated session status.
+	pub status: SessionStatus,
+	/// New outbound envelopes as pretty JSON (may be empty).
+	pub outbound_json: Vec<String>,
+}
+
+/// Start a CreateOutput session; returns status + first envelope JSON.
+pub fn session_create_output_raw<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	ceremony_id: &CeremonyId,
+	coin_number: u64,
+	coin_value: u64,
+	session_tag: &str,
+	quorum_indices: Option<&[usize]>,
+) -> Result<MultisigSessionStartResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let quorum = quorum_points_from_state(&secp, &state, quorum_indices)?;
+	let coin = CoinId::new(coin_number, coin_value);
+	let (neg, env) = Negotiator::create_output(
+		&secp,
+		&state.config.public_poly,
+		&quorum,
+		state.config.ceremony_id.clone(),
+		state.config.actors.clone(),
+		state.my_actor.clone(),
+		coin,
+		session_tag.as_bytes(),
+	)?;
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	let envelope_json = serde_json::to_string_pretty(&env)
+		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
+	Ok(MultisigSessionStartResult {
+		status: neg.status(),
+		envelope_json,
+	})
+}
+
+/// Start a CreateOutput session; write our first outbound envelope to `out_path`.
+pub fn session_create_output<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	ceremony_id: &CeremonyId,
+	coin_number: u64,
+	coin_value: u64,
+	session_tag: &str,
+	out_path: &str,
+	quorum_indices: Option<&[usize]>,
+) -> Result<SessionStatus, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let res = session_create_output_raw(
+		w,
+		keychain_mask,
+		wallet_data_dir,
+		ceremony_id,
+		coin_number,
+		coin_value,
+		session_tag,
+		quorum_indices,
+	)?;
+	let mut f = File::create(out_path).map_err(|e| Error::Multisig(format!("create: {}", e)))?;
+	f.write_all(res.envelope_json.as_bytes())
+		.map_err(|e| Error::Multisig(format!("write: {}", e)))?;
+	Ok(res.status)
+}
+
+/// Start a Spend session; returns status + first envelope JSON.
+pub fn session_create_spend_raw<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	ceremony_id: &CeremonyId,
+	inputs: Vec<CoinId>,
+	outputs: Vec<CoinId>,
+	fee: u64,
+	session_tag: &str,
+	quorum_indices: Option<&[usize]>,
+) -> Result<MultisigSessionStartResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let quorum = quorum_points_from_state(&secp, &state, quorum_indices)?;
+	let (neg, env) = Negotiator::create_spend(
+		&secp,
+		&state.config.public_poly,
+		&quorum,
+		state.config.ceremony_id.clone(),
+		state.config.actors.clone(),
+		state.my_actor.clone(),
+		inputs,
+		outputs,
+		fee,
+		session_tag.as_bytes(),
+	)?;
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	let envelope_json = serde_json::to_string_pretty(&env)
+		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
+	Ok(MultisigSessionStartResult {
+		status: neg.status(),
+		envelope_json,
+	})
+}
+
+/// Start a Spend session; write our FROST commit to `out_path`.
+pub fn session_create_spend<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	ceremony_id: &CeremonyId,
+	inputs: Vec<CoinId>,
+	outputs: Vec<CoinId>,
+	fee: u64,
+	session_tag: &str,
+	out_path: &str,
+	quorum_indices: Option<&[usize]>,
+) -> Result<SessionStatus, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let res = session_create_spend_raw(
+		w,
+		keychain_mask,
+		wallet_data_dir,
+		ceremony_id,
+		inputs,
+		outputs,
+		fee,
+		session_tag,
+		quorum_indices,
+	)?;
+	let mut f = File::create(out_path).map_err(|e| Error::Multisig(format!("create: {}", e)))?;
+	f.write_all(res.envelope_json.as_bytes())
+		.map_err(|e| Error::Multisig(format!("write: {}", e)))?;
+	Ok(res.status)
+}
+
+/// Apply a peer envelope JSON string; returns status + outbound envelope JSONs.
+pub fn session_apply_raw<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	peer_envelope_json: &str,
+) -> Result<MultisigSessionApplyResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let session_id = crate::grin_util::from_hex(session_id_hex)
+		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
+	let ceremony_id = record.ceremony_id.clone();
+	let state = get_state(w, keychain_mask, &ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
+	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
+	let env: MultisigEnvelope = serde_json::from_str(peer_envelope_json)
+		.map_err(|e| Error::Multisig(format!("parse peer envelope: {}", e)))?;
+	let outbound = neg.apply(&env)?;
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	let mut outbound_json = Vec::new();
+	for oenv in &outbound {
+		outbound_json.push(
+			serde_json::to_string_pretty(oenv)
+				.map_err(|e| Error::Multisig(format!("ser outbound: {}", e)))?,
+		);
+	}
+	Ok(MultisigSessionApplyResult {
+		status: neg.status(),
+		outbound_json,
+	})
+}
+
+/// Apply a peer envelope file; write any new outbound messages to `out_dir`.
+///
+/// Returns `(status, paths of written outbound envelopes)`.
+pub fn session_apply<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	peer_envelope_path: &str,
+	out_dir: &str,
+) -> Result<(SessionStatus, Vec<String>), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let mut f = File::open(peer_envelope_path)
+		.map_err(|e| Error::Multisig(format!("open peer envelope: {}", e)))?;
+	let mut s = String::new();
+	f.read_to_string(&mut s)
+		.map_err(|e| Error::Multisig(format!("read peer envelope: {}", e)))?;
+	let res = session_apply_raw(w, keychain_mask, wallet_data_dir, session_id_hex, &s)?;
+	fs::create_dir_all(out_dir).map_err(|e| Error::Multisig(format!("mkdir out: {}", e)))?;
+	let mut paths = Vec::new();
+	for (i, json) in res.outbound_json.iter().enumerate() {
+		let path = Path::new(out_dir).join(format!("out_{}_{}.json", session_id_hex, i));
+		let mut of =
+			File::create(&path).map_err(|e| Error::Multisig(format!("create out: {}", e)))?;
+		of.write_all(json.as_bytes())
+			.map_err(|e| Error::Multisig(format!("write out: {}", e)))?;
+		paths.push(path.display().to_string());
+	}
+	Ok((res.status, paths))
+}
+
+/// List sealed session statuses (loads each record).
+pub fn session_list<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+) -> Result<Vec<SessionStatus>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let ids = list_session_ids(wallet_data_dir)?;
+	let mut out = Vec::new();
+	for hex_id in ids {
+		let sid = crate::grin_util::from_hex(&hex_id)
+			.map_err(|e| Error::Multisig(format!("session id: {}", e)))?;
+		match load_session(wallet_data_dir, &session_key, &sid) {
+			Ok(rec) => {
+				let collected = match &rec.phase {
+					super::session::SessionPhase::RpRound1 => rec.rp_r1.len(),
+					super::session::SessionPhase::RpRound2 => rec.rp_tau.len(),
+					super::session::SessionPhase::KernelRound1 => rec.kern_commits.len(),
+					super::session::SessionPhase::KernelRound2 => rec.kern_partials.len(),
+					_ => 0,
+				};
+				out.push(SessionStatus {
+					session_id_hex: hex_id,
+					kind: rec.kind,
+					phase: rec.phase,
+					my_index: rec.my_index,
+					quorum_size: rec.quorum_x_hexes.len(),
+					collected,
+					abort_reason: rec.abort_reason,
+				});
+			}
+			Err(_) => continue,
+		}
+	}
+	Ok(out)
+}
+
+/// Show one session status.
+pub fn session_status<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+) -> Result<SessionStatus, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let session_id = crate::grin_util::from_hex(session_id_hex)
+		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
+	let ceremony_id = record.ceremony_id.clone();
+	let state = get_state(w, keychain_mask, &ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
+	let neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
+	Ok(neg.status())
+}
+
+/// Abort a session and wipe secrets; optionally delete the sealed file.
+pub fn session_abort<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	reason: &str,
+	delete_file: bool,
+) -> Result<SessionStatus, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let session_id = crate::grin_util::from_hex(session_id_hex)
+		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
+	let ceremony_id = record.ceremony_id.clone();
+	let state = get_state(w, keychain_mask, &ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
+	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
+	neg.abort(reason);
+	let st = neg.status();
+	if delete_file {
+		delete_session(wallet_data_dir, &session_id)?;
+	} else {
+		save_session(wallet_data_dir, &session_key, &neg.record)?;
+	}
+	Ok(st)
+}
+
+fn rebuild_quorum_from_record(
+	secp: &Secp256k1,
+	state: &MultisigWalletState,
+	record: &super::session::SessionRecord,
+) -> Result<Vec<super::share::ActorPoint>, Error> {
+	// Map sealed x-hexes back to roster actors (share 0).
+	use super::scalar::sk_from_u64;
+	use super::share::ActorPoint;
+	let dummy_y = sk_from_u64(secp, 1)?;
+	let mut points = Vec::new();
+	for x_hex in &record.quorum_x_hexes {
+		let x = seckey_from_hex(secp, x_hex)?;
+		// Find matching roster actor.
+		let mut found = None;
+		for actor in &state.config.actors {
+			let ax = actor.x_coordinate_share(secp, 0)?;
+			if ax.0 == x.0 {
+				let y = if actor.id == state.my_actor.id {
+					state
+						.shares
+						.get(0)
+						.map(|s| s.y.clone())
+						.ok_or_else(|| Error::Multisig("no shares".into()))?
+				} else {
+					dummy_y.clone()
+				};
+				found = Some(ActorPoint { x, y });
+				break;
+			}
+		}
+		points.push(found.ok_or_else(|| {
+			Error::Multisig(format!("quorum x {} not in ceremony roster", x_hex))
+		})?);
+	}
+	Ok(points)
 }
 
 #[cfg(test)]
@@ -795,6 +1262,7 @@ mod tests {
 		let c0 = w0.join("contrib0.json");
 		let c1 = w1.join("contrib1.json");
 
+		// shares_per_actor = None → recommended (C-11 production floor).
 		dkg_start(
 			w0s,
 			&k0,
@@ -802,7 +1270,7 @@ mod tests {
 			2,
 			2,
 			0,
-			Some(1),
+			None,
 			Some(roster.clone()),
 			Some(cid.clone()),
 			c0.to_str().unwrap(),
@@ -815,7 +1283,7 @@ mod tests {
 			2,
 			2,
 			1,
-			Some(1),
+			None,
 			Some(roster.clone()),
 			Some(cid.clone()),
 			c1.to_str().unwrap(),
@@ -840,10 +1308,11 @@ mod tests {
 		dkg_import_contrib(w0s, &k0, &env_c1).unwrap();
 		dkg_import_contrib(w1s, &k1, &env_c0).unwrap();
 
-		// Actor 1 exports the share addressed to actor 0.
+		// Actor 1 exports shares addressed to actor 0 (one file per share index;
+		// recommended shares_per_actor for M=2 is 2 under C-11).
 		let paths1 =
 			dkg_export_shares(w1s, &k1, &addr1, &sk1, w1.join("out").to_str().unwrap()).unwrap();
-		assert_eq!(paths1.len(), 1);
+		assert_eq!(paths1.len(), 2);
 
 		let share_env = read_encrypted_share_file(&paths1[0], &sk0).unwrap();
 		share_env.verify_signature().unwrap();

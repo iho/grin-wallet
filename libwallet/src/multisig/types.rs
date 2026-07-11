@@ -46,13 +46,54 @@ pub struct ThresholdParams {
 }
 
 impl ThresholdParams {
-	/// Create params with one share per actor.
+	/// Create params with one share per actor (enforces the PTE degree floor, C-11).
+	///
+	/// For M < [`MIN_SHARES_FOR_DEGREE`], use
+	/// [`with_shares_per_actor`] with [`recommended_shares_per_actor`], or
+	/// [`new_allow_low_degree`] for tests only.
 	pub fn new(threshold: usize, total_actors: usize) -> Result<Self, Error> {
 		Self::with_shares_per_actor(threshold, total_actors, 1)
 	}
 
+	/// Create params with one share per actor **without** the PTE degree floor.
+	///
+	/// **Tests / local-sim only.** Production ceremonies must satisfy
+	/// `effective_degree + 1 ≥ MIN_SHARES_FOR_DEGREE` (C-11 / F-08).
+	pub fn new_allow_low_degree(threshold: usize, total_actors: usize) -> Result<Self, Error> {
+		Self::with_shares_per_actor_allow_low_degree(threshold, total_actors, 1)
+	}
+
 	/// Create params, optionally with multiple shares per actor.
+	///
+	/// Rejects configurations where `num_coefficients() < MIN_SHARES_FOR_DEGREE`
+	/// (C-11). Prefer [`recommended_shares_per_actor`] when M is small.
 	pub fn with_shares_per_actor(
+		threshold: usize,
+		total_actors: usize,
+		shares_per_actor: usize,
+	) -> Result<Self, Error> {
+		let p = Self::with_shares_per_actor_allow_low_degree(
+			threshold,
+			total_actors,
+			shares_per_actor,
+		)?;
+		if p.num_coefficients() < MIN_SHARES_FOR_DEGREE {
+			return Err(Error::Multisig(format!(
+				"polynomial degree too low for production (num_coefficients={} < MIN_SHARES_FOR_DEGREE={}); \
+				 raise shares_per_actor to {} (see ThresholdParams::recommended_shares_per_actor), \
+				 or use with_shares_per_actor_allow_low_degree for tests only",
+				p.num_coefficients(),
+				MIN_SHARES_FOR_DEGREE,
+				Self::recommended_shares_per_actor(threshold)
+			)));
+		}
+		Ok(p)
+	}
+
+	/// Like [`with_shares_per_actor`] but skips the PTE degree floor (C-11).
+	///
+	/// **Tests / local-sim only** — not for ceremonies that hold real value.
+	pub fn with_shares_per_actor_allow_low_degree(
 		threshold: usize,
 		total_actors: usize,
 		shares_per_actor: usize,
@@ -97,6 +138,60 @@ impl ThresholdParams {
 		// Need threshold * k >= MIN_SHARES_FOR_DEGREE  =>  k = ceil(MIN / threshold)
 		let min = MIN_SHARES_FOR_DEGREE;
 		(min + threshold - 1) / threshold
+	}
+
+	/// Whether this configuration meets the production PTE degree floor (C-11).
+	pub fn meets_degree_floor(&self) -> bool {
+		self.num_coefficients() >= MIN_SHARES_FOR_DEGREE
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn secret_share_debug_redacts() {
+		let secp = crate::grin_util::secp::Secp256k1::with_caps(
+			crate::grin_util::secp::ContextFlag::Commit,
+		);
+		let y = crate::multisig::scalar::sk_from_u64(&secp, 7).unwrap();
+		let x = crate::multisig::scalar::sk_from_u64(&secp, 3).unwrap();
+		let s = SecretShare {
+			share_index: 0,
+			x,
+			y,
+		};
+		let dbg = format!("{:?}", s);
+		assert!(dbg.contains("redacted"), "got: {}", dbg);
+		// Must not dump raw secret-key Debug (which would include byte arrays).
+		assert!(!dbg.contains("SecretKey("), "got: {}", dbg);
+	}
+
+	#[test]
+	fn production_rejects_low_degree() {
+		// 2-of-3 with 1 share ⇒ degree 1, coefficients 2 < 4
+		assert!(ThresholdParams::new(2, 3).is_err());
+		assert!(ThresholdParams::with_shares_per_actor(2, 3, 1).is_err());
+		// Dev path still allowed
+		assert!(ThresholdParams::new_allow_low_degree(2, 3).is_ok());
+		// Recommended k for M=2 is 2 → coefficients = 4
+		let k = ThresholdParams::recommended_shares_per_actor(2);
+		assert_eq!(k, 2);
+		let p = ThresholdParams::with_shares_per_actor(2, 3, k).unwrap();
+		assert!(p.meets_degree_floor());
+		assert_eq!(p.num_coefficients(), 4);
+	}
+
+	#[test]
+	fn three_of_n_with_one_share_meets_floor() {
+		// M=3, k=1 ⇒ coefficients 3 still < 4
+		assert!(ThresholdParams::new(3, 5).is_err());
+		let k = ThresholdParams::recommended_shares_per_actor(3);
+		assert_eq!(k, 2);
+		assert!(ThresholdParams::with_shares_per_actor(3, 5, k)
+			.unwrap()
+			.meets_degree_floor());
 	}
 }
 
@@ -247,8 +342,9 @@ impl MultisigConfig {
 /// Local state held by one actor after DKG (must be backed up).
 ///
 /// **Note:** Under Feldman DKG the share cannot be re-derived from a BIP39
-/// seed alone; this structure is the backup unit.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// seed alone; this structure is the backup unit. Persist only via AEAD-sealed
+/// storage / export (C-08) — never log or print Debug in production.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct MultisigWalletState {
 	/// Shared configuration.
 	pub config: MultisigConfig,
@@ -259,8 +355,18 @@ pub struct MultisigWalletState {
 	pub shares: Vec<SecretShare>,
 }
 
+impl std::fmt::Debug for MultisigWalletState {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("MultisigWalletState")
+			.field("config", &self.config)
+			.field("my_actor", &self.my_actor)
+			.field("shares", &format_args!("[{} shares, redacted]", self.shares.len()))
+			.finish()
+	}
+}
+
 /// One secret share evaluation.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SecretShare {
 	/// Share index for this actor (`0..shares_per_actor`).
 	pub share_index: usize,
@@ -268,6 +374,16 @@ pub struct SecretShare {
 	pub x: SecretKey,
 	/// y = sk(x) secret evaluation.
 	pub y: SecretKey,
+}
+
+impl std::fmt::Debug for SecretShare {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SecretShare")
+			.field("share_index", &self.share_index)
+			.field("x", &"[redacted]")
+			.field("y", &"[redacted]")
+			.finish()
+	}
 }
 
 impl MultisigWalletState {

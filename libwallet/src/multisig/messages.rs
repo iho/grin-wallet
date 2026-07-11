@@ -25,7 +25,7 @@
 //! | --- | --- |
 //! | DKG | contribution broadcast, private partial share |
 //! | Rangeproof | round1 T1/T2, round2 τ, finalize proof |
-//! | Kernel | nonce commit, nonce reveal, partial sig, final sig |
+//! | Kernel | FROST signing commit (D,E,X), partial sig, final sig |
 //!
 //! **Status:** experimental wire format; version field allows future changes.
 
@@ -44,7 +44,7 @@ use uuid::Uuid;
 
 use super::coin::CoinId;
 use super::dkg::{DealerContribution, PopProof};
-use super::kernel::{NonceCommitment, NonceReveal};
+use super::kernel::SigningCommitment;
 use super::poly::PublicPoly;
 use super::rangeproof::{AggregatedT, RangeproofParams, Round1Share};
 use super::types::{ActorId, CeremonyId, ThresholdParams};
@@ -95,11 +95,9 @@ pub enum MultisigBody {
 	/// Finalized rangeproof (any actor may broadcast).
 	RpFinal(RpFinalMsg),
 
-	// --- Kernel ---
-	/// Hash commitment to signing nonce.
-	KernelNonceCommit(KernelNonceCommitMsg),
-	/// Reveal of public nonce + partial excess pubkey.
-	KernelNonceReveal(KernelNonceRevealMsg),
+	// --- Kernel (FROST) ---
+	/// Round-1 FROST signing commitment `(D_j, E_j, X_j)`.
+	KernelSigningCommit(KernelSigningCommitMsg),
 	/// Partial kernel signature.
 	KernelPartialSig(KernelPartialSigMsg),
 	/// Aggregated final kernel signature.
@@ -217,29 +215,18 @@ pub struct KernelSessionWire {
 	pub outputs: Vec<CoinId>,
 }
 
-/// Nonce commitment round.
+/// FROST round-1 signing commitment (broadcast).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct KernelNonceCommitMsg {
-	/// Session.
+pub struct KernelSigningCommitMsg {
+	/// Session (public fields; first committer typically embeds full session).
 	pub session: KernelSessionWire,
-	/// Actor index in quorum.
+	/// Actor index in the ordered quorum.
 	pub actor_index: usize,
-	/// SHA256 commitment hex (32 bytes).
-	pub commit_hash_hex: String,
-	/// Public partial excess hex (can be sent early for convenience).
-	pub pub_excess_hex: String,
-}
-
-/// Nonce reveal round.
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
-pub struct KernelNonceRevealMsg {
-	/// Session id hex (bind).
-	pub session_id_hex: String,
-	/// Actor index.
-	pub actor_index: usize,
-	/// Public nonce hex.
-	pub pub_nonce_hex: String,
-	/// Public partial excess hex.
+	/// Hiding-nonce commitment `D_j` hex (compressed pubkey).
+	pub pub_d_hex: String,
+	/// Binding-nonce commitment `E_j` hex (compressed pubkey).
+	pub pub_e_hex: String,
+	/// Public partial excess `X_j` hex (compressed pubkey).
 	pub pub_excess_hex: String,
 }
 
@@ -692,15 +679,14 @@ pub fn build_rp_final(
 	)
 }
 
-/// Build kernel nonce-commit message.
-pub fn build_kernel_nonce_commit(
+/// Build FROST round-1 signing-commitment message.
+pub fn build_kernel_signing_commit(
 	secp: &Secp256k1,
 	ceremony_id: CeremonyId,
 	sender: ActorId,
 	session: &super::kernel::KernelSession,
 	actor_index: usize,
-	commitment: &NonceCommitment,
-	pub_excess: &PublicKey,
+	commitment: &SigningCommitment,
 ) -> MultisigEnvelope {
 	let wire = KernelSessionWire {
 		session_id_hex: session.session_id.to_hex(),
@@ -715,45 +701,25 @@ pub fn build_kernel_nonce_commit(
 	MultisigEnvelope::new(
 		ceremony_id,
 		sender,
-		MultisigBody::KernelNonceCommit(KernelNonceCommitMsg {
+		MultisigBody::KernelSigningCommit(KernelSigningCommitMsg {
 			session: wire,
 			actor_index,
-			commit_hash_hex: commitment.hash.to_vec().to_hex(),
-			pub_excess_hex: pubkey_to_hex(secp, pub_excess),
+			pub_d_hex: pubkey_to_hex(secp, &commitment.pub_d),
+			pub_e_hex: pubkey_to_hex(secp, &commitment.pub_e),
+			pub_excess_hex: pubkey_to_hex(secp, &commitment.pub_excess),
 		}),
 	)
 	.with_session_id(&session.session_id)
 }
 
-/// Build kernel nonce-reveal message.
-pub fn build_kernel_nonce_reveal(
+/// Parse FROST signing commitment from wire.
+pub fn parse_kernel_signing_commit(
 	secp: &Secp256k1,
-	ceremony_id: CeremonyId,
-	sender: ActorId,
-	session_id: &[u8],
-	actor_index: usize,
-	reveal: &NonceReveal,
-) -> MultisigEnvelope {
-	MultisigEnvelope::new(
-		ceremony_id,
-		sender,
-		MultisigBody::KernelNonceReveal(KernelNonceRevealMsg {
-			session_id_hex: session_id.to_hex(),
-			actor_index,
-			pub_nonce_hex: pubkey_to_hex(secp, &reveal.pub_nonce),
-			pub_excess_hex: pubkey_to_hex(secp, &reveal.pub_excess),
-		}),
-	)
-	.with_session_id(session_id)
-}
-
-/// Parse nonce reveal from wire.
-pub fn parse_kernel_nonce_reveal(
-	secp: &Secp256k1,
-	msg: &KernelNonceRevealMsg,
-) -> Result<NonceReveal, Error> {
-	Ok(NonceReveal {
-		pub_nonce: pubkey_from_hex(secp, &msg.pub_nonce_hex)?,
+	msg: &KernelSigningCommitMsg,
+) -> Result<SigningCommitment, Error> {
+	Ok(SigningCommitment {
+		pub_d: pubkey_from_hex(secp, &msg.pub_d_hex)?,
+		pub_e: pubkey_from_hex(secp, &msg.pub_e_hex)?,
 		pub_excess: pubkey_from_hex(secp, &msg.pub_excess_hex)?,
 	})
 }
@@ -836,7 +802,7 @@ mod tests {
 			MultisigBody::DkgPublicPoly(DkgPublicPolyMsg {
 				coefficient_hexes: vec!["aabb".into()],
 				actors: vec![ActorId::from_index(0)],
-				params: ThresholdParams::new(1, 1).unwrap(),
+				params: ThresholdParams::new_allow_low_degree(1, 1).unwrap(),
 			}),
 		);
 		let bytes = env.to_payload_bytes().unwrap();
@@ -849,7 +815,7 @@ mod tests {
 	fn dkg_contribution_wire_roundtrip() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let ceremony = CeremonyId::new();
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let actor = ActorId::from_index(0);
 		let (_sec, contrib) =
 			generate_dealer_contribution(&secp, &ceremony, actor.clone(), &params).unwrap();
@@ -872,7 +838,7 @@ mod tests {
 	#[test]
 	fn rp_and_kernel_messages_roundtrip() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let ceremony = CeremonyId::new();
 		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, ceremony.clone(), params, actors).unwrap();

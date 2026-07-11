@@ -1666,6 +1666,7 @@ dependencies = [
  "thiserror",
  "uuid",
  "x25519-dalek 0.6.0",
+ "zeroize",
 ]
 
 [[package]]

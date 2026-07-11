@@ -14,75 +14,99 @@
 
 //! Persistence helpers for multisig wallet state.
 //!
-//! Secret shares are XOR-obfuscated with a keychain-derived key before
-//! writing to LMDB (same pattern as private tx context). This is not a
-//! substitute for full-disk encryption, but keeps share material from
-//! sitting in plaintext next to other wallet metadata.
+//! ## At-rest encryption (C-03 / C-08)
+//!
+//! - **Pending DKG file** and **LMDB ceremony state** are sealed with
+//!   ChaCha20-Poly1305 under a keychain-derived key (authenticated encryption).
+//! - Plaintext JSON is zeroized after sealing.
+//! - XOR-only obfuscation of shares is **removed** — it had no integrity and
+//!   bit-flips silently corrupted secrets.
 
 use crate::blake2::blake2b::Blake2b;
 use crate::grin_core::ser;
 use crate::grin_keychain::{Keychain, SwitchCommitmentType};
-use crate::grin_util::secp::constants::SECRET_KEY_SIZE;
-use crate::grin_util::secp::key::SecretKey;
 use crate::Error;
 use chacha20poly1305::aead::{Aead, NewAead};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use rand::RngCore;
+use zeroize::Zeroize;
 
 use super::types::{CeremonyId, MultisigWalletState};
 
 /// LMDB key prefix for multisig wallet states (`m` = 0x6d).
 pub const MULTISIG_PREFIX: u8 = b'm';
 
-/// Size of the symmetric key used for pending-ceremony AEAD (bytes).
+/// Size of the symmetric key used for AEAD (bytes).
 pub const PENDING_KEY_SIZE: usize = 32;
+/// Alias for the state-storage key size (same cipher).
+pub const STATE_KEY_SIZE: usize = PENDING_KEY_SIZE;
 /// ChaCha20-Poly1305 nonce size (bytes).
-const PENDING_NONCE_SIZE: usize = 12;
+const AEAD_NONCE_SIZE: usize = 12;
 /// Poly1305 tag size (bytes).
-const PENDING_TAG_SIZE: usize = 16;
+const AEAD_TAG_SIZE: usize = 16;
+
+/// Magic prefix for AEAD-sealed multisig state blobs in LMDB / export files.
+pub const STATE_SEAL_MAGIC: &[u8; 4] = b"MSAE";
+/// Sealed-state format version.
+pub const STATE_SEAL_VERSION: u8 = 1;
 
 /// Derive a 32-byte symmetric key from the wallet keychain for at-rest
-/// encryption of pending DKG ceremony state.
-///
-/// The pending file holds this dealer's **secret** polynomial coefficients and
-/// running share accumulators (C-03); it must never sit on disk in plaintext.
-/// The key is domain-separated from the share-obfuscation key so the two never
-/// collide.
+/// encryption of pending DKG ceremony state (C-03).
 pub fn derive_pending_key<K: Keychain>(keychain: &K) -> Result<[u8; PENDING_KEY_SIZE], Error> {
+	derive_domain_key(keychain, b"grin-msig/pending-key-v1")
+}
+
+/// Derive a 32-byte key for LMDB / backup sealing of completed ceremony state (C-08).
+pub fn derive_state_key<K: Keychain>(keychain: &K) -> Result<[u8; STATE_KEY_SIZE], Error> {
+	derive_domain_key(keychain, b"grin-msig/state-key-v1")
+}
+
+fn derive_domain_key<K: Keychain>(
+	keychain: &K,
+	domain: &[u8],
+) -> Result<[u8; PENDING_KEY_SIZE], Error> {
 	let root_key = keychain.derive_key(0, &K::root_key_id(), SwitchCommitmentType::Regular)?;
 	let mut hasher = Blake2b::new(PENDING_KEY_SIZE);
 	hasher.update(&root_key.0[..]);
-	hasher.update(b"grin-msig/pending-key-v1");
+	hasher.update(domain);
 	let out = hasher.finalize();
 	let mut ret = [0u8; PENDING_KEY_SIZE];
 	ret.copy_from_slice(&out.as_bytes()[0..PENDING_KEY_SIZE]);
 	Ok(ret)
 }
 
-/// Encrypt pending-ceremony bytes: output is `nonce(12) || ciphertext || tag`.
+/// Encrypt bytes: output is `nonce(12) || ciphertext || tag`.
 pub fn seal_pending(key: &[u8; PENDING_KEY_SIZE], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
+	seal_aead(key, plaintext)
+}
+
+/// Decrypt bytes produced by [`seal_pending`].
+pub fn open_pending(key: &[u8; PENDING_KEY_SIZE], blob: &[u8]) -> Result<Vec<u8>, Error> {
+	open_aead(key, blob)
+}
+
+fn seal_aead(key: &[u8; 32], plaintext: &[u8]) -> Result<Vec<u8>, Error> {
 	let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-	let mut nonce_bytes = [0u8; PENDING_NONCE_SIZE];
+	let mut nonce_bytes = [0u8; AEAD_NONCE_SIZE];
 	rand::thread_rng().fill_bytes(&mut nonce_bytes);
 	let ct = cipher
 		.encrypt(Nonce::from_slice(&nonce_bytes), plaintext)
-		.map_err(|e| Error::Multisig(format!("pending seal failed: {:?}", e)))?;
-	let mut out = Vec::with_capacity(PENDING_NONCE_SIZE + ct.len());
+		.map_err(|e| Error::Multisig(format!("aead seal failed: {:?}", e)))?;
+	let mut out = Vec::with_capacity(AEAD_NONCE_SIZE + ct.len());
 	out.extend_from_slice(&nonce_bytes);
 	out.extend_from_slice(&ct);
 	Ok(out)
 }
 
-/// Decrypt pending-ceremony bytes produced by [`seal_pending`].
-pub fn open_pending(key: &[u8; PENDING_KEY_SIZE], blob: &[u8]) -> Result<Vec<u8>, Error> {
-	if blob.len() < PENDING_NONCE_SIZE + PENDING_TAG_SIZE {
-		return Err(Error::Multisig("pending blob too short".into()));
+fn open_aead(key: &[u8; 32], blob: &[u8]) -> Result<Vec<u8>, Error> {
+	if blob.len() < AEAD_NONCE_SIZE + AEAD_TAG_SIZE {
+		return Err(Error::Multisig("aead blob too short".into()));
 	}
 	let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-	let nonce = Nonce::from_slice(&blob[0..PENDING_NONCE_SIZE]);
+	let nonce = Nonce::from_slice(&blob[0..AEAD_NONCE_SIZE]);
 	cipher
-		.decrypt(nonce, &blob[PENDING_NONCE_SIZE..])
-		.map_err(|_| Error::Multisig("pending decrypt failed (wrong key or corrupt file)".into()))
+		.decrypt(nonce, &blob[AEAD_NONCE_SIZE..])
+		.map_err(|_| Error::Multisig("aead decrypt failed (wrong key or corrupt data)".into()))
 }
 
 /// Build DB key for a ceremony: `prefix || uuid_bytes`.
@@ -102,74 +126,100 @@ pub fn ceremony_id_from_db_key(key: &[u8]) -> Result<CeremonyId, Error> {
 	Ok(CeremonyId(uuid::Uuid::from_bytes(bytes)))
 }
 
-/// Derive per-share XOR mask from the wallet master key material.
-fn share_xor_key<K: Keychain>(
-	keychain: &K,
-	ceremony_id: &CeremonyId,
-	share_index: usize,
-	label: &[u8],
-) -> Result<[u8; SECRET_KEY_SIZE], Error> {
-	let root_key = keychain.derive_key(0, &K::root_key_id(), SwitchCommitmentType::Regular)?;
-	let mut hasher = Blake2b::new(SECRET_KEY_SIZE);
-	hasher.update(&root_key.0[..]);
-	hasher.update(ceremony_id.0.as_bytes());
-	hasher.update(label);
-	hasher.update(&(share_index as u32).to_be_bytes());
-	let out = hasher.finalize();
-	let mut ret = [0u8; SECRET_KEY_SIZE];
-	ret.copy_from_slice(&out.as_bytes()[0..SECRET_KEY_SIZE]);
-	Ok(ret)
+/// AEAD-sealed multisig state for LMDB / file export (C-08).
+///
+/// On-disk layout: `magic(4) || version(1) || nonce||ct||tag`.
+#[derive(Clone)]
+pub struct EncryptedMultisigState {
+	/// Full sealed blob including magic + version.
+	pub sealed: Vec<u8>,
 }
 
-fn xor_secret(sk: &mut SecretKey, mask: &[u8; SECRET_KEY_SIZE]) {
-	for i in 0..SECRET_KEY_SIZE {
-		sk.0[i] ^= mask[i];
+impl EncryptedMultisigState {
+	/// Seal a wallet state under a keychain-derived state key.
+	pub fn seal<K: Keychain>(
+		keychain: &K,
+		state: &MultisigWalletState,
+	) -> Result<Self, Error> {
+		let key = derive_state_key(keychain)?;
+		Self::seal_with_key(&key, state)
+	}
+
+	/// Seal with an explicit 32-byte key (tests / export).
+	pub fn seal_with_key(
+		key: &[u8; STATE_KEY_SIZE],
+		state: &MultisigWalletState,
+	) -> Result<Self, Error> {
+		let mut plaintext = serde_json::to_vec(state)
+			.map_err(|e| Error::Multisig(format!("ser state for seal: {}", e)))?;
+		let body = seal_aead(key, &plaintext)?;
+		plaintext.zeroize();
+		let mut sealed = Vec::with_capacity(5 + body.len());
+		sealed.extend_from_slice(STATE_SEAL_MAGIC);
+		sealed.push(STATE_SEAL_VERSION);
+		sealed.extend_from_slice(&body);
+		Ok(Self { sealed })
+	}
+
+	/// Open a sealed blob with a keychain-derived state key.
+	pub fn open<K: Keychain>(&self, keychain: &K) -> Result<MultisigWalletState, Error> {
+		let key = derive_state_key(keychain)?;
+		self.open_with_key(&key)
+	}
+
+	/// Open with an explicit key.
+	pub fn open_with_key(&self, key: &[u8; STATE_KEY_SIZE]) -> Result<MultisigWalletState, Error> {
+		if self.sealed.len() < 5 + AEAD_NONCE_SIZE + AEAD_TAG_SIZE {
+			return Err(Error::Multisig("sealed multisig state too short".into()));
+		}
+		if &self.sealed[0..4] != STATE_SEAL_MAGIC {
+			return Err(Error::Multisig(
+				"not an AEAD-sealed multisig state (missing MSAE magic); \
+				 pre-C-08 XOR-obfuscated blobs are no longer supported"
+					.into(),
+			));
+		}
+		if self.sealed[4] != STATE_SEAL_VERSION {
+			return Err(Error::Multisig(format!(
+				"unsupported sealed multisig version {}",
+				self.sealed[4]
+			)));
+		}
+		let mut plaintext = open_aead(key, &self.sealed[5..])?;
+		let state: MultisigWalletState = serde_json::from_slice(&plaintext)
+			.map_err(|e| Error::Multisig(format!("parse sealed state: {}", e)))?;
+		plaintext.zeroize();
+		Ok(state)
 	}
 }
 
-/// Clone state and XOR-obfuscate all share secrets for storage.
+impl ser::Writeable for EncryptedMultisigState {
+	fn write<W: ser::Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
+		writer.write_bytes(&self.sealed)
+	}
+}
+
+impl ser::Readable for EncryptedMultisigState {
+	fn read<R: ser::Reader>(reader: &mut R) -> Result<EncryptedMultisigState, ser::Error> {
+		let sealed = reader.read_bytes_len_prefix()?;
+		Ok(EncryptedMultisigState { sealed })
+	}
+}
+
+/// Encrypt ceremony state for LMDB (AEAD, C-08).
 pub fn encrypt_for_storage<K: Keychain>(
 	keychain: &K,
 	state: &MultisigWalletState,
-) -> Result<MultisigWalletState, Error> {
-	let mut stored = state.clone();
-	let ceremony = &stored.config.ceremony_id;
-	for share in &mut stored.shares {
-		let x_mask = share_xor_key(keychain, ceremony, share.share_index, b"msig-x")?;
-		let y_mask = share_xor_key(keychain, ceremony, share.share_index, b"msig-y")?;
-		xor_secret(&mut share.x, &x_mask);
-		xor_secret(&mut share.y, &y_mask);
-	}
-	Ok(stored)
+) -> Result<EncryptedMultisigState, Error> {
+	EncryptedMultisigState::seal(keychain, state)
 }
 
-/// Reverse XOR obfuscation after loading from storage.
+/// Decrypt ceremony state loaded from LMDB (AEAD, C-08).
 pub fn decrypt_from_storage<K: Keychain>(
 	keychain: &K,
-	state: &mut MultisigWalletState,
-) -> Result<(), Error> {
-	// encrypt is its own inverse
-	let ceremony = state.config.ceremony_id.clone();
-	for share in &mut state.shares {
-		let x_mask = share_xor_key(keychain, &ceremony, share.share_index, b"msig-x")?;
-		let y_mask = share_xor_key(keychain, &ceremony, share.share_index, b"msig-y")?;
-		xor_secret(&mut share.x, &x_mask);
-		xor_secret(&mut share.y, &y_mask);
-	}
-	Ok(())
-}
-
-impl ser::Writeable for MultisigWalletState {
-	fn write<W: ser::Writer>(&self, writer: &mut W) -> Result<(), ser::Error> {
-		writer.write_bytes(&serde_json::to_vec(self).map_err(|_| ser::Error::CorruptedData)?)
-	}
-}
-
-impl ser::Readable for MultisigWalletState {
-	fn read<R: ser::Reader>(reader: &mut R) -> Result<MultisigWalletState, ser::Error> {
-		let data = reader.read_bytes_len_prefix()?;
-		serde_json::from_slice(&data[..]).map_err(|_| ser::Error::CorruptedData)
-	}
+	encrypted: &EncryptedMultisigState,
+) -> Result<MultisigWalletState, Error> {
+	encrypted.open(keychain)
 }
 
 #[cfg(test)]
@@ -183,20 +233,46 @@ mod tests {
 	#[test]
 	fn encrypt_decrypt_roundtrip() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 		let original = states[0].clone();
 
 		let keychain = ExtKeychain::from_random_seed(false).unwrap();
 		let encrypted = encrypt_for_storage(&keychain, &original).unwrap();
-		// Ciphertext should differ from plaintext shares
-		assert_ne!(encrypted.shares[0].y.0, original.shares[0].y.0);
+		// Sealed blob must not contain raw share bytes.
+		assert!(encrypted.sealed.windows(32).all(|w| w != &original.shares[0].y.0[..]));
+		assert_eq!(&encrypted.sealed[0..4], STATE_SEAL_MAGIC);
 
-		let mut decrypted = encrypted;
-		decrypt_from_storage(&keychain, &mut decrypted).unwrap();
+		let decrypted = decrypt_from_storage(&keychain, &encrypted).unwrap();
 		assert_eq!(decrypted.shares[0].y.0, original.shares[0].y.0);
 		assert_eq!(decrypted.shares[0].x.0, original.shares[0].x.0);
+		assert_eq!(decrypted.config.ceremony_id.0, original.config.ceremony_id.0);
+	}
+
+	#[test]
+	fn sealed_state_wrong_key_rejected() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
+		let kc1 = ExtKeychain::from_random_seed(false).unwrap();
+		let kc2 = ExtKeychain::from_random_seed(false).unwrap();
+		let sealed = encrypt_for_storage(&kc1, &states[0]).unwrap();
+		assert!(decrypt_from_storage(&kc2, &sealed).is_err());
+	}
+
+	#[test]
+	fn sealed_state_tamper_rejected() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
+		let keychain = ExtKeychain::from_random_seed(false).unwrap();
+		let mut sealed = encrypt_for_storage(&keychain, &states[0]).unwrap();
+		let last = sealed.sealed.len() - 1;
+		sealed.sealed[last] ^= 0x5a;
+		assert!(decrypt_from_storage(&keychain, &sealed).is_err());
 	}
 
 	#[test]
@@ -213,8 +289,7 @@ mod tests {
 		let key = derive_pending_key(&keychain).unwrap();
 		let plaintext = b"secret dealer coefficients and share accumulators";
 		let blob = seal_pending(&key, plaintext).unwrap();
-		// Ciphertext must not contain the plaintext and must be longer (nonce + tag).
-		assert!(blob.len() > plaintext.len() + PENDING_NONCE_SIZE);
+		assert!(blob.len() > plaintext.len() + AEAD_NONCE_SIZE);
 		assert!(blob.windows(plaintext.len()).all(|w| w != &plaintext[..]));
 		let recovered = open_pending(&key, &blob).unwrap();
 		assert_eq!(recovered, plaintext);
@@ -228,7 +303,6 @@ mod tests {
 		let k2 = derive_pending_key(&kc2).unwrap();
 		assert_ne!(k1, k2);
 		let blob = seal_pending(&k1, b"payload").unwrap();
-		// Decrypt with a different key must fail (AEAD tag mismatch), not silently corrupt.
 		assert!(open_pending(&k2, &blob).is_err());
 	}
 
@@ -237,9 +311,16 @@ mod tests {
 		let keychain = ExtKeychain::from_random_seed(false).unwrap();
 		let key = derive_pending_key(&keychain).unwrap();
 		let mut blob = seal_pending(&key, b"payload").unwrap();
-		// Flip a ciphertext byte; AEAD must reject.
 		let last = blob.len() - 1;
 		blob[last] ^= 0x01;
 		assert!(open_pending(&key, &blob).is_err());
+	}
+
+	#[test]
+	fn state_and_pending_keys_differ() {
+		let keychain = ExtKeychain::from_random_seed(false).unwrap();
+		let p = derive_pending_key(&keychain).unwrap();
+		let s = derive_state_key(&keychain).unwrap();
+		assert_ne!(p, s);
 	}
 }

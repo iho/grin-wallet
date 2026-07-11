@@ -23,7 +23,7 @@ Multisig is production ready when **all** of the following gates pass. Everythin
 
 ### Gate G1 — Cryptographic soundness
 - [ ] RFC-0023 revision frozen with: degree/threshold rule, multi-share policy, named DKG variant, named threshold-signing scheme, PoP transcript, hash-to-scalar spec, wire transcripts.
-- [ ] Kernel signing uses a scheme with published security analysis (FROST for M-of-N; MuSig2 acceptable for an N-of-N cosign track) — **not** the current ad-hoc additive aggsig + hash-commit.
+- [x] Kernel signing uses FROST (Komlo–Goldberg two-round threshold Schnorr) over Lagrange partial excess keys — implementation complete in `kernel.rs`; residual: external specialist review + concurrent-session stress tests.
 - [ ] Partial contributions (τ, partial sigs, DKG shares) are **verifiable before use**, with identifiable abort.
 - [ ] External review by ≥1 threshold-cryptography specialist with no open Critical/High findings.
 
@@ -63,7 +63,7 @@ Multisig is production ready when **all** of the following gates pass. Everythin
 | Lagrange partials / reconstruction / δ-mask algebra | `share.rs` | cancel + reconstruction tests |
 | Coin derivation `x_coin = H("coin"‖number‖value)`, view mix | `coin.rs` | same-number-different-value test |
 | Multiparty bulletproof T1/T2 → τ → finalize over `bullet_proof_multisig` | `rangeproof.rs` | 2-of-3 and 3-of-3 proofs verify; rewind recovers value + coin number |
-| Threshold kernel sign (additive aggsig + nonce hash-commit) | `kernel.rs` | 2-of-3 / 3-of-3 sign+verify, partial-sums test |
+| Threshold kernel sign (**FROST** + poly excess check) | `kernel.rs` | 2-of-3 / 3-of-3 sign+verify, binding-factor, `TxKernel::verify` |
 | E2E tx build + validation, hex round-trip | `tx.rs` | `e2e_fund_and_spend_validates`, `demo_tx_hex_roundtrip` |
 | LMDB persistence with XOR-obfuscated shares | `store.rs`, `impls/backends/lmdb.rs` | round-trip test |
 | Slatepack JSON envelopes (`GMS1`, versioned) for DKG/RP/kernel rounds | `messages.rs` | round-trip tests |
@@ -95,7 +95,7 @@ These are **new findings from reading the working-tree code**, complementary to 
 ### C-03 — Dealer secret coefficients persisted in plaintext pending file — **Critical (secrets)** — ✅ FIXED
 `PendingDkg` stored `my_coeff_hexes` (the dealer's secret polynomial) and accumulated share sums (`my_share_ys_hex`) as hex in a JSON file in the wallet data dir. A file-system read during the (possibly days-long) ceremony window leaked the dealer's entire contribution.
 **Resolution:** the pending file is now AEAD-encrypted (ChaCha20-Poly1305, `store::seal_pending`/`open_pending`) under a keychain-derived key (`store::derive_pending_key`, domain-separated from the share-obfuscation key). File renamed to `pending_dkg.enc`; every pending-touching CLI command now unlocks the wallet to derive the key, so the file can neither be read nor written without wallet access. Legacy plaintext file removed on `clear`. Verified: seal/open roundtrip, wrong-key rejection, and tamper rejection tests pass (35/35 multisig tests).
-**Residual (tracked under WS3):** `zeroize` on the in-memory secret buffers is still pending; AEAD is not yet applied to `export_state_json` (C-08) or the LMDB XOR path.
+**Residual:** none material for C-03; LMDB/export AEAD completed under C-08.
 
 ### C-04 — Wire envelopes are unauthenticated — **High** — ✅ FIXED
 `MultisigEnvelope.sender` was attacker-controlled, checked against the roster by id with no signature; a re-imported contribution silently overwrote `contributions[idx]`, and a replayed share was **summed twice** into the accumulator (a silent corruption, not just a nuisance).
@@ -106,21 +106,43 @@ These are **new findings from reading the working-tree code**, complementary to 
 Verified by unit tests (sign/verify, tamper, wrong-sender, key-mismatch) and a full 2-of-2 authenticated DKG exchange over the file API that also asserts replay rejection (41/41 multisig tests).
 **Residual (WS2/WS5):** transcript binds sender+ceremony+session+body but not an explicit round/sequence counter (contribution/share replay is covered structurally; kernel/rangeproof round messages will need per-round sequence binding when the session engine lands). δ-masking of delivered shares (F-03) is still open.
 
-### C-05 — Kernel nonce commitment binds too little — **High**
-`kernel.rs::commit_nonce` (line 236) commits to `SHA256(tag‖pub_nonce)` only. It does not bind the actor identity, session id, or the actor's `pub_excess`. Consequences: (a) commitments are replayable across sessions; (b) the last revealer chooses/claims `pub_excess` **after** seeing everyone's nonces and excess keys — the classic adaptive-key setting the commit-reveal was meant to prevent (rogue-key style cancellation on `excess_sum` is checked nowhere; correctness currently relies on tx balance failing, which is detection-by-DoS, not security).
-**Fix (WS2):** superseded by the FROST migration (which has its own binding factors). If additive aggsig is retained short-term: commit to `H(tag‖session_id‖actor_id‖pub_nonce‖pub_excess)`; verify each `pub_excess` equals the Lagrange-predicted public partial `λ_j·P(x_coin)` combination — this is computable from public data and is a **must** even under FROST for the excess key itself.
+### C-05 — Kernel nonce commitment binds too little — **High** — ✅ FIXED (FROST)
+The prior additive aggsig path used a weak hash commit to a single nonce and did not bind claimed `pub_excess` (rogue-key / adaptive last-mover risk).
+**Resolution — FROST kernel signing (`kernel.rs`):**
+- Each actor samples **two** nonces `(d_j, e_j)` and broadcasts `SigningCommitment = (D_j, E_j, X_j)` in one round (`kernel_round1`).
+- Per-actor **binding factor** `ρ_j = H_s("grin-msig/frost-rho" ‖ session ‖ offset ‖ all commitments ‖ j)` (`binding_factor`) feeds group nonce `R = Σ (D_j + ρ_j·E_j)` (`aggregate_frost`).
+- Partial sign uses effective nonce `k_j = d_j + ρ_j·e_j`; aggregates via existing `aggsig` into a normal Grin kernel signature.
+- **Rogue-key guard retained:** `expected_pub_excess_for_actor` / `verify_partial_excess` check every claimed `X_j` against the public polynomial before signing.
+- Wire: `KernelSigningCommit` replaces `KernelNonceCommit` / `KernelNonceReveal`.
+Verified by multiparty sign, binding-factor context tests, bad-partial rejection, and `TxKernel::verify()` on the aggregated sig.
+**Residual:** external specialist review of FROST composition with multiparty BP over the same shares; concurrent multi-session stress tests.
 
-### C-06 — Partial τ contributions are unverifiable — **High** (review F-07, still open)
-`rangeproof.rs::aggregate_tau` sums τ shares blindly. A malicious quorum member can submit garbage τ_j; failure appears only at `rangeproof_finalize`, with no attribution (no identifiable abort), enabling untraceable griefing and repeated-session probing.
-**Fix (WS2):** add per-actor τ verification (linear relation of τ_j against that actor's published T1_j/T2_j and partial-blind commitment, or a DLEQ proof), matching Beam's ability to validate cosign parts; add negative tests ("bad τ rejected, culprit identified").
+### C-06 — Partial τ contributions are unverifiable — **High** (review F-07) — ✅ FIXED
+`aggregate_tau` previously summed τ shares blindly; a garbage `τ_j` failed only at finalize with no attribution.
+**Resolution (`rangeproof.rs`):**
+- libsecp multiparty BP satisfies `τ_j = τ1_j·x + τ2_j·x² + z²·blind_j` with round-1 exports `T1_j = τ1_j·G`, `T2_j = τ2_j·G`.
+- Challenges `(x, z²)` are recovered by local **probe** step-2 runs against the same aggregated T1/T2 (same Fiat–Shamir transcript); probe `(τ1,τ2)` pairs are re-derived via bit-compatible `scalar_chacha20`.
+- `expected_pub_blind_for_actor` predicts `P_j = blind_j·G` from the public polynomial (+ actor-0 view mix).
+- `verify_tau_share` checks `τ·G = x·T1 + x²·T2 + z²·P`; `aggregate_tau_verified` attributes failures to the actor index (identifiable abort).
+- `run_rangeproof_local` always verifies before summing.
+Verified: chacha20 matches round-1 T1/T2, honest τ accepted, corrupted τ from actor 1 rejected with that index, full multiparty proofs still verify.
 
-### C-07 — Quorum ordering and the actor-0 special role are un-transcripted — **High (protocol fragility)**
-`partial_excess_for_actor` and `quorum_partial_blinds` give index 0 the view-mix and the offset subtraction. Nothing in the wire format canonicalizes quorum membership or ordering; if two actors order the quorum differently, partials silently don't sum to the excess (stuck sessions), and "who is actor 0" is implicit.
-**Fix (WS2/WS5):** define a canonical quorum encoding (sorted by x-coordinate) inside the signed session transcript; make the mix/offset assignment explicit in the session record rather than positional.
+### C-07 — Quorum ordering and the actor-0 special role are un-transcripted — **High (protocol fragility)** — ✅ FIXED
+`partial_excess_for_actor` and `quorum_partial_blinds` used positional index 0 for mix/offset with no canonical order.
+**Resolution:**
+- `canonical_quorum` sorts by x-coordinate (big-endian); index 0 is the **mix/offset role**.
+- `quorum_partial_blinds`, `partial_excess_for_actor`, `expected_pub_*`, `run_*_local`, and `quorum_from_states` always canonicalize.
+- Kernel sessions bind `quorum_transcript` (canonical x-list) into the session id / offset context.
+Verified: reverse-order quorums produce the same excess and valid rangeproofs.
 
-### C-08 — Secrets pass through JSON and are never zeroized — **Medium/High**
-`MultisigWalletState` (containing `SecretShare.y`) is serialized with `serde_json` for LMDB (`store.rs:108-119`), export (`export_state_json` — documented "SENSITIVE" but plaintext), and the pending file. `SecretKey` values are cloned freely throughout; nothing implements `Zeroize`. XOR obfuscation in `store.rs` has no integrity (bit-flips silently corrupt shares) and is not applied to `export_state_json`.
-**Fix (WS3):** AEAD (e.g. `age` or ChaCha20-Poly1305 under a keychain-derived key) for stored + exported state; `zeroize` on all secret-bearing types; keep secrets out of `Debug` derives (`ActorKernelSecrets`, `ActorRpSecrets`, `DealerSecrets`, `SecretShare` all derive/expose `Debug` today).
+### C-08 — Secrets pass through JSON and are never zeroized — **Medium/High** — ✅ FIXED (core hygiene)
+**Resolution:**
+- **LMDB ceremony state** sealed with ChaCha20-Poly1305 (`MSAE` magic + keychain-derived `state-key-v1`); XOR-only path removed (no integrity).
+- **Export/import** is the same AEAD blob (`export_state_sealed` / `import_state_sealed`); plaintext JSON export removed.
+- **Pending DKG** already AEAD (C-03); plaintext buffers zeroized after seal/open.
+- **Debug redaction** for `SecretShare`, `MultisigWalletState`, `ActorPoint`, `SecretPoly`, `DealerSecrets`, `ActorKernelSecrets`, `ActorRpSecrets`, `PendingDkg`, `TauChallenges`.
+- `SecretKey` already uses `zeroize` on drop (secp crate).
+**Residual:** clones of secrets in hot paths still exist (hard to eliminate without larger API redesign); optional `ZeroizeOnDrop` wrappers later.
 
 ### C-09 — Deterministic public offset — **Medium (privacy/documented trade-off)**
 `coin.rs::tx_offset` derives the kernel offset from the **public** `S_0` + session context. Anyone holding the (public) ceremony config — including removed actors, or a thief of any actor's wallet file — can recompute offsets and strip them from kernels for known sessions, weakening the offset's unlinkability role for this wallet's transactions.
@@ -130,17 +152,19 @@ Verified by unit tests (sign/verify, tamper, wrong-sender, key-mismatch) and a f
 `derive_shared_nonce` and `view_mix` derive from `S_0`. Every actor (and anyone who obtains a wallet-state backup, and every **removed** actor forever) can rewind all wallet outputs. This matches RFC "strategy A" but is nowhere surfaced as a product decision; there is no per-epoch view-key option.
 **Fix (WS1):** decide strategy A vs B per the RFC discussion; document that exporting `MultisigConfig` = granting permanent view access for the epoch.
 
-### C-11 — `ThresholdParams::new` does not enforce the PTE floor — **Medium** (review F-08 partially addressed)
-`MIN_SHARES_FOR_DEGREE = 4` and `recommended_shares_per_actor` exist (`types.rs`), but plain `ThresholdParams::new(2, 3)` (degree 1) is accepted everywhere, including the CLI and the kernel/rangeproof test setups. The mitigation exists but is opt-in.
-**Fix (WS1/WS2):** enforce `effective_degree + 1 ≥ MIN_SHARES_FOR_DEGREE` in `with_shares_per_actor` for non-test builds (or require an explicit `allow_low_degree` dev flag); commission the actual PTE cryptanalysis to justify the floor value.
+### C-11 — `ThresholdParams::new` does not enforce the PTE floor — **Medium** (review F-08) — ✅ FIXED (floor enforced; cryptanalysis residual)
+**Resolution:**
+- Production constructors `new` / `with_shares_per_actor` reject `num_coefficients() < MIN_SHARES_FOR_DEGREE` (4).
+- Tests/dev use `new_allow_low_degree` / `with_shares_per_actor_allow_low_degree`.
+- CLI/DKG default remains `recommended_shares_per_actor` (already floor-compliant).
+**Residual:** commission PTE cryptanalysis to justify the numeric floor value.
 
 ### C-12 — No DoS bounds on message parsing — **Medium**
 JSON envelopes are parsed without size limits, count limits (e.g. `commitment_hexes` length is checked against params only after parse), or streaming caps. Malicious peers can send megabyte envelopes or 10⁶ coefficients.
 **Fix (WS5):** hard caps (max actors, max coefficients, max message size) enforced before deserialization of inner fields.
 
-### C-13 — Add-actor remains exposed — **Medium** (review F-03, acknowledged in code)
-`share.rs::add_actor_masked_share` is exported from the crate root with a doc warning. Warnings don't gate anything; a wallet UI built on this API can invoke the share-exfiltration-prone flow.
-**Fix (WS1):** for v1, remove from the public API or hide behind a feature flag; membership change = re-DKG new epoch + on-chain sweep.
+### C-13 — Add-actor remains exposed — **Medium** (review F-03) — ✅ FIXED (v1)
+**Resolution:** `add_actor_masked_share` is no longer re-exported from the crate root and is `#[cfg(test)]` only. v1 membership change = re-DKG new epoch + on-chain sweep.
 
 ### C-14 — DKG is joint-Feldman "v0" by design — **Medium** (review F-04, open)
 `dkg.rs` header admits: "Joint-Feldman can be biased by last movers; acceptable for v0 research." No complaint round, no commit-then-reveal of contributions, no abort rules for missing dealers (F-10: share assembly assumes all N dealers deliver; `dkg_finalize` verifies the sum against the public poly, which detects but cannot attribute failures).
@@ -162,15 +186,15 @@ JSON envelopes are parsed without size limits, count limits (e.g. `commitment_he
 | --- | --- | --- | --- |
 | F-01 degree/threshold | Critical | **Fixed** (`types.rs`, enforced) | Freeze in RFC text; cross-impl vectors |
 | F-02 HKDF claim | High | **Documented honestly** (`coin.rs`) | RFC text fix; decide C-09/C-10 |
-| F-03 add-actor exfiltration | High | Implemented w/ warning only | Gate/remove (C-13) |
+| F-03 add-actor exfiltration | High | **Gated** (not public API; C-13) | Re-DKG + sweep for membership |
 | F-04 robust DKG | High/Med | **Open** ("v0" joint-Feldman) | WS2: named DKG + complaints (C-14) |
 | F-05 PoP underspecified | Medium | Largely fixed (`pop_message` binds ceremony/actor/index/commitment) | Bind full coefficient vector + params into each PoP msg; RFC transcript |
-| F-06 kernel signing scheme | High | **Open** (additive aggsig + weak commit; C-05) | WS2: FROST |
-| F-07 BP partial verification | Med/High | **Open** (C-06) | WS2: verifiable τ + identifiable abort |
-| F-08 PTE parameters | High (small M) | Partial (floor exists, unenforced; C-11) | Enforce + cryptanalysis |
+| F-06 kernel signing scheme | High | **Fixed in code** (FROST + excess check; C-05) | External audit still required |
+| F-07 BP partial verification | Med/High | **Fixed in code** (C-06 verifiable τ + actor index) | External audit residual |
+| F-08 PTE parameters | High (small M) | **Floor enforced** (C-11) | Cryptanalysis to justify floor value |
 | F-09 hash-to-scalar | Medium | **Fixed** (rejection sampling) | Keep property for real DH; test vectors |
 | F-10 δ-mask / all-N delivery | Medium | Algebra implemented; abort rules missing | WS2 session rules |
-| F-11 backup model | Medium | State export exists but plaintext (C-08) | WS3: encrypted backup object + restore drill |
+| F-11 backup model | Medium | **Sealed export** (C-08 AEAD) | Restore drill + runbook (WS7) |
 | F-12 M-shares ⇒ total compromise | High (inherent) | Documented | Runbooks (WS7); UX warnings |
 | F-13 address grinding | Low/Med | `ActorId::from_index` avoids it; address-based ids possible | Commit-reveal when real addresses used |
 | F-14 value in derivation | Low/Med | **Fixed + tested** | Bind concrete commitment list into signing transcript (with C-05 fix) |
@@ -195,7 +219,7 @@ Ordered so that each unblocks the next. Effort assumes 1–2 senior engineers pl
 
 | Task | Files | Acceptance |
 | --- | --- | --- |
-| Replace kernel signing with **FROST** over the Lagrange-evaluated excess key (audited crate, e.g. ZF FROST, adapted to secp256k1-zkp types) | `kernel.rs` → `crypto/frost.rs` | Forgeability tests; concurrent-session tests; nonce-reuse impossible by construction |
+| ✅ FROST kernel over Lagrange excess (hand-rolled on Grin `aggsig`; not ZF-FROST crate) | `kernel.rs` | Sign/verify, binding-factor, `TxKernel::verify`; residual: concurrent-session stress + specialist audit |
 | Verify partial excess pubkeys against the public poly (`λ_j`-weighted `P(x)` sums) | `kernel.rs` | Wrong-excess partial rejected with attribution |
 | Verifiable τ contributions + identifiable abort | `rangeproof.rs` | Bad τ_j rejected, culprit named; negative tests |
 | Robust DKG: contribution commit-reveal, complaint round, abort rules | `dkg.rs` | Last-mover bias test; missing-dealer abort test |
@@ -205,33 +229,42 @@ Ordered so that each unblocks the next. Effort assumes 1–2 senior engineers pl
 
 **Beam references to mirror:** `core/ecc_bulletproof.cpp` (`MultiSig::CoSignPart`, phased `Step2`/`Finalize`), `core/ecc.h` nonce-hygiene comments, `core/unittest/ecc_test.cpp` 5-signer BP test.
 
-### WS3 — Secrets hygiene (2–4 weeks, parallel with WS2)
+### WS3 — Secrets hygiene (2–4 weeks, parallel with WS2) — mostly done
 
-1. AEAD-encrypt: LMDB state, pending-DKG file (C-03), state export (C-08); delete `export_state_json` plaintext path.
-2. Mandatory age encryption + δ-masking for `DkgPartialShare` delivery (C-02); refuse to write plaintext share files.
-3. `zeroize` on `SecretShare`, `DealerSecrets`, `ActorKernelSecrets`, `ActorRpSecrets`, pending buffers; strip `Debug` from secret-bearing types or redact.
-4. Defined **backup object** `{ceremony_id, params, roster, public_poly, shares, epoch}`, encrypted, with a scripted restore drill (F-11).
+1. ✅ AEAD-encrypt: LMDB state + state export (C-08), pending-DKG file (C-03).
+2. ✅ Age-encrypted DKG share delivery (C-02); residual: δ-masking.
+3. ✅ Debug redaction + plaintext buffer zeroize after seal/open; `SecretKey` zeroizes on drop.
+4. Residual: scripted restore drill / runbook for sealed backup objects (F-11 / WS7).
 
-### WS4 — Session engine / negotiator (6–10 weeks)
+### WS4 — Session engine / negotiator (6–10 weeks) — **foundation landed**
 
-Build the Beam-`Negotiator` analog — the largest product gap. Design before code:
+Core negotiator is implemented in `libwallet/src/multisig/session.rs`:
 
 ```
-SessionStore (LMDB, encrypted)
-  session_id, ceremony_id, kind (Dkg | CreateOutput | Spend)
-  round, canonical quorum, role, peer roster, deadlines
-  secrets (nonce seeds, partials) — AEAD
-  inbound log (all signed envelopes), outbound queue
+SessionStore (filesystem AEAD: wallet_data/multisig/sessions/*.enc)
+  session_id, ceremony_id, kind (CreateOutput | Spend), phase
+  canonical quorum x-list, roster, my_index
+  secrets (hex, wiped on Complete/Abort) — sealed with session key
+  seen_body_hashes (replay), collected round contributions
 
 Negotiator
-  apply(envelope) -> Vec<outbound envelope>   // idempotent, replay-safe
-  state() -> Round / Complete / Aborted(reason, culprit?)
-  resume()                                    // crash recovery from store
+  create_output / create_spend  → first outbound envelope
+  apply(envelope) → Vec<outbound>   // idempotent, replay-safe, size-capped
+  tick()                            // emit when barriers clear
+  resume(record)                    // crash recovery
+  abort(reason)                     // wipe secrets
 ```
 
-Rules to adopt from Beam `MultiTx`: barriers (never reveal a finalizable secret before the counterparty is equally committed), input/output restriction between rounds, explicit roles for who finalizes/broadcasts.
+**Barriers:** never send τ until all T1/T2 in; never send kernel partial until all FROST commits in. Sender index checked against canonical quorum x (C-07).
 
-**Exit:** 3-process integration test over real slatepack files/sockets: DKG → create output → spend, with kill-and-resume at every round boundary, and abort-at-every-round leaving no reusable nonce state.
+**Tests (in-module):** 2-of-2 CreateOutput + Spend complete; crash-resume mid-CreateOutput after R1; abort wipes secrets; exact-message replay is idempotent.
+
+**Still open for full WS4 exit:**
+- DKG as a session kind (still uses PendingDkg file API)
+- Multi-process CLI (`session create/advance/status/abort`) + Owner RPC
+- 3-process slatepack file/socket integration with kill-resume at every boundary
+- Deadlines / timeout abort; LMDB session store (optional; files are AEAD today)
+- Combined CreateOutput+Spend single multi-round MultiTx
 
 ### WS5 — Wire format & transport (3–5 weeks, overlaps WS4)
 
@@ -266,15 +299,17 @@ Rules to adopt from Beam `MultiTx`: barriers (never reveal a finalizable secret 
 1. ✅ C-01 chain-type footgun removal.
 2. ✅ C-02/C-03 plaintext secrets on disk (pending file AEAD-encrypted; share export age-encrypted to recipient addresses).
 3. ✅ C-04 envelope authentication + replay protection.
-4. WS1 spec freeze (incl. C-07 canonical transcript, C-11 degree floor, C-13 add-actor removal).
-5. WS2 FROST kernel + verifiable τ (C-05/C-06).
-6. WS4 durable negotiator with crash recovery.
+4. ✅ C-07 canonical quorum + mix/offset role; C-11 PTE floor; C-13 add-actor gated.
+5. ✅ C-05 FROST kernel (binding factors + excess poly check).
+6. ✅ C-06 verifiable multiparty τ (identifiable abort).
+7. WS1 residual: RFC freeze text, C-09/C-10 product decisions, threat model write-up.
+8. ✅ WS4 negotiator + CLI + Owner RPC session methods. Residual: multi-process soak + DKG-as-session.
 
 **P1 — before mainnet flag:**
-7. WS6 UTXO tracking + coin allocator + rotation sweep.
-8. WS3 zeroization/AEAD everywhere; backup/restore drill.
-9. WS5 fuzzed, frozen wire format; DoS caps (C-12).
-10. External audit + malicious-peer suite + 30-day soak.
+9. WS6 UTXO tracking + coin allocator + rotation sweep.
+10. ✅ C-08 AEAD state + Debug redaction (WS3 core); residual: restore drill runbook.
+11. WS5 fuzzed, frozen wire format; DoS caps (C-12).
+12. External audit + malicious-peer suite + 30-day soak.
 
 **P2 — quality/optional:**
 11. Hardware-keykeeper interface design (Beam `private_key_keeper` pattern).
@@ -305,7 +340,7 @@ Month 6–9   WS7 audit, soak, bounty → mainnet feature flag
 | `scalar.rs` | Keep (correct rejection sampling) | `crypto/scalar.rs` |
 | `poly.rs`, `share.rs` | Keep; drop public add-actor | `crypto/shamir.rs` |
 | `dkg.rs` | Rework (robust DKG, commit-reveal, complaints) | `crypto/dkg.rs` |
-| `kernel.rs` | **Replace** signing core with FROST; keep session/offset plumbing | `crypto/frost.rs` + `session/kernel.rs` |
+| `kernel.rs` | ✅ FROST core landed; keep hardening + concurrent-session tests | (optional later split) `session/kernel.rs` |
 | `rangeproof.rs` | Keep structure; add τ verification + golden vectors | `crypto/mp_bp.rs` |
 | `coin.rs` | Keep; document C-09/C-10 decisions | `multisig/coin.rs` |
 | `messages.rs` | Add signatures, rounds, caps; freeze v1 | `wire/v1.rs` |

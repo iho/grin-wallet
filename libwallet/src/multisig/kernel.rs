@@ -12,34 +12,42 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Threshold multiparty kernel signing for multisig wallets.
+//! Threshold multiparty kernel signing for multisig wallets — **FROST**
+//! (Komlo–Goldberg two-round threshold Schnorr) over Grin's kernel excess.
 //!
-//! Builds on Grin's existing **additive** aggsig (`calculate_partial_sig` /
-//! `add_signatures`). Each quorum member holds a Lagrange partial of the
-//! kernel excess secret; partials sum to the full excess key.
+//! Each quorum member holds a Lagrange partial of the kernel excess secret
+//! (`partial_excess_for_actor`); the partials sum to the full excess key, whose
+//! public form `X = Σ X_j` is the kernel's excess pubkey.
 //!
-//! ## Protocol (2.5 rounds)
+//! ## Protocol (FROST, 2 rounds)
 //!
-//! 1. **Nonce commit** — each actor samples a secure nonce (`create_secnonce`)
-//!    and broadcasts `H(pub_nonce)` (binding commitment).
-//! 2. **Nonce reveal** — reveal `pub_nonce`; peers check against commitment.
-//!    Aggregate `R = Σ R_j`, `X = Σ X_j` (excess pubkeys).
-//! 3. **Partial sig** — each signs with `calculate_partial_sig` using the
-//!    same kernel message, `R`, and `X`.
-//! 4. **Aggregate** — `add_signatures` → final kernel signature; verify vs
-//!    excess commitment / pubkey.
+//! 1. **Commit** — each actor `j` samples **two** nonces `(d_j, e_j)` and
+//!    broadcasts `(D_j, E_j, X_j)` = `(d_j·G, e_j·G, X_j)` ([`kernel_round1`],
+//!    [`SigningCommitment`]).
+//! 2. **Sign** — everyone derives a per-actor **binding factor**
+//!    `ρ_j = H(session ‖ offset ‖ all commitments ‖ j)` ([`binding_factor`]),
+//!    forms the group nonce `R = Σ (D_j + ρ_j·E_j)` and excess `X = Σ X_j`
+//!    ([`aggregate_frost`]), and each actor signs with its effective nonce
+//!    `k_j = d_j + ρ_j·e_j` ([`kernel_partial_sign`]).
+//! 3. **Aggregate** — `add_signatures` → the final Schnorr signature `(R, z)`,
+//!    verified as an ordinary Grin kernel signature over `X`.
+//!
+//! The binding factor is what gives FROST its concurrent-session security
+//! (resistance to the Drijvers/Wagner ROS attack that a naive
+//! sum-of-single-nonces Schnorr is vulnerable to). Because the aggregate nonce
+//! `R` and each effective nonce `k_j` satisfy `Σ G·k_j = R` exactly as in the
+//! single-nonce case, this composes with Grin's proven `aggsig` signing and
+//! `TxKernel::verify()` verification unchanged — only the nonce each actor uses
+//! changes.
 //!
 //! ## Security notes
 //!
-//! - This is **not** full FROST. It is additive multi-sig (same family as
-//!   Grin sender/receiver) with **nonce commitments** to reduce adaptive
-//!   nonce attacks within a single session.
-//! - Concurrent sessions must use distinct `session_id` context in the
-//!   offset and must not reuse nonces.
+//! - Rogue-key protection: every actor's claimed `X_j` is checked against the
+//!   public polynomial before signing ([`verify_partial_excess`]).
+//! - Nonces are single-use per session; never reuse `(d_j, e_j)` across
+//!   sessions (a fresh pair is drawn each round).
 //! - Partial excess keys are session-specific (Lagrange over the active
 //!   quorum); do not reuse across different quorums without recomputing.
-//!
-//! **Status:** experimental. Not wired into slatepack / full tx build yet.
 
 use crate::grin_core::core::transaction::KernelFeatures;
 use crate::grin_core::core::FeeFields;
@@ -48,13 +56,14 @@ use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::pedersen::Commitment;
 use crate::grin_util::secp::{Message, Secp256k1, Signature};
 use crate::Error;
-use sha2::{Digest, Sha256};
 use std::convert::TryFrom;
 
-use super::coin::{coin_partial_poly_key, tx_offset, view_mix, view_seed_from_public_poly, CoinId};
-use super::poly::PublicPoly;
-use super::scalar::{sk_add, sk_sub};
-use super::share::ActorPoint;
+use super::coin::{
+	coin_partial_poly_key, coin_x, tx_offset, view_mix, view_seed_from_public_poly, CoinId,
+};
+use super::poly::{eval_public_poly, PublicPoly};
+use super::scalar::{hash_to_scalar, sk_add, sk_from_u64, sk_mul, sk_neg, sk_sub, HashDomain};
+use super::share::{canonical_quorum, lagrange_coefficient, quorum_transcript, ActorPoint};
 
 /// Kernel signing session parameters shared by the quorum.
 #[derive(Clone, Debug)]
@@ -71,39 +80,45 @@ pub struct KernelSession {
 	pub outputs: Vec<CoinId>,
 }
 
-/// Local secrets for one actor during kernel signing.
-#[derive(Clone, Debug)]
-pub struct ActorKernelSecrets {
-	/// Partial excess secret for this actor.
-	pub partial_excess: SecretKey,
-	/// Secure signing nonce (secret).
-	pub sec_nonce: SecretKey,
-	/// Public nonce `R_j = k_j · G`.
-	pub pub_nonce: PublicKey,
+/// Round-1 public commitment broadcast by one actor (FROST).
+#[derive(Clone, Debug, PartialEq)]
+pub struct SigningCommitment {
+	/// Hiding-nonce commitment `D_j = d_j · G`.
+	pub pub_d: PublicKey,
+	/// Binding-nonce commitment `E_j = e_j · G`.
+	pub pub_e: PublicKey,
 	/// Public partial excess `X_j = x_j · G`.
 	pub pub_excess: PublicKey,
 }
 
-/// Nonce commitment: `SHA256(pub_nonce_compressed)`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct NonceCommitment {
-	/// Commitment bytes.
-	pub hash: [u8; 32],
+/// Local secrets for one actor during FROST kernel signing.
+#[derive(Clone)]
+pub struct ActorKernelSecrets {
+	/// Partial excess secret for this actor.
+	pub partial_excess: SecretKey,
+	/// Hiding nonce `d_j` (secret).
+	pub d: SecretKey,
+	/// Binding nonce `e_j` (secret).
+	pub e: SecretKey,
+	/// This actor's public round-1 commitment.
+	pub commitment: SigningCommitment,
 }
 
-/// Revealed nonce + excess pubkey for one actor.
-#[derive(Clone, Debug)]
-pub struct NonceReveal {
-	/// Public nonce.
-	pub pub_nonce: PublicKey,
-	/// Public partial excess.
-	pub pub_excess: PublicKey,
+impl std::fmt::Debug for ActorKernelSecrets {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ActorKernelSecrets")
+			.field("partial_excess", &"[redacted]")
+			.field("d", &"[redacted]")
+			.field("e", &"[redacted]")
+			.field("commitment", &self.commitment)
+			.finish()
+	}
 }
 
-/// Aggregated public values after nonce reveal.
+/// Aggregated public values after the commitment round.
 #[derive(Clone, Debug)]
 pub struct AggregatedKernelPubs {
-	/// `R = Σ R_j`
+	/// Group nonce `R = Σ (D_j + ρ_j · E_j)`
 	pub nonce_sum: PublicKey,
 	/// `X = Σ X_j` (kernel excess pubkey)
 	pub excess_sum: PublicKey,
@@ -163,12 +178,13 @@ pub fn create_kernel_session(
 	})
 }
 
-/// Partial excess for actor `j`:
+/// Partial excess for actor `j` (index into the **canonical** quorum, C-07):
 /// `Σ partial(output) − Σ partial(input) − [offset if j==0]`.
 ///
 /// Matches Grin balance: `excess + offset = out_blinds − in_blinds`.
 /// Each coin partial is the Lagrange share of `sk(x_coin)`; the view mix for
-/// each coin is added only on actor 0 (same split as rangeproof blinds).
+/// each coin and the offset subtraction apply only to **canonical index 0**
+/// (smallest x-coordinate).
 pub fn partial_excess_for_actor(
 	secp: &Secp256k1,
 	public_poly: &PublicPoly,
@@ -176,6 +192,7 @@ pub fn partial_excess_for_actor(
 	j: usize,
 	session: &KernelSession,
 ) -> Result<SecretKey, Error> {
+	let quorum = canonical_quorum(quorum)?;
 	if j >= quorum.len() {
 		return Err(Error::Multisig("actor index out of range".into()));
 	}
@@ -186,7 +203,7 @@ pub fn partial_excess_for_actor(
 
 	let add_coin =
 		|acc: &mut Option<SecretKey>, coin: &CoinId, sign_positive: bool| -> Result<(), Error> {
-			let mut part = coin_partial_poly_key(secp, quorum, j, coin)?;
+			let mut part = coin_partial_poly_key(secp, &quorum, j, coin)?;
 			if j == 0 {
 				let x = super::coin::coin_x(secp, coin)?;
 				let mix = view_mix(secp, &seed, &x)?;
@@ -229,83 +246,208 @@ pub fn partial_excess_for_actor(
 	Ok(excess)
 }
 
-/// Commit to a public nonce: `SHA256("grin-msig/nonce-commit" || pub_nonce)`.
-pub fn commit_nonce(secp: &Secp256k1, pub_nonce: &PublicKey) -> NonceCommitment {
-	let mut h = Sha256::new();
-	h.update(b"grin-msig/nonce-commit");
-	h.update(&pub_nonce.serialize_vec(secp, true));
-	let d = h.finalize();
-	let mut hash = [0u8; 32];
-	hash.copy_from_slice(&d);
-	NonceCommitment { hash }
-}
-
-/// Verify a nonce reveal matches a prior commitment.
-pub fn verify_nonce_commitment(
-	secp: &Secp256k1,
-	commitment: &NonceCommitment,
-	pub_nonce: &PublicKey,
-) -> Result<(), Error> {
-	let expected = commit_nonce(secp, pub_nonce);
-	if expected.hash != commitment.hash {
-		return Err(Error::Multisig("nonce commitment mismatch".into()));
-	}
-	Ok(())
-}
-
-/// Round 1 local setup: sample nonce, derive partial excess, emit commitment.
-pub fn kernel_prepare(
+/// Expected **public** partial excess for actor `j`, computed purely from the
+/// public polynomial and session (C-05).
+///
+/// This is the group-element analog of [`partial_excess_for_actor`]:
+/// `X_j = Σ_out λ_j(x)·P(x_j) − Σ_in λ_j(x)·P(x_j) [+ mix·G terms − offset·G, on actor 0]`.
+/// Because `P(x_j)` is fixed by the DKG public poly, an actor cannot claim a
+/// partial excess pubkey it did not honestly derive — this is what stops
+/// rogue-key manipulation of the aggregate excess (a valid signature over a
+/// forged `excess_sum` would otherwise only be caught by the transaction
+/// failing to balance, i.e. detection-by-DoS).
+pub fn expected_pub_excess_for_actor(
 	secp: &Secp256k1,
 	public_poly: &PublicPoly,
 	quorum: &[ActorPoint],
 	j: usize,
 	session: &KernelSession,
-) -> Result<(ActorKernelSecrets, NonceCommitment), Error> {
-	let partial_excess = partial_excess_for_actor(secp, public_poly, quorum, j, session)?;
-	let sec_nonce =
-		aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce: {}", e)))?;
-	let pub_nonce = PublicKey::from_secret_key(secp, &sec_nonce)?;
-	let pub_excess = PublicKey::from_secret_key(secp, &partial_excess)?;
-	let commitment = commit_nonce(secp, &pub_nonce);
-	Ok((
-		ActorKernelSecrets {
-			partial_excess,
-			sec_nonce,
-			pub_nonce,
-			pub_excess,
-		},
-		commitment,
-	))
+) -> Result<PublicKey, Error> {
+	let quorum = canonical_quorum(quorum)?;
+	expected_pub_excess_for_actor_canonical(secp, public_poly, &quorum, j, session)
 }
 
-/// Aggregate revealed nonces and excess pubkeys after commitment checks.
-pub fn aggregate_kernel_pubs(
+fn expected_pub_excess_for_actor_canonical(
 	secp: &Secp256k1,
-	reveals: &[NonceReveal],
-) -> Result<AggregatedKernelPubs, Error> {
-	if reveals.is_empty() {
-		return Err(Error::Multisig("no nonce reveals".into()));
+	public_poly: &PublicPoly,
+	quorum: &[ActorPoint],
+	j: usize,
+	session: &KernelSession,
+) -> Result<PublicKey, Error> {
+	if j >= quorum.len() {
+		return Err(Error::Multisig("actor index out of range".into()));
 	}
-	let nonces: Vec<&PublicKey> = reveals.iter().map(|r| &r.pub_nonce).collect();
-	let excesses: Vec<&PublicKey> = reveals.iter().map(|r| &r.pub_excess).collect();
-	Ok(AggregatedKernelPubs {
-		nonce_sum: PublicKey::from_combination(secp, nonces)?,
-		excess_sum: PublicKey::from_combination(secp, excesses)?,
+	let seed = view_seed_from_public_poly(secp, public_poly)?;
+	let x_j = &quorum[j].x;
+	let p_xj = eval_public_poly(secp, public_poly, x_j)?; // P(x_j) = G·y_j
+	let xs: Vec<SecretKey> = quorum.iter().map(|p| p.x.clone()).collect();
+	let minus_one = sk_neg(secp, &sk_from_u64(secp, 1)?)?;
+
+	let mut pos: Vec<PublicKey> = Vec::new();
+	let mut neg: Vec<PublicKey> = Vec::new();
+
+	let mut add_coin = |coin: &CoinId, positive: bool| -> Result<(), Error> {
+		let x_coin = coin_x(secp, coin)?;
+		let lambda = lagrange_coefficient(secp, &xs, j, &x_coin)?;
+		let mut term = p_xj.clone();
+		term.mul_assign(secp, &lambda)?;
+		if positive {
+			pos.push(term);
+		} else {
+			neg.push(term);
+		}
+		if j == 0 {
+			let mix = view_mix(secp, &seed, &x_coin)?;
+			let g_mix = PublicKey::from_secret_key(secp, &mix)?;
+			if positive {
+				pos.push(g_mix);
+			} else {
+				neg.push(g_mix);
+			}
+		}
+		Ok(())
+	};
+
+	for c in &session.outputs {
+		add_coin(c, true)?;
+	}
+	for c in &session.inputs {
+		add_coin(c, false)?;
+	}
+	if j == 0 {
+		// − offset·G
+		neg.push(PublicKey::from_secret_key(secp, &session.offset)?);
+	}
+
+	let mut terms: Vec<PublicKey> = pos;
+	for mut n in neg {
+		n.mul_assign(secp, &minus_one)?;
+		terms.push(n);
+	}
+	let refs: Vec<&PublicKey> = terms.iter().collect();
+	PublicKey::from_combination(secp, refs)
+		.map_err(|e| Error::Multisig(format!("expected excess combine: {}", e)))
+}
+
+/// Verify a claimed partial excess pubkey against the public-poly prediction.
+pub fn verify_partial_excess(
+	secp: &Secp256k1,
+	public_poly: &PublicPoly,
+	quorum: &[ActorPoint],
+	j: usize,
+	session: &KernelSession,
+	claimed: &PublicKey,
+) -> Result<(), Error> {
+	let expected = expected_pub_excess_for_actor(secp, public_poly, quorum, j, session)?;
+	if expected != *claimed {
+		return Err(Error::Multisig(format!(
+			"partial excess pubkey mismatch for actor {} (rogue key?)",
+			j
+		)));
+	}
+	Ok(())
+}
+
+/// Round 1: sample two FROST nonces, derive the partial excess, and emit the
+/// public commitment `(D_j, E_j, X_j)`.
+pub fn kernel_round1(
+	secp: &Secp256k1,
+	public_poly: &PublicPoly,
+	quorum: &[ActorPoint],
+	j: usize,
+	session: &KernelSession,
+) -> Result<ActorKernelSecrets, Error> {
+	let partial_excess = partial_excess_for_actor(secp, public_poly, quorum, j, session)?;
+	let d = aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce d: {}", e)))?;
+	let e = aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce e: {}", e)))?;
+	let pub_d = PublicKey::from_secret_key(secp, &d)?;
+	let pub_e = PublicKey::from_secret_key(secp, &e)?;
+	let pub_excess = PublicKey::from_secret_key(secp, &partial_excess)?;
+	Ok(ActorKernelSecrets {
+		partial_excess,
+		d,
+		e,
+		commitment: SigningCommitment {
+			pub_d,
+			pub_e,
+			pub_excess,
+		},
 	})
 }
 
-/// Produce a partial kernel signature.
+/// FROST binding factor `ρ` for the actor at position `idx` in the ordered
+/// commitment list.
+///
+/// Binds the whole signing context — session id, the deterministic offset
+/// (which fixes inputs/outputs/fee), the full ordered commitment list, and the
+/// actor position — so no participant can grind nonces to force a colliding
+/// group nonce (Drijvers/Wagner ROS resistance).
+pub fn binding_factor(
+	secp: &Secp256k1,
+	session: &KernelSession,
+	commitments: &[SigningCommitment],
+	idx: usize,
+) -> Result<SecretKey, Error> {
+	let mut m = Vec::new();
+	m.extend_from_slice(&(session.session_id.len() as u32).to_be_bytes());
+	m.extend_from_slice(&session.session_id);
+	m.extend_from_slice(&session.offset.0);
+	m.extend_from_slice(&(commitments.len() as u32).to_be_bytes());
+	for c in commitments {
+		m.extend_from_slice(&c.pub_d.serialize_vec(secp, true));
+		m.extend_from_slice(&c.pub_e.serialize_vec(secp, true));
+		m.extend_from_slice(&c.pub_excess.serialize_vec(secp, true));
+	}
+	m.extend_from_slice(&(idx as u32).to_be_bytes());
+	hash_to_scalar(secp, HashDomain::Frost, &m)
+}
+
+/// Aggregate the group nonce `R = Σ (D_j + ρ_j·E_j)` and excess `X = Σ X_j`
+/// from the ordered commitment list.
+pub fn aggregate_frost(
+	secp: &Secp256k1,
+	session: &KernelSession,
+	commitments: &[SigningCommitment],
+) -> Result<AggregatedKernelPubs, Error> {
+	if commitments.is_empty() {
+		return Err(Error::Multisig("no signing commitments".into()));
+	}
+	let mut nonce_terms: Vec<PublicKey> = Vec::with_capacity(commitments.len());
+	for (idx, c) in commitments.iter().enumerate() {
+		let rho = binding_factor(secp, session, commitments, idx)?;
+		let mut rho_e = c.pub_e.clone();
+		rho_e.mul_assign(secp, &rho)?;
+		let r_j = PublicKey::from_combination(secp, vec![&c.pub_d, &rho_e])?;
+		nonce_terms.push(r_j);
+	}
+	let nonce_refs: Vec<&PublicKey> = nonce_terms.iter().collect();
+	let excess_refs: Vec<&PublicKey> = commitments.iter().map(|c| &c.pub_excess).collect();
+	Ok(AggregatedKernelPubs {
+		nonce_sum: PublicKey::from_combination(secp, nonce_refs)?,
+		excess_sum: PublicKey::from_combination(secp, excess_refs)?,
+	})
+}
+
+/// Produce a FROST partial signature for the actor at `my_index`.
+///
+/// The effective nonce is `k_j = d_j + ρ_j·e_j`, so `k_j·G = D_j + ρ_j·E_j`
+/// and the partials sum consistently to the group nonce `R`.
 pub fn kernel_partial_sign(
 	secp: &Secp256k1,
 	secrets: &ActorKernelSecrets,
+	commitments: &[SigningCommitment],
+	my_index: usize,
 	agg: &AggregatedKernelPubs,
 	session: &KernelSession,
 ) -> Result<Signature, Error> {
+	let rho = binding_factor(secp, session, commitments, my_index)?;
+	let rho_e = sk_mul(secp, &rho, &secrets.e)?;
+	let k_j = sk_add(secp, &secrets.d, &rho_e)?;
 	let msg = kernel_message(&session.features)?;
 	aggsig::calculate_partial_sig(
 		secp,
 		&secrets.partial_excess,
-		&secrets.sec_nonce,
+		&k_j,
 		&agg.nonce_sum,
 		Some(&agg.excess_sum),
 		&msg,
@@ -379,35 +521,40 @@ pub fn run_kernel_sign_local(
 	inputs: Vec<CoinId>,
 	outputs: Vec<CoinId>,
 ) -> Result<(Signature, AggregatedKernelPubs, KernelSession), Error> {
+	// C-07: fix quorum order and bind it into the session tag / offset context.
+	let quorum = canonical_quorum(quorum)?;
+	let mut sid = session_id.as_ref().to_vec();
+	sid.extend_from_slice(b"|quorum|");
+	sid.extend_from_slice(&quorum_transcript(&quorum)?);
+
 	let features = plain_features(fee)?;
-	let session = create_kernel_session(secp, public_poly, session_id, features, inputs, outputs)?;
+	let session = create_kernel_session(secp, public_poly, &sid, features, inputs, outputs)?;
 
-	// Prepare each actor
+	// Round 1: each actor draws two nonces and publishes its commitment. Every
+	// claimed partial excess is checked against the public polynomial before use
+	// (rogue-key guard, C-05). Indices are canonical (mix/offset role = 0).
 	let mut secrets = Vec::new();
-	let mut commits = Vec::new();
+	let mut commitments = Vec::new();
 	for j in 0..quorum.len() {
-		let (sec, c) = kernel_prepare(secp, public_poly, quorum, j, &session)?;
+		let sec = kernel_round1(secp, public_poly, &quorum, j, &session)?;
+		verify_partial_excess(
+			secp,
+			public_poly,
+			&quorum,
+			j,
+			&session,
+			&sec.commitment.pub_excess,
+		)?;
+		commitments.push(sec.commitment.clone());
 		secrets.push(sec);
-		commits.push(c);
 	}
 
-	// Reveal + verify commitments
-	let mut reveals = Vec::new();
-	for (j, sec) in secrets.iter().enumerate() {
-		verify_nonce_commitment(secp, &commits[j], &sec.pub_nonce)?;
-		reveals.push(NonceReveal {
-			pub_nonce: sec.pub_nonce,
-			pub_excess: sec.pub_excess,
-		});
-	}
-	let agg = aggregate_kernel_pubs(secp, &reveals)?;
-
-	// Partial signs
+	// Round 2: derive the group nonce with binding factors, then sign.
+	let agg = aggregate_frost(secp, &session, &commitments)?;
 	let mut partials = Vec::new();
 	for (j, sec) in secrets.iter().enumerate() {
-		let ps = kernel_partial_sign(secp, sec, &agg, &session)?;
-		verify_kernel_partial(secp, &ps, &sec.pub_excess, &agg, &session)?;
-		let _ = j;
+		let ps = kernel_partial_sign(secp, sec, &commitments, j, &agg, &session)?;
+		verify_kernel_partial(secp, &ps, &sec.commitment.pub_excess, &agg, &session)?;
 		partials.push(ps);
 	}
 
@@ -441,13 +588,14 @@ mod tests {
 	use crate::multisig::types::{ActorId, CeremonyId, ThresholdParams};
 
 	fn setup_2of3(secp: &Secp256k1) -> (PublicPoly, Vec<ActorPoint>) {
-		let params = ThresholdParams::new(2, 3).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 3).unwrap();
 		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
 		let states = run_dkg_local(secp, CeremonyId::new(), params, actors).unwrap();
-		let q = vec![
+		let q = canonical_quorum(&[
 			ActorPoint::from(&states[0].shares[0]),
 			ActorPoint::from(&states[1].shares[0]),
-		];
+		])
+		.unwrap();
 		(states[0].config.public_poly.clone(), q)
 	}
 
@@ -462,6 +610,23 @@ mod tests {
 		let (sig, agg, session) =
 			run_kernel_sign_local(&secp, &pp, &q, b"test-session-1", fee, inputs, outputs).unwrap();
 		verify_kernel_sig(&secp, &sig, &agg, &session).unwrap();
+	}
+
+	#[test]
+	fn reversed_quorum_same_excess() {
+		// C-07: reordering the quorum must not change the aggregated excess.
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, mut q) = setup_2of3(&secp);
+		let inputs = vec![CoinId::new(1, 5000)];
+		let outputs = vec![CoinId::new(2, 4000)];
+		let fee = 1000;
+		let (_s1, agg1, _) =
+			run_kernel_sign_local(&secp, &pp, &q, b"ord", fee, inputs.clone(), outputs.clone())
+				.unwrap();
+		q.reverse();
+		let (_s2, agg2, _) =
+			run_kernel_sign_local(&secp, &pp, &q, b"ord", fee, inputs, outputs).unwrap();
+		assert_eq!(agg1.excess_sum, agg2.excess_sum);
 	}
 
 	#[test]
@@ -488,28 +653,71 @@ mod tests {
 	}
 
 	#[test]
-	fn nonce_commitment_binds_reveal() {
+	fn binding_factor_binds_context() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let k = SecretKey::new(&secp, &mut rand::thread_rng());
-		let pk = PublicKey::from_secret_key(&secp, &k).unwrap();
-		let c = commit_nonce(&secp, &pk);
-		verify_nonce_commitment(&secp, &c, &pk).unwrap();
+		let (pp, q) = setup_2of3(&secp);
+		let session = create_kernel_session(
+			&secp,
+			&pp,
+			b"bf",
+			plain_features(5).unwrap(),
+			vec![CoinId::new(1, 100)],
+			vec![CoinId::new(2, 95)],
+		)
+		.unwrap();
+		let c0 = kernel_round1(&secp, &pp, &q, 0, &session).unwrap().commitment;
+		let c1 = kernel_round1(&secp, &pp, &q, 1, &session).unwrap().commitment;
+		let commitments = vec![c0, c1];
+		let r0 = binding_factor(&secp, &session, &commitments, 0).unwrap();
+		let r1 = binding_factor(&secp, &session, &commitments, 1).unwrap();
+		// Per-actor binding factors differ, and are deterministic.
+		assert_ne!(r0.0, r1.0);
+		let r0b = binding_factor(&secp, &session, &commitments, 0).unwrap();
+		assert_eq!(r0.0, r0b.0);
+		// Reordering the commitment list changes the binding factor (binds the set).
+		let reordered = vec![commitments[1].clone(), commitments[0].clone()];
+		let r0r = binding_factor(&secp, &session, &reordered, 0).unwrap();
+		assert_ne!(r0.0, r0r.0);
+	}
 
-		let k2 = SecretKey::new(&secp, &mut rand::thread_rng());
-		let pk2 = PublicKey::from_secret_key(&secp, &k2).unwrap();
-		assert!(verify_nonce_commitment(&secp, &c, &pk2).is_err());
+	#[test]
+	fn partial_excess_matches_public_poly() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q) = setup_2of3(&secp);
+		let session = create_kernel_session(
+			&secp,
+			&pp,
+			b"pe",
+			plain_features(10).unwrap(),
+			vec![CoinId::new(1, 5000)],
+			vec![CoinId::new(2, 4990)],
+		)
+		.unwrap();
+		for j in 0..q.len() {
+			let sk = partial_excess_for_actor(&secp, &pp, &q, j, &session).unwrap();
+			let pub_excess = PublicKey::from_secret_key(&secp, &sk).unwrap();
+			// Honest partial excess matches the public-poly prediction.
+			verify_partial_excess(&secp, &pp, &q, j, &session, &pub_excess).unwrap();
+			// A tampered excess pubkey is rejected.
+			let bad_sk = SecretKey::new(&secp, &mut rand::thread_rng());
+			let bad = PublicKey::from_secret_key(&secp, &bad_sk).unwrap();
+			assert!(verify_partial_excess(&secp, &pp, &q, j, &session, &bad).is_err());
+		}
 	}
 
 	#[test]
 	fn three_of_three_kernel() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(3, 3).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(3, 3).unwrap();
 		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
-		let q: Vec<_> = states
-			.iter()
-			.map(|s| ActorPoint::from(&s.shares[0]))
-			.collect();
+		let q: Vec<_> = canonical_quorum(
+			&states
+				.iter()
+				.map(|s| ActorPoint::from(&s.shares[0]))
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
 		let (sig, agg, session) = run_kernel_sign_local(
 			&secp,
 			&states[0].config.public_poly,
@@ -536,21 +744,41 @@ mod tests {
 			vec![CoinId::new(2, 99)],
 		)
 		.unwrap();
-		let (sec0, _) = kernel_prepare(&secp, &pp, &q, 0, &session).unwrap();
-		let (sec1, _) = kernel_prepare(&secp, &pp, &q, 1, &session).unwrap();
-		let reveals = vec![
-			NonceReveal {
-				pub_nonce: sec0.pub_nonce,
-				pub_excess: sec0.pub_excess,
-			},
-			NonceReveal {
-				pub_nonce: sec1.pub_nonce,
-				pub_excess: sec1.pub_excess,
-			},
-		];
-		let agg = aggregate_kernel_pubs(&secp, &reveals).unwrap();
-		let good = kernel_partial_sign(&secp, &sec0, &agg, &session).unwrap();
-		// Verify with wrong pubkey should fail
-		assert!(verify_kernel_partial(&secp, &good, &sec1.pub_excess, &agg, &session).is_err());
+		let sec0 = kernel_round1(&secp, &pp, &q, 0, &session).unwrap();
+		let sec1 = kernel_round1(&secp, &pp, &q, 1, &session).unwrap();
+		let commitments = vec![sec0.commitment.clone(), sec1.commitment.clone()];
+		let agg = aggregate_frost(&secp, &session, &commitments).unwrap();
+		let good = kernel_partial_sign(&secp, &sec0, &commitments, 0, &agg, &session).unwrap();
+		// The partial verifies against its own excess...
+		verify_kernel_partial(&secp, &good, &sec0.commitment.pub_excess, &agg, &session).unwrap();
+		// ...but not against another actor's excess pubkey.
+		assert!(
+			verify_kernel_partial(&secp, &good, &sec1.commitment.pub_excess, &agg, &session).is_err()
+		);
+	}
+
+	#[test]
+	fn frost_signature_verifies_as_kernel() {
+		use crate::grin_core::global;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q) = setup_2of3(&secp);
+		let (sig, agg, session) = run_kernel_sign_local(
+			&secp,
+			&pp,
+			&q,
+			b"frost-sess",
+			1_000,
+			vec![CoinId::new(1, 1_000_000)],
+			vec![CoinId::new(2, 999_000)],
+		)
+		.unwrap();
+		// The aggregated FROST signature verifies under Grin's own kernel check.
+		let kernel = crate::grin_core::core::TxKernel {
+			features: session.features.clone(),
+			excess: excess_commitment(&secp, &agg).unwrap(),
+			excess_sig: sig,
+		};
+		kernel.verify().unwrap();
 	}
 }

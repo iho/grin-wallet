@@ -31,7 +31,8 @@ use crate::store::{self, option_to_not_found, to_key, to_key_u64};
 use crate::core::core::Transaction;
 use crate::core::ser;
 use crate::libwallet::multisig::{
-	decrypt_from_storage, encrypt_for_storage, multisig_db_key, CeremonyId, MultisigWalletState,
+	decrypt_from_storage, encrypt_for_storage, multisig_db_key, CeremonyId, EncryptedMultisigState,
+	MultisigWalletState,
 	MULTISIG_PREFIX,
 };
 use crate::libwallet::{
@@ -519,13 +520,12 @@ where
 		ceremony_id: &CeremonyId,
 	) -> Result<MultisigWalletState, Error> {
 		let key = multisig_db_key(ceremony_id);
-		let mut state: MultisigWalletState =
+		let sealed: EncryptedMultisigState =
 			option_to_not_found(self.db.get_ser(&key, None), || {
 				format!("Multisig ceremony: {}", ceremony_id.0)
 			})?;
 		let keychain = self.keychain(keychain_mask)?;
-		decrypt_from_storage(&keychain, &mut state)?;
-		Ok(state)
+		decrypt_from_storage(&keychain, &sealed)
 	}
 
 	fn list_multisig_ceremonies(&self) -> Result<Vec<CeremonyId>, Error> {

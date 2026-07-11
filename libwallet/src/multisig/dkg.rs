@@ -65,6 +65,15 @@ pub struct DealerSecrets {
 	pub poly: SecretPoly,
 }
 
+impl std::fmt::Debug for DealerSecrets {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("DealerSecrets")
+			.field("actor", &self.actor)
+			.field("poly", &"[redacted]")
+			.finish()
+	}
+}
+
 fn pop_domain_tag() -> &'static [u8] {
 	b"grin-msig/pop"
 }
@@ -289,7 +298,7 @@ mod tests {
 	#[test]
 	fn reject_wrong_coeff_count() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let ceremony = CeremonyId::new();
 		let actor = ActorId::from_index(0);
 		let (_s, mut c) = generate_dealer_contribution(&secp, &ceremony, actor, &params).unwrap();

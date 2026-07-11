@@ -21,7 +21,10 @@ use crate::config::{TorConfig, WalletConfig};
 use crate::core::core::OutputFeatures;
 use crate::core::global;
 use crate::keychain::{Identifier, Keychain};
-use crate::libwallet::multisig::{CeremonySummary, MultisigDemoTxResult};
+use crate::libwallet::multisig::{
+	CeremonySummary, MultisigDemoTxResult, MultisigSessionApplyResult, MultisigSessionStartResult,
+	SessionStatus,
+};
 use crate::libwallet::{
 	mwixnet::MixnetReqCreationParams, AcctPathMapping, Amount, BuiltOutput, Error, InitTxArgs,
 	IssueInvoiceTxArgs, NodeClient, NodeHeightResult, OutputCommitMapping, PaymentProof, Slate,
@@ -2055,6 +2058,54 @@ pub trait OwnerRpc {
 		tx_hex: String,
 		fluff: bool,
 	) -> Result<(), Error>;
+
+	/// Experimental: list durable multiparty sessions (WS4).
+	fn multisig_session_list(&self, token: Token) -> Result<Vec<SessionStatus>, Error>;
+
+	/// Experimental: status of one sealed session (session id hex).
+	fn multisig_session_status(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<SessionStatus, Error>;
+
+	/// Experimental: start CreateOutput session; returns status + first envelope JSON.
+	fn multisig_session_create_output(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: start Spend session. `inputs`/`outputs` are `[[number,value],...]`.
+	fn multisig_session_create_spend(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: apply peer envelope JSON to a session.
+	fn multisig_session_apply(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		peer_envelope_json: String,
+	) -> Result<MultisigSessionApplyResult, Error>;
+
+	/// Experimental: abort a session and wipe secrets.
+	fn multisig_session_abort(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		reason: String,
+		delete_file: bool,
+	) -> Result<SessionStatus, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2545,6 +2596,86 @@ where
 		fluff: bool,
 	) -> Result<(), Error> {
 		Owner::multisig_post_tx(self, (&token.keychain_mask).as_ref(), tx_hex, fluff)
+	}
+
+	fn multisig_session_list(&self, token: Token) -> Result<Vec<SessionStatus>, Error> {
+		Owner::multisig_session_list(self, (&token.keychain_mask).as_ref())
+	}
+
+	fn multisig_session_status(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<SessionStatus, Error> {
+		Owner::multisig_session_status(self, (&token.keychain_mask).as_ref(), session_id_hex)
+	}
+
+	fn multisig_session_create_output(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_create_output(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			coin_number,
+			coin_value,
+			session_tag,
+		)
+	}
+
+	fn multisig_session_create_spend(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_create_spend(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			inputs,
+			outputs,
+			fee,
+			session_tag,
+		)
+	}
+
+	fn multisig_session_apply(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		peer_envelope_json: String,
+	) -> Result<MultisigSessionApplyResult, Error> {
+		Owner::multisig_session_apply(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			peer_envelope_json,
+		)
+	}
+
+	fn multisig_session_abort(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		reason: String,
+		delete_file: bool,
+	) -> Result<SessionStatus, Error> {
+		Owner::multisig_session_abort(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			reason,
+			delete_file,
+		)
 	}
 }
 

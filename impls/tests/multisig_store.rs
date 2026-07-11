@@ -55,7 +55,7 @@ fn multisig_state_lmdb_roundtrip() {
 
 	// Build a small multisig state
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
-	let params = ThresholdParams::new(2, 2).unwrap();
+	let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 	let ceremony = CeremonyId::new();
 	let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 	let states = run_dkg_local(&secp, ceremony.clone(), params, actors).unwrap();

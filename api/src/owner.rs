@@ -29,7 +29,8 @@ use crate::keychain::{Identifier, Keychain};
 use crate::libwallet::api_impl::owner_updater::{start_updater_log_thread, StatusMessage};
 use crate::libwallet::api_impl::{owner, owner_updater};
 use crate::libwallet::multisig::{
-	self, CeremonySummary, MultisigDemoTxResult, MultisigWalletState,
+	self, CeremonySummary, CoinId, MultisigDemoTxResult, MultisigSessionApplyResult,
+	MultisigSessionStartResult, MultisigWalletState, SessionStatus,
 };
 use crate::libwallet::{
 	AcctPathMapping, BuiltOutput, Error, InitTxArgs, IssueInvoiceTxArgs, NodeClient,
@@ -2592,6 +2593,140 @@ where
 		};
 		let tx = multisig::tx_from_hex(&tx_hex)?;
 		owner::post_tx(&client, &tx, fluff)
+	}
+
+	// -----------------------------------------------------------------------
+	// Multisig sessions (WS4 negotiator) — experimental
+	// -----------------------------------------------------------------------
+
+	fn multisig_wallet_data_dir(&self) -> Result<String, Error> {
+		let tld = self.get_top_level_directory()?;
+		Ok(multisig::wallet_data_dir(&tld).display().to_string())
+	}
+
+	/// List durable multiparty sessions sealed on disk.
+	pub fn multisig_session_list(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+	) -> Result<Vec<SessionStatus>, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_list(&mut **w, keychain_mask, &wdata)
+	}
+
+	/// Status of one sealed session (session_id as hex).
+	pub fn multisig_session_status(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+	) -> Result<SessionStatus, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_status(&mut **w, keychain_mask, &wdata, &session_id_hex)
+	}
+
+	/// Start a CreateOutput session; returns status + first envelope JSON.
+	pub fn multisig_session_create_output(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_create_output_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&multisig::CeremonyId(uuid),
+			coin_number,
+			coin_value,
+			&session_tag,
+			None,
+		)
+	}
+
+	/// Start a Spend session; inputs/outputs as `[[number, value], ...]`.
+	pub fn multisig_session_create_spend(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let inputs: Vec<CoinId> = inputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let outputs: Vec<CoinId> = outputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_create_spend_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&multisig::CeremonyId(uuid),
+			inputs,
+			outputs,
+			fee,
+			&session_tag,
+			None,
+		)
+	}
+
+	/// Apply a peer envelope JSON string to a session.
+	pub fn multisig_session_apply(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		peer_envelope_json: String,
+	) -> Result<MultisigSessionApplyResult, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_apply_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&session_id_hex,
+			&peer_envelope_json,
+		)
+	}
+
+	/// Abort a session (wipe secrets); optionally delete the sealed file.
+	pub fn multisig_session_abort(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		reason: String,
+		delete_file: bool,
+	) -> Result<SessionStatus, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_abort(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&session_id_hex,
+			&reason,
+			delete_file,
+		)
 	}
 }
 

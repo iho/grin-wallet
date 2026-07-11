@@ -22,10 +22,19 @@ use rand::thread_rng;
 use super::scalar::{sk_add, sk_mul, sk_pow_u32};
 
 /// Secret polynomial coefficients `r_0 + r_1 x + ... + r_d x^d`.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct SecretPoly {
 	/// Coefficients low-degree first. Length = degree + 1.
 	pub coeffs: Vec<SecretKey>,
+}
+
+impl std::fmt::Debug for SecretPoly {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("SecretPoly")
+			.field("degree", &self.degree())
+			.field("coeffs", &"[redacted]")
+			.finish()
+	}
 }
 
 impl SecretPoly {

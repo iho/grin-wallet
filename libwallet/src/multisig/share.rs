@@ -12,13 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Lagrange partial keys, reconstruction, and δ-masked add-actor shares.
+//! Lagrange partial keys, reconstruction, and (internal) δ-masked add-actor.
 //!
-//! ## Warning (crypto review F-03)
+//! ## Quorum ordering (C-07)
 //!
-//! Add-actor with a quorum of M allows M−1 colluding members plus a
-//! sockpuppet new actor to extract the remaining honest share. Prefer full
-//! re-DKG + UTXO migration for membership changes when possible.
+//! All multiparty partials that assign a special role to "index 0" (view mix,
+//! kernel offset) assume the quorum is in **canonical order**: sorted by
+//! x-coordinate big-endian. Use [`canonical_quorum`] before indexing actors.
+//!
+//! ## Membership changes (F-03 / C-13)
+//!
+//! Interactive add-actor is **not part of the v1 public API**. A quorum of M
+//! can exfiltrate an honest share via a sockpuppet. Membership change for v1 =
+//! full re-DKG (new epoch) + on-chain sweep of old-epoch UTXOs.
 
 use crate::grin_util::secp::key::SecretKey;
 use crate::grin_util::secp::Secp256k1;
@@ -28,12 +34,21 @@ use super::scalar::{hash_to_scalar, sk_add, sk_div, sk_mul, sk_neg, sk_sub, Hash
 use super::types::SecretShare;
 
 /// One evaluation point used in Lagrange (x, y = sk(x)).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ActorPoint {
 	/// x-coordinate.
 	pub x: SecretKey,
 	/// y = sk(x).
 	pub y: SecretKey,
+}
+
+impl std::fmt::Debug for ActorPoint {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("ActorPoint")
+			.field("x", &"[redacted]")
+			.field("y", &"[redacted]")
+			.finish()
+	}
 }
 
 impl From<&SecretShare> for ActorPoint {
@@ -43,6 +58,40 @@ impl From<&SecretShare> for ActorPoint {
 			y: s.y.clone(),
 		}
 	}
+}
+
+/// Sort a quorum into **canonical order** (x-coordinate, big-endian) — C-07.
+///
+/// After this sort, index `0` is the **mix/offset role**: it alone applies the
+/// public view-mix to coin blinds and subtracts the kernel offset. All parties
+/// must use the same order or partial excesses / blinds will not sum.
+///
+/// Rejects empty quorums and duplicate x-coordinates.
+pub fn canonical_quorum(quorum: &[ActorPoint]) -> Result<Vec<ActorPoint>, Error> {
+	if quorum.is_empty() {
+		return Err(Error::Multisig("empty quorum".into()));
+	}
+	let mut q = quorum.to_vec();
+	q.sort_by(|a, b| a.x.0.cmp(&b.x.0));
+	for w in q.windows(2) {
+		if w[0].x.0 == w[1].x.0 {
+			return Err(Error::Multisig(
+				"duplicate actor x-coordinate in quorum".into(),
+			));
+		}
+	}
+	Ok(q)
+}
+
+/// Transcript bytes binding a canonical quorum (for session / offset context).
+pub fn quorum_transcript(quorum: &[ActorPoint]) -> Result<Vec<u8>, Error> {
+	let q = canonical_quorum(quorum)?;
+	let mut out = Vec::with_capacity(4 + q.len() * 32);
+	out.extend_from_slice(&(q.len() as u32).to_be_bytes());
+	for p in &q {
+		out.extend_from_slice(&p.x.0);
+	}
+	Ok(out)
 }
 
 /// Lagrange coefficient λ_j for point j in quorum, evaluated at target `x`:
@@ -122,12 +171,15 @@ pub fn delta_mask(
 	sk_mul(secp, &h, &dx)
 }
 
-/// Masked share for add-actor from quorum member i:
-/// `sk_share_i = sk_{i,Q}(x_new) + sum_{j≠i} δ(i,j,ctx)`.
+/// Masked share for add-actor from quorum member i (tests only; C-13).
 ///
+/// **Not part of the v1 public API (F-03).** Prefer re-DKG + sweep.
+///
+/// `sk_share_i = sk_{i,Q}(x_new) + sum_{j≠i} δ(i,j,ctx)`.
 /// `pairwise_secrets[j]` is the DH/shared secret between i and quorum[j]
 /// (ignored at j == i).
-pub fn add_actor_masked_share(
+#[cfg(test)]
+pub(crate) fn add_actor_masked_share(
 	secp: &Secp256k1,
 	quorum: &[ActorPoint],
 	i: usize,
@@ -186,7 +238,7 @@ mod tests {
 	fn lagrange_reconstructs_at_new_point() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		// degree 1 => threshold 2, use 2-of-2 for simple reconstruction
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 
@@ -195,6 +247,7 @@ mod tests {
 			.iter()
 			.map(|s| ActorPoint::from(&s.shares[0]))
 			.collect();
+		let q = canonical_quorum(&q).unwrap();
 
 		// Evaluate at a fresh x
 		let x_new = crate::multisig::scalar::hash_to_scalar(
@@ -216,17 +269,18 @@ mod tests {
 	#[test]
 	fn delta_masks_cancel() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(2, 2).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
 		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 		let q: Vec<ActorPoint> = states
 			.iter()
 			.map(|s| ActorPoint::from(&s.shares[0]))
 			.collect();
+		let q = canonical_quorum(&q).unwrap();
 		let x_new = crate::multisig::scalar::sk_from_u64(&secp, 99).unwrap();
 		let ctx = b"add-actor-ctx";
 
-		// Symmetric pairwise secrets
+		// Symmetric pairwise secrets (aligned with canonical order)
 		let sec01 = b"shared-0-1".to_vec();
 		let secrets_for_0 = vec![vec![], sec01.clone()];
 		let secrets_for_1 = vec![sec01, vec![]];
@@ -235,5 +289,28 @@ mod tests {
 		let m1 = add_actor_masked_share(&secp, &q, 1, &x_new, ctx, &secrets_for_1).unwrap();
 		let y_new = unmask_sum(&secp, &[m0, m1]).unwrap();
 		assert!(verify_share(&secp, &states[0].config.public_poly, &x_new, &y_new).unwrap());
+	}
+
+	#[test]
+	fn canonical_quorum_sorts_by_x() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 3).unwrap();
+		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
+		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
+		let mut q: Vec<ActorPoint> = states
+			.iter()
+			.map(|s| ActorPoint::from(&s.shares[0]))
+			.collect();
+		// Reverse order, then canonicalize — result must be sorted and stable.
+		q.reverse();
+		let c1 = canonical_quorum(&q).unwrap();
+		let c2 = canonical_quorum(&c1).unwrap();
+		assert_eq!(c1.len(), 3);
+		for w in c1.windows(2) {
+			assert!(w[0].x.0 <= w[1].x.0);
+		}
+		assert_eq!(c1[0].x.0, c2[0].x.0);
+		assert_eq!(c1[1].x.0, c2[1].x.0);
+		assert_eq!(c1[2].x.0, c2[2].x.0);
 	}
 }

@@ -1495,6 +1495,24 @@ pub struct MultisigArgs {
 	/// Ordered Slatepack addresses of all actors (multi-party roster). Enables
 	/// encrypted share delivery; all parties must supply the same list.
 	pub addresses: Option<Vec<String>>,
+	/// Session id hex (WS4).
+	pub session_id: Option<String>,
+	/// Shared session tag string (WS4 create).
+	pub session_tag: Option<String>,
+	/// Coin number (CreateOutput).
+	pub coin_number: Option<u64>,
+	/// Coin value nanogrins (CreateOutput).
+	pub coin_value: Option<u64>,
+	/// Fee nanogrins (Spend).
+	pub fee: Option<u64>,
+	/// Input coins as "number:value".
+	pub inputs: Option<Vec<String>>,
+	/// Output coins as "number:value".
+	pub outputs: Option<Vec<String>>,
+	/// Abort reason.
+	pub reason: Option<String>,
+	/// Delete session file after abort.
+	pub delete: bool,
 }
 
 fn msig_wallet_data_dir<L, C, K>(owner_api: &Owner<L, C, K>) -> Result<String, Error>
@@ -1815,9 +1833,10 @@ where
 				let mut w_lock = api.wallet_inst.lock();
 				let w = w_lock.lc_provider()?.wallet_inst()?;
 				let st = libwallet::multisig::get_state(&mut **w, m, &ceremony)?;
-				libwallet::multisig::export_state_json(&st, &out)?;
+				// AEAD-sealed under keychain-derived key (C-08) — not plaintext JSON.
+				libwallet::multisig::export_state_sealed(&mut **w, m, &st, &out)?;
 				println!(
-					"Exported state (SENSITIVE — contains share material) to {}",
+					"Exported sealed multisig state (keychain-encrypted) to {}",
 					out
 				);
 				Ok(())
@@ -1830,7 +1849,7 @@ where
 			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
 				let mut w_lock = api.wallet_inst.lock();
 				let w = w_lock.lc_provider()?.wallet_inst()?;
-				let st = libwallet::multisig::import_state_json(&mut **w, m, &file)?;
+				let st = libwallet::multisig::import_state_sealed(&mut **w, m, &file)?;
 				println!("Imported ceremony {}", st.config.ceremony_id.0);
 				Ok(())
 			})?;
@@ -1873,6 +1892,233 @@ where
 				.multisig_post_tx(keychain_mask, tx_hex, fluff)
 				.map_err(Error::LibWallet)?;
 			println!("Posted transaction from {} (fluff={})", file, fluff);
+		}
+		"session-list" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let list = libwallet::multisig::session_list(&mut **w, m, &wdata)?;
+				if list.is_empty() {
+					println!("No durable sessions.");
+				} else {
+					println!(
+						"{:<20} {:<14} {:<12} {:>5} {:>5}/{:<5}",
+						"Session (hex..)", "Kind", "Phase", "Idx", "Have", "N"
+					);
+					println!("{}", "-".repeat(70));
+					for s in list {
+						let sid = if s.session_id_hex.len() > 16 {
+							format!("{}…", &s.session_id_hex[..16])
+						} else {
+							s.session_id_hex.clone()
+						};
+						println!(
+							"{:<20} {:<14} {:<12} {:>5} {:>5}/{:<5}",
+							sid,
+							format!("{:?}", s.kind),
+							format!("{:?}", s.phase),
+							s.my_index,
+							s.collected,
+							s.quorum_size
+						);
+					}
+				}
+				Ok(())
+			})?;
+		}
+		"session-status" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let s = libwallet::multisig::session_status(&mut **w, m, &wdata, &sid)?;
+				println!("Session:  {}", s.session_id_hex);
+				println!("Kind:     {:?}", s.kind);
+				println!("Phase:    {:?}", s.phase);
+				println!("My index: {} / {}", s.my_index, s.quorum_size);
+				println!("Collected this phase: {}/{}", s.collected, s.quorum_size);
+				if let Some(r) = s.abort_reason {
+					println!("Aborted:  {}", r);
+				}
+				Ok(())
+			})?;
+		}
+		"session-create-output" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let coin_number = args
+				.coin_number
+				.ok_or_else(|| Error::ArgumentError("--coin-number required".into()))?;
+			let coin_value = args
+				.coin_value
+				.ok_or_else(|| Error::ArgumentError("--coin-value required".into()))?;
+			let tag = args
+				.session_tag
+				.clone()
+				.unwrap_or_else(|| "create-output".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out.json".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::session_create_output(
+					&mut **w,
+					m,
+					&wdata,
+					&libwallet::multisig::CeremonyId(uuid),
+					coin_number,
+					coin_value,
+					&tag,
+					&out,
+					None,
+				)?;
+				println!("CreateOutput session started.");
+				println!("  Session id: {}", st.session_id_hex);
+				println!("  Phase:      {:?}", st.phase);
+				println!("  Wrote:      {}", out);
+				println!("  Exchange this envelope with quorum peers, then session-apply.");
+				Ok(())
+			})?;
+		}
+		"session-create-spend" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let parse_coin = |s: &str| -> Result<libwallet::multisig::CoinId, Error> {
+				let parts: Vec<_> = s.split(':').collect();
+				if parts.len() != 2 {
+					return Err(Error::ArgumentError(
+						"coin must be number:value".into(),
+					));
+				}
+				let n = parts[0]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin number: {}", e)))?;
+				let v = parts[1]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin value: {}", e)))?;
+				Ok(libwallet::multisig::CoinId::new(n, v))
+			};
+			let inputs = args
+				.inputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			let outputs = args
+				.outputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			if inputs.is_empty() || outputs.is_empty() {
+				return Err(Error::ArgumentError(
+					"--input and --output required (number:value)".into(),
+				));
+			}
+			let fee = args.fee.unwrap_or(1_000_000);
+			let tag = args.session_tag.clone().unwrap_or_else(|| "spend".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out.json".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::session_create_spend(
+					&mut **w,
+					m,
+					&wdata,
+					&libwallet::multisig::CeremonyId(uuid),
+					inputs,
+					outputs,
+					fee,
+					&tag,
+					&out,
+					None,
+				)?;
+				println!("Spend session started.");
+				println!("  Session id: {}", st.session_id_hex);
+				println!("  Phase:      {:?}", st.phase);
+				println!("  Wrote:      {}", out);
+				Ok(())
+			})?;
+		}
+		"session-apply" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			let out_dir = args
+				.out_dir
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let (st, paths) =
+					libwallet::multisig::session_apply(&mut **w, m, &wdata, &sid, &file, &out_dir)?;
+				println!("Applied peer envelope.");
+				println!("  Phase:     {:?}", st.phase);
+				println!("  Collected: {}/{}", st.collected, st.quorum_size);
+				if paths.is_empty() {
+					println!("  No new outbound messages.");
+				} else {
+					println!("  Outbound:");
+					for p in paths {
+						println!("    {}", p);
+					}
+				}
+				if st.phase == libwallet::multisig::SessionPhase::Complete {
+					println!("  Session COMPLETE.");
+				}
+				Ok(())
+			})?;
+		}
+		"session-abort" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let reason = args
+				.reason
+				.clone()
+				.unwrap_or_else(|| "user abort".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::session_abort(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					&reason,
+					args.delete,
+				)?;
+				println!("Session aborted: {:?}", st.phase);
+				if let Some(r) = st.abort_reason {
+					println!("  Reason: {}", r);
+				}
+				Ok(())
+			})?;
 		}
 		other => {
 			return Err(Error::ArgumentError(format!(

@@ -41,7 +41,7 @@ use super::coin::CoinId;
 use super::kernel::{excess_commitment, run_kernel_sign_local};
 use super::poly::PublicPoly;
 use super::rangeproof::run_rangeproof_local;
-use super::share::ActorPoint;
+use super::share::{canonical_quorum, ActorPoint};
 use super::types::MultisigWalletState;
 
 /// A fully constructed multisig UTXO (commit + rangeproof).
@@ -226,7 +226,9 @@ pub fn quorum_from_state(state: &MultisigWalletState) -> Vec<ActorPoint> {
 		.collect()
 }
 
-/// Build a quorum from several wallet states (one share index 0 each).
+/// Build a **canonical** quorum from several wallet states (one share index 0 each).
+///
+/// Order is sorted by x-coordinate (C-07); index 0 is the mix/offset role.
 pub fn quorum_from_states(states: &[MultisigWalletState]) -> Result<Vec<ActorPoint>, Error> {
 	if states.is_empty() {
 		return Err(Error::Multisig("empty states for quorum".into()));
@@ -241,7 +243,7 @@ pub fn quorum_from_states(states: &[MultisigWalletState]) -> Result<Vec<ActorPoi
 			y: st.shares[0].y.clone(),
 		});
 	}
-	Ok(q)
+	canonical_quorum(&q)
 }
 
 /// Serialize a transaction to hex (protocol v3 body encoding).
@@ -301,7 +303,7 @@ pub fn run_demo_tx(
 	// already configured — always set inside a running wallet, and set
 	// explicitly by the unit tests that exercise this path.
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
-	let params = ThresholdParams::new(threshold, total)?;
+	let params = ThresholdParams::new_allow_low_degree(threshold, total)?;
 	let actors: Vec<_> = (0..total as u32).map(ActorId::from_index).collect();
 	let states = run_dkg_local(&secp, CeremonyId::new(), params, actors)?;
 	let q = quorum_from_states(&states)?;
@@ -330,7 +332,7 @@ mod tests {
 
 	fn setup_2of3(secp: &Secp256k1) -> (PublicPoly, Vec<ActorPoint>, MultisigWalletState) {
 		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
-		let params = ThresholdParams::new(2, 3).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(2, 3).unwrap();
 		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
 		let states = run_dkg_local(secp, CeremonyId::new(), params, actors).unwrap();
 		let q = vec![
@@ -409,7 +411,7 @@ mod tests {
 	fn three_of_three_e2e() {
 		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
-		let params = ThresholdParams::new(3, 3).unwrap();
+		let params = ThresholdParams::new_allow_low_degree(3, 3).unwrap();
 		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 		let q = quorum_from_states(&states).unwrap();
