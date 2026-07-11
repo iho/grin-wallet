@@ -2953,7 +2953,7 @@ where
 		)
 	}
 
-	/// Start a durable DKG session (index roster; experimental).
+	/// Start a durable DKG session (index or address roster; experimental).
 	pub fn multisig_session_dkg_create(
 		&self,
 		keychain_mask: Option<&SecretKey>,
@@ -2963,6 +2963,7 @@ where
 		shares_per_actor: Option<usize>,
 		ceremony_id: Option<String>,
 		session_tag: String,
+		addresses: Option<Vec<String>>,
 	) -> Result<MultisigSessionStartResult, Error> {
 		let tld = self.get_top_level_directory()?;
 		let wdata = multisig::wallet_data_dir(&tld);
@@ -2973,6 +2974,11 @@ where
 					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
 			),
 			None => None,
+		};
+		let sign_key = if addresses.is_some() {
+			Some(self.get_slatepack_secret_key(keychain_mask, 0)?)
+		} else {
+			None
 		};
 		let mut w_lock = self.wallet_inst.lock();
 		let w = w_lock.lc_provider()?.wallet_inst()?;
@@ -2986,6 +2992,32 @@ where
 			shares_per_actor,
 			cid,
 			&session_tag,
+			addresses,
+			sign_key.as_ref(),
+		)
+	}
+
+	/// Export age-encrypted DKG partial shares for a session (address roster).
+	pub fn multisig_session_dkg_export_shares(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		out_dir: String,
+	) -> Result<Vec<String>, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let sender = self.get_slatepack_address(keychain_mask, 0)?;
+		let sign_key = self.get_slatepack_secret_key(keychain_mask, 0)?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_dkg_export_shares_armored(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&session_id_hex,
+			&sender,
+			&sign_key,
+			&out_dir,
 		)
 	}
 

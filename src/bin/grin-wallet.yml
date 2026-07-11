@@ -478,7 +478,7 @@ subcommands:
                   long: out
                   takes_value: true
         - session-dkg-create:
-            about: Start durable DKG session (index roster); write contribution envelope
+            about: Start durable DKG session (index or address roster); write contribution
             args:
               - threshold:
                   help: Threshold M
@@ -512,12 +512,31 @@ subcommands:
                   long: session-tag
                   takes_value: true
                   default_value: "dkg"
+              - addresses:
+                  help: Comma-separated ordered Slatepack addresses (all N actors)
+                  long: addresses
+                  takes_value: true
               - out:
                   help: Contribution envelope path
                   short: o
                   long: out
                   takes_value: true
                   default_value: "msig_dkg_contrib.json"
+        - session-dkg-export-shares:
+            about: Export age-encrypted DKG partial shares (address roster, C-02)
+            args:
+              - session:
+                  help: DKG session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - dir:
+                  help: Output directory for share slatepacks
+                  short: d
+                  long: dir
+                  takes_value: true
+                  default_value: "msig_dkg_shares"
         - session-dkg-finalize:
             about: Finalize completed DKG session into wallet LMDB
             args:

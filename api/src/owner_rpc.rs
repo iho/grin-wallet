@@ -2191,7 +2191,7 @@ pub trait OwnerRpc {
 		session_id_hex: String,
 	) -> Result<String, Error>;
 
-	/// Experimental: start durable DKG session (index roster).
+	/// Experimental: start durable DKG session (index or address roster).
 	fn multisig_session_dkg_create(
 		&self,
 		token: Token,
@@ -2201,7 +2201,16 @@ pub trait OwnerRpc {
 		shares_per_actor: Option<usize>,
 		ceremony_id: Option<String>,
 		session_tag: String,
+		addresses: Option<Vec<String>>,
 	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: export age-encrypted DKG partial shares for a session.
+	fn multisig_session_dkg_export_shares(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		out_dir: String,
+	) -> Result<Vec<String>, Error>;
 
 	/// Experimental: finalize completed DKG session into LMDB.
 	fn multisig_session_dkg_finalize(
@@ -2925,6 +2934,7 @@ where
 		shares_per_actor: Option<usize>,
 		ceremony_id: Option<String>,
 		session_tag: String,
+		addresses: Option<Vec<String>>,
 	) -> Result<MultisigSessionStartResult, Error> {
 		Owner::multisig_session_dkg_create(
 			self,
@@ -2935,6 +2945,21 @@ where
 			shares_per_actor,
 			ceremony_id,
 			session_tag,
+			addresses,
+		)
+	}
+
+	fn multisig_session_dkg_export_shares(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		out_dir: String,
+	) -> Result<Vec<String>, Error> {
+		Owner::multisig_session_dkg_export_shares(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			out_dir,
 		)
 	}
 

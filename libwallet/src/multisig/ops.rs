@@ -28,6 +28,7 @@ use crate::slatepack::SlatepackAddress;
 use crate::types::WalletBackend;
 use crate::Error;
 use ed25519_dalek::SecretKey as EdSecretKey;
+use std::convert::TryFrom;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -1239,12 +1240,39 @@ where
 }
 
 /// Apply a peer envelope JSON string; returns status + outbound envelope JSONs.
+///
+/// Accepts plain JSON envelopes or armored Slatepack (`BEGINSLATEPACK`). When
+/// the payload is age-encrypted, pass `dec_key` (this wallet's slatepack secret).
 pub fn session_apply_raw<'a, T: ?Sized, C, K>(
 	w: &mut T,
 	keychain_mask: Option<&SecretKey>,
 	wallet_data_dir: &str,
 	session_id_hex: &str,
 	peer_envelope_json: &str,
+) -> Result<MultisigSessionApplyResult, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	session_apply_raw_with_key(
+		w,
+		keychain_mask,
+		wallet_data_dir,
+		session_id_hex,
+		peer_envelope_json,
+		None,
+	)
+}
+
+/// Like [`session_apply_raw`] but with an optional slatepack decrypt key.
+pub fn session_apply_raw_with_key<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	peer_payload: &str,
+	dec_key: Option<&EdSecretKey>,
 ) -> Result<MultisigSessionApplyResult, Error>
 where
 	T: WalletBackend<'a, C, K>,
@@ -1266,7 +1294,12 @@ where
 		let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
 		Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?
 	};
-	let env = MultisigEnvelope::from_json_str(peer_envelope_json)?;
+	let trimmed = peer_payload.trim();
+	let env = if trimmed.contains("BEGINSLATEPACK") {
+		MultisigEnvelope::from_armored_string(trimmed, dec_key)?
+	} else {
+		MultisigEnvelope::from_json_str(trimmed)?
+	};
 	let outbound = match neg.apply(&env) {
 		Ok(o) => o,
 		Err(e) => {
@@ -1297,6 +1330,10 @@ where
 }
 
 /// Start a durable DKG session; returns status + contribution envelope JSON.
+///
+/// When `addresses` is set (length = total), the roster is address-backed and
+/// the contribution is signed with `sign_key` (C-04). Index roster remains for
+/// local-sim / file demos without encryption keys.
 pub fn session_dkg_create_raw<'a, T: ?Sized, C, K>(
 	w: &mut T,
 	keychain_mask: Option<&SecretKey>,
@@ -1307,6 +1344,8 @@ pub fn session_dkg_create_raw<'a, T: ?Sized, C, K>(
 	shares_per_actor: Option<usize>,
 	ceremony_id: Option<CeremonyId>,
 	session_tag: &str,
+	addresses: Option<Vec<String>>,
+	sign_key: Option<&EdSecretKey>,
 ) -> Result<MultisigSessionStartResult, Error>
 where
 	T: WalletBackend<'a, C, K>,
@@ -1320,11 +1359,29 @@ where
 		.unwrap_or_else(|| ThresholdParams::recommended_shares_per_actor(threshold));
 	let params = ThresholdParams::with_shares_per_actor(threshold, total, spa)?;
 	let ceremony = ceremony_id.unwrap_or_else(CeremonyId::new);
-	let roster: Vec<ActorId> = (0..total as u32).map(ActorId::from_index).collect();
+	let roster: Vec<ActorId> = match &addresses {
+		Some(list) => {
+			if list.len() != total {
+				return Err(Error::Multisig(format!(
+					"expected {} actor addresses, got {}",
+					total,
+					list.len()
+				)));
+			}
+			let mut v = Vec::with_capacity(total);
+			for s in list {
+				let addr = SlatepackAddress::try_from(s.as_str())
+					.map_err(|e| Error::Multisig(format!("bad actor address '{}': {}", s, e)))?;
+				v.push(ActorId::from_slatepack_address(&addr)?);
+			}
+			v
+		}
+		None => (0..total as u32).map(ActorId::from_index).collect(),
+	};
 	let keychain = w.keychain(keychain_mask)?;
 	let session_key = derive_session_key(&keychain)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
-	let (neg, env) = Negotiator::create_dkg(
+	let (neg, mut env) = Negotiator::create_dkg(
 		&secp,
 		ceremony,
 		params,
@@ -1332,6 +1389,14 @@ where
 		my_index,
 		session_tag.as_bytes(),
 	)?;
+	if neg.record.my_actor.slatepack_address().is_ok() {
+		let sk = sign_key.ok_or_else(|| {
+			Error::Multisig(
+				"address-based DKG session requires slatepack key to sign contribution".into(),
+			)
+		})?;
+		env.sign(sk)?;
+	}
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	let envelope_json = serde_json::to_string_pretty(&env)
 		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
@@ -1339,6 +1404,92 @@ where
 		status: neg.status(),
 		envelope_json,
 	})
+}
+
+/// Export age-encrypted partial share slatepacks for a DKG session (C-02).
+///
+/// Requires an address-based roster and all contributions collected. Writes
+/// `{out_dir}/share_to_actor{i}_s{k}.slatepack` and marks shares_exported.
+pub fn session_dkg_export_shares_armored<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	sender_address: &crate::slatepack::SlatepackAddress,
+	sign_key: &EdSecretKey,
+	out_dir: &str,
+) -> Result<Vec<String>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let session_id = crate::grin_util::from_hex(session_id_hex)
+		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
+	let keychain = w.keychain(keychain_mask)?;
+	let session_key = derive_session_key(&keychain)?;
+	let record = load_session(wallet_data_dir, &session_key, &session_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let mut neg = Negotiator::resume_dkg(&secp, record)?;
+	// Advance to DkgShares / emit plain partials then wrap.
+	let plain = neg.tick()?;
+	let mut paths = Vec::new();
+	fs::create_dir_all(out_dir).map_err(|e| Error::Multisig(format!("mkdir: {}", e)))?;
+	let partials: Vec<_> = plain
+		.into_iter()
+		.filter(|e| matches!(e.body, MultisigBody::DkgPartialShare(_)))
+		.collect();
+	if partials.is_empty() {
+		// May already have exported; rebuild from emit path
+		if neg.record.phase == super::session::SessionPhase::DkgContrib {
+			return Err(Error::Multisig(
+				"not all contributions collected yet".into(),
+			));
+		}
+	}
+	// Prefer tick output; if empty, force emit via internal rebuild by clearing flag once.
+	let envs = if partials.is_empty() {
+		if let Some(ref mut d) = neg.record.dkg {
+			d.shares_exported = false;
+		}
+		neg.tick()?
+			.into_iter()
+			.filter(|e| matches!(e.body, MultisigBody::DkgPartialShare(_)))
+			.collect::<Vec<_>>()
+	} else {
+		partials
+	};
+	for mut env in envs {
+		let recipient = match &env.body {
+			MultisigBody::DkgPartialShare(m) => m.recipient.clone(),
+			_ => continue,
+		};
+		let rcpt_addr = recipient.slatepack_address()?;
+		env.sign(sign_key)?;
+		let armored =
+			env.to_armored_string(Some(sender_address.clone()), vec![rcpt_addr])?;
+		let share_index = match &env.body {
+			MultisigBody::DkgPartialShare(m) => m.share_index,
+			_ => 0,
+		};
+		let actor_idx = neg
+			.record
+			.roster
+			.iter()
+			.position(|a| a.id == recipient.id)
+			.unwrap_or(0);
+		let path = Path::new(out_dir).join(format!(
+			"share_to_actor{}_s{}.slatepack",
+			actor_idx, share_index
+		));
+		let mut f = File::create(&path)
+			.map_err(|e| Error::Multisig(format!("create share: {}", e)))?;
+		f.write_all(armored.as_bytes())
+			.map_err(|e| Error::Multisig(format!("write share: {}", e)))?;
+		paths.push(path.display().to_string());
+	}
+	save_session(wallet_data_dir, &session_key, &neg.record)?;
+	Ok(paths)
 }
 
 /// Finalize a completed DKG session into LMDB ceremony state.
@@ -1396,7 +1547,55 @@ where
 	let mut s = String::new();
 	f.read_to_string(&mut s)
 		.map_err(|e| Error::Multisig(format!("read peer envelope: {}", e)))?;
-	let res = session_apply_raw(w, keychain_mask, wallet_data_dir, session_id_hex, &s)?;
+	let res = session_apply_raw_with_key(
+		w,
+		keychain_mask,
+		wallet_data_dir,
+		session_id_hex,
+		&s,
+		None,
+	)?;
+	fs::create_dir_all(out_dir).map_err(|e| Error::Multisig(format!("mkdir out: {}", e)))?;
+	let mut paths = Vec::new();
+	for (i, json) in res.outbound_json.iter().enumerate() {
+		let path = Path::new(out_dir).join(format!("out_{}_{}.json", session_id_hex, i));
+		let mut of =
+			File::create(&path).map_err(|e| Error::Multisig(format!("create out: {}", e)))?;
+		of.write_all(json.as_bytes())
+			.map_err(|e| Error::Multisig(format!("write out: {}", e)))?;
+		paths.push(path.display().to_string());
+	}
+	Ok((res.status, paths))
+}
+
+/// Apply a peer envelope file with optional slatepack decrypt key (C-02 shares).
+pub fn session_apply_with_key<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	wallet_data_dir: &str,
+	session_id_hex: &str,
+	peer_envelope_path: &str,
+	out_dir: &str,
+	dec_key: Option<&EdSecretKey>,
+) -> Result<(SessionStatus, Vec<String>), Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let mut f = File::open(peer_envelope_path)
+		.map_err(|e| Error::Multisig(format!("open peer envelope: {}", e)))?;
+	let mut s = String::new();
+	f.read_to_string(&mut s)
+		.map_err(|e| Error::Multisig(format!("read peer envelope: {}", e)))?;
+	let res = session_apply_raw_with_key(
+		w,
+		keychain_mask,
+		wallet_data_dir,
+		session_id_hex,
+		&s,
+		dec_key,
+	)?;
 	fs::create_dir_all(out_dir).map_err(|e| Error::Multisig(format!("mkdir out: {}", e)))?;
 	let mut paths = Vec::new();
 	for (i, json) in res.outbound_json.iter().enumerate() {

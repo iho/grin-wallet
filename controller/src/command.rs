@@ -2093,11 +2093,22 @@ where
 				.clone()
 				.unwrap_or_else(|| "msig_sess_out".into());
 			let wdata = msig_wallet_data_dir(owner_api)?;
+			// Decrypt key for age-encrypted share slatepacks (optional).
+			let dec_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.ok();
 			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
 				let mut w_lock = api.wallet_inst.lock();
 				let w = w_lock.lc_provider()?.wallet_inst()?;
-				let (st, paths) =
-					libwallet::multisig::session_apply(&mut **w, m, &wdata, &sid, &file, &out_dir)?;
+				let (st, paths) = libwallet::multisig::session_apply_with_key(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					&file,
+					&out_dir,
+					dec_key.as_ref(),
+				)?;
 				println!("Applied peer envelope.");
 				println!("  Phase:     {:?}", st.phase);
 				println!("  Collected: {}/{}", st.collected, st.quorum_size);
@@ -2497,6 +2508,15 @@ where
 				None => None,
 			};
 			let wdata = msig_wallet_data_dir(owner_api)?;
+			let sign_key = if args.addresses.is_some() {
+				Some(
+					owner_api
+						.get_slatepack_secret_key(keychain_mask, 0)
+						.map_err(Error::LibWallet)?,
+				)
+			} else {
+				None
+			};
 			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
 				let mut w_lock = api.wallet_inst.lock();
 				let w = w_lock.lc_provider()?.wallet_inst()?;
@@ -2510,6 +2530,8 @@ where
 					args.shares_per_actor,
 					ceremony,
 					&tag,
+					args.addresses.clone(),
+					sign_key.as_ref(),
 				)?;
 				std::fs::write(&out, res.envelope_json.as_bytes())
 					.map_err(|e| libwallet::Error::Multisig(format!("write: {}", e)))?;
@@ -2518,6 +2540,40 @@ where
 					res.status.session_id_hex, res.status.phase
 				);
 				println!("Contribution → {}", out);
+				Ok(())
+			})?;
+		}
+		"session-dkg-export-shares" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let out_dir = args
+				.out_dir
+				.clone()
+				.unwrap_or_else(|| "msig_dkg_shares".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let sender = owner_api
+				.get_slatepack_address(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			let sign_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let paths = libwallet::multisig::session_dkg_export_shares_armored(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					&sender,
+					&sign_key,
+					&out_dir,
+				)?;
+				println!("Exported {} encrypted share slatepack(s):", paths.len());
+				for p in paths {
+					println!("  {}", p);
+				}
 				Ok(())
 			})?;
 		}

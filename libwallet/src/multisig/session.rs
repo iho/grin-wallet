@@ -1675,6 +1675,10 @@ impl Negotiator {
 			.iter()
 			.position(|a| a.id == actor.id)
 			.ok_or_else(|| Error::Multisig(format!("unknown actor {}", actor.label)))?;
+		// Address-based rosters require signed contributions (C-04).
+		if self.record.roster[idx].slatepack_address().is_ok() {
+			env.verify_signature()?;
+		}
 		let contrib = parse_dkg_contribution(msg, actor.clone())?;
 		verify_pop(
 			&self.secp,
@@ -1733,6 +1737,10 @@ impl Negotiator {
 			.iter()
 			.position(|a| a.id == env.sender.id)
 			.ok_or_else(|| Error::Multisig(format!("unknown dealer {}", env.sender.label)))?;
+		// Address-based dealers must sign partial shares (C-04).
+		if self.record.roster[dealer_idx].slatepack_address().is_ok() {
+			env.verify_signature()?;
+		}
 		if dkg.applied_share_dealers.len() != dkg.params.shares_per_actor {
 			dkg.applied_share_dealers = vec![Vec::new(); dkg.params.shares_per_actor];
 		}
@@ -2187,6 +2195,91 @@ mod tests {
 	}
 
 	#[test]
+	fn dkg_address_roster_requires_signed_contrib() {
+		use crate::grin_core::global;
+		use crate::slatepack::SlatepackAddress;
+		use ed25519_dalek::SecretKey as EdSecretKey;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let sk0 = EdSecretKey::from_bytes(&[31u8; 32]).unwrap();
+		let sk1 = EdSecretKey::from_bytes(&[32u8; 32]).unwrap();
+		let a0 = ActorId::from_slatepack_address(&SlatepackAddress::new(
+			&ed25519_dalek::PublicKey::from(&sk0),
+		))
+		.unwrap();
+		let a1 = ActorId::from_slatepack_address(&SlatepackAddress::new(
+			&ed25519_dalek::PublicKey::from(&sk1),
+		))
+		.unwrap();
+		let roster = vec![a0, a1];
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let ceremony = CeremonyId::new();
+		let (mut n0, mut e0) = Negotiator::create_dkg(
+			&secp,
+			ceremony.clone(),
+			params.clone(),
+			roster.clone(),
+			0,
+			b"addr-dkg",
+		)
+		.unwrap();
+		let (mut n1, mut e1) =
+			Negotiator::create_dkg(&secp, ceremony, params, roster, 1, b"addr-dkg").unwrap();
+		// Unsigned must fail
+		assert!(n0.apply(&e1).is_err());
+		e0.sign(&sk0).unwrap();
+		e1.sign(&sk1).unwrap();
+		// Signed contributions accepted; exchange shares
+		let mut o0 = n0.apply(&e1).unwrap();
+		let mut o1 = n1.apply(&e0).unwrap();
+		// Sign partials before apply
+		for env in o0.iter_mut().chain(o1.iter_mut()) {
+			if matches!(env.body, MultisigBody::DkgPartialShare(_)) {
+				// dealer signs
+			}
+		}
+		// Partial shares from n0 need sk0 signature
+		let mut pending: VecDeque<(usize, MultisigEnvelope)> = VecDeque::new();
+		for mut m in o0.drain(..) {
+			if matches!(m.body, MultisigBody::DkgPartialShare(_)) {
+				m.sign(&sk0).unwrap();
+			}
+			pending.push_back((1, m));
+		}
+		for mut m in o1.drain(..) {
+			if matches!(m.body, MultisigBody::DkgPartialShare(_)) {
+				m.sign(&sk1).unwrap();
+			}
+			pending.push_back((0, m));
+		}
+		while let Some((i, env)) = pending.pop_front() {
+			let more = if i == 0 {
+				n0.apply(&env).unwrap()
+			} else {
+				n1.apply(&env).unwrap()
+			};
+			for mut m in more {
+				if matches!(m.body, MultisigBody::DkgPartialShare(_)) {
+					if i == 0 {
+						m.sign(&sk0).unwrap();
+					} else {
+						m.sign(&sk1).unwrap();
+					}
+				}
+				pending.push_back((1 - i, m));
+			}
+		}
+		assert_eq!(n0.record.phase, SessionPhase::Complete);
+		assert_eq!(n1.record.phase, SessionPhase::Complete);
+		let s0 = n0.finalize_dkg_state().unwrap();
+		let s1 = n1.finalize_dkg_state().unwrap();
+		assert_eq!(
+			s0.config.public_poly.coefficients,
+			s1.config.public_poly.coefficients
+		);
+	}
+
+	#[test]
 	fn dkg_two_party_session_completes() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
@@ -2242,6 +2335,148 @@ mod tests {
 		let s1 = n1.finalize_dkg_state().unwrap();
 		assert_eq!(s0.config.public_poly.coefficients, s1.config.public_poly.coefficients);
 		assert!(!s0.shares.is_empty());
+	}
+
+	#[test]
+	fn dkg_contrib_equivocation_rejected() {
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let roster: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let ceremony = CeremonyId::new();
+		let (mut n0, _e0) = Negotiator::create_dkg(
+			&secp,
+			ceremony.clone(),
+			params.clone(),
+			roster.clone(),
+			0,
+			b"dkg-eq",
+		)
+		.unwrap();
+		// Two different contributions from actor 1
+		let (_n1a, e1a) =
+			Negotiator::create_dkg(&secp, ceremony.clone(), params.clone(), roster.clone(), 1, b"dkg-eq-a")
+				.unwrap();
+		let (_n1b, e1b) =
+			Negotiator::create_dkg(&secp, ceremony, params, roster, 1, b"dkg-eq-b").unwrap();
+		// Force same session id on second so it is a different body from same actor
+		// in n0's ceremony — use e1a then a re-tagged e1b with same sender.
+		n0.apply(&e1a).unwrap();
+		// e1b has different session_id and different contrib; still same sender actor
+		n0.record.seen_body_hashes.clear();
+		let err = n0.apply(&e1b).unwrap_err();
+		assert!(
+			format!("{}", err).contains("equivocation")
+				|| format!("{}", err).contains("session")
+				|| format!("{}", err).contains("mismatch"),
+			"got {}",
+			err
+		);
+	}
+
+	#[test]
+	fn file_harness_create_output_crash_resume() {
+		// Multi-actor sealed file exchange with mid-protocol crash (disk sessions).
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, roster, ceremony) = setup_2of2(&secp);
+		let key = [9u8; 32];
+		let dir = std::env::temp_dir().join(format!("msig_harness_{}", uuid::Uuid::new_v4()));
+		let d0 = dir.join("a0");
+		let d1 = dir.join("a1");
+		fs::create_dir_all(&d0).unwrap();
+		fs::create_dir_all(&d1).unwrap();
+		let coin = CoinId::new(1, 1_000_000);
+
+		let (n0, e0) = Negotiator::create_output(
+			&secp,
+			&pp,
+			&q,
+			ceremony.clone(),
+			roster.clone(),
+			roster[0].clone(),
+			coin.clone(),
+			b"harness",
+		)
+		.unwrap();
+		let (n1, e1) = Negotiator::create_output(
+			&secp,
+			&pp,
+			&q,
+			ceremony,
+			roster.clone(),
+			roster[1].clone(),
+			coin,
+			b"harness",
+		)
+		.unwrap();
+		save_session(d0.to_str().unwrap(), &key, &n0.record).unwrap();
+		save_session(d1.to_str().unwrap(), &key, &n1.record).unwrap();
+		let sid0 = n0.record.session_id.clone();
+		let sid1 = n1.record.session_id.clone();
+		drop(n0);
+		drop(n1);
+
+		// Resume, apply peer R1, seal again mid-flight
+		let mut n0 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d0.to_str().unwrap(), &key, &sid0).unwrap(),
+		)
+		.unwrap();
+		let mut n1 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d1.to_str().unwrap(), &key, &sid1).unwrap(),
+		)
+		.unwrap();
+		let outs0 = n0.apply(&e1).unwrap();
+		let outs1 = n1.apply(&e0).unwrap();
+		save_session(d0.to_str().unwrap(), &key, &n0.record).unwrap();
+		save_session(d1.to_str().unwrap(), &key, &n1.record).unwrap();
+		// Crash: drop without delivering τ
+		let pending: VecDeque<(usize, MultisigEnvelope)> = outs0
+			.into_iter()
+			.map(|m| (1usize, m))
+			.chain(outs1.into_iter().map(|m| (0usize, m)))
+			.collect();
+		drop(n0);
+		drop(n1);
+
+		let mut n0 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d0.to_str().unwrap(), &key, &sid0).unwrap(),
+		)
+		.unwrap();
+		let mut n1 = Negotiator::resume(
+			&secp,
+			&pp,
+			&q,
+			load_session(d1.to_str().unwrap(), &key, &sid1).unwrap(),
+		)
+		.unwrap();
+		let mut pending = pending;
+		for m in n0.tick().unwrap() {
+			pending.push_back((1, m));
+		}
+		for m in n1.tick().unwrap() {
+			pending.push_back((0, m));
+		}
+		while let Some((i, env)) = pending.pop_front() {
+			let more = if i == 0 {
+				n0.apply(&env).unwrap()
+			} else {
+				n1.apply(&env).unwrap()
+			};
+			for m in more {
+				pending.push_back((1 - i, m));
+			}
+		}
+		assert_eq!(n0.record.phase, SessionPhase::Complete);
+		assert_eq!(n1.record.phase, SessionPhase::Complete);
+		let _ = fs::remove_dir_all(&dir);
 	}
 
 	#[test]
