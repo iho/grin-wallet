@@ -47,6 +47,7 @@ pub mod address;
 pub mod api_impl;
 mod error;
 mod internal;
+pub mod multisig;
 pub mod mwixnet;
 mod slate;
 pub mod slate_versions;

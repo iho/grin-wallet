@@ -27,7 +27,7 @@ use crate::libwallet::{
 	SlatepackAddress, Slatepacker, SlatepackerArgs, WalletLCProvider,
 };
 use crate::util::secp::key::SecretKey;
-use crate::util::{Mutex, ZeroingString};
+use crate::util::{Mutex, ToHex, ZeroingString};
 use crate::{controller, display};
 use ::core::time;
 use qr_code::QrCode;
@@ -1473,5 +1473,381 @@ where
 			}
 		}
 	})?;
+	Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multisig (experimental)
+// ---------------------------------------------------------------------------
+
+/// Multisig CLI arguments
+pub struct MultisigArgs {
+	pub subcommand: String,
+	pub threshold: Option<usize>,
+	pub total: Option<usize>,
+	pub my_index: Option<usize>,
+	pub shares_per_actor: Option<usize>,
+	pub ceremony_id: Option<String>,
+	pub local_sim: bool,
+	pub file: Option<String>,
+	pub out: Option<String>,
+	pub out_dir: Option<String>,
+}
+
+fn msig_wallet_data_dir<L, C, K>(owner_api: &Owner<L, C, K>) -> Result<String, Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let tld = owner_api.get_top_level_directory().map_err(Error::LibWallet)?;
+	let dir = libwallet::multisig::wallet_data_dir(&tld);
+	Ok(dir.display().to_string())
+}
+
+/// Derive the keychain-bound key used to encrypt pending DKG state at rest
+/// (C-03). Opens the wallet so the pending file can never be read or written
+/// without unlocking the wallet.
+fn msig_pending_key<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+) -> Result<libwallet::multisig::PendingKey, Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let mut key: Option<libwallet::multisig::PendingKey> = None;
+	controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+		let mut w_lock = api.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let kc = w.keychain(m)?;
+		key = Some(libwallet::multisig::derive_pending_key(&kc)?);
+		Ok(())
+	})?;
+	key.ok_or_else(|| Error::GenericError("failed to derive multisig pending key".into()))
+}
+
+/// Multisig command dispatcher
+pub fn multisig<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+	args: MultisigArgs,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	println!();
+	println!("WARNING: Multisig is EXPERIMENTAL — do not use with real funds.");
+	println!();
+
+	match args.subcommand.as_str() {
+		"list" => {
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let list = libwallet::multisig::list_ceremonies(&mut **w, m)?;
+				if list.is_empty() {
+					println!("No multisig ceremonies stored.");
+				} else {
+					println!(
+						"{:<40} {:>5} {:>5} {:<16} {:>6}",
+						"Ceremony ID", "M", "N", "Actor", "Shares"
+					);
+					println!("{}", "-".repeat(80));
+					for s in list {
+						println!(
+							"{:<40} {:>5} {:>5} {:<16} {:>6}",
+							s.ceremony_id, s.threshold, s.total_actors, s.my_label, s.num_shares
+						);
+					}
+				}
+				Ok(())
+			})?;
+		}
+		"show" => {
+			let cid = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("ceremony id required".into()))?;
+			let uuid = Uuid::parse_str(&cid)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let ceremony = libwallet::multisig::CeremonyId(uuid);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::get_state(&mut **w, m, &ceremony)?;
+				println!("Ceremony:    {}", st.config.ceremony_id.0);
+				println!(
+					"Threshold:   {}-of-{}",
+					st.config.params.threshold, st.config.params.total_actors
+				);
+				println!(
+					"Shares/actor:{}",
+					st.config.params.shares_per_actor
+				);
+				println!(
+					"My actor:    {} ({})",
+					st.my_actor.label,
+					st.my_actor.id.to_hex()
+				);
+				println!("Shares:      {}", st.shares.len());
+				println!("Actors:");
+				for (i, a) in st.config.actors.iter().enumerate() {
+					println!("  [{}] {}", i, a.label);
+				}
+				println!(
+					"Public poly coefficients: {}",
+					st.config.public_poly.coefficients.len()
+				);
+				Ok(())
+			})?;
+		}
+		"delete" => {
+			let cid = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("ceremony id required".into()))?;
+			let uuid = Uuid::parse_str(&cid)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let ceremony = libwallet::multisig::CeremonyId(uuid);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				libwallet::multisig::delete_ceremony(&mut **w, m, &ceremony)?;
+				println!("Deleted ceremony {}", cid);
+				Ok(())
+			})?;
+		}
+		"init" => {
+			let threshold = args.threshold.unwrap_or(2);
+			let total = args.total.unwrap_or(3);
+			let my_index = args.my_index.unwrap_or(0);
+			if args.local_sim {
+				controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+					let mut w_lock = api.wallet_inst.lock();
+					let w = w_lock.lc_provider()?.wallet_inst()?;
+					let st = libwallet::multisig::init_local_sim(
+						&mut **w,
+						m,
+						threshold,
+						total,
+						my_index,
+						args.shares_per_actor,
+					)?;
+					println!("Local-sim DKG complete.");
+					println!("Ceremony: {}", st.config.ceremony_id.0);
+					println!(
+						"Threshold: {}-of-{} (shares/actor={})",
+						st.config.params.threshold,
+						st.config.params.total_actors,
+						st.config.params.shares_per_actor
+					);
+					println!("This wallet is actor: {}", st.my_actor.label);
+					Ok(())
+				})?;
+			} else {
+				let wdata = msig_wallet_data_dir(owner_api)?;
+				let key = msig_pending_key(owner_api, keychain_mask)?;
+				let out = args
+					.out
+					.unwrap_or_else(|| "msig_contrib.json".to_owned());
+				let ceremony = match args.ceremony_id.as_ref() {
+					Some(s) => {
+						let u = Uuid::parse_str(s).map_err(|e| {
+							Error::ArgumentError(format!("bad ceremony id: {}", e))
+						})?;
+						Some(libwallet::multisig::CeremonyId(u))
+					}
+					None => None,
+				};
+				let pending = libwallet::multisig::dkg_start(
+					&wdata,
+					&key,
+					threshold,
+					total,
+					my_index,
+					args.shares_per_actor,
+					ceremony,
+					&out,
+				)
+				.map_err(Error::LibWallet)?;
+				println!("DKG started (multi-party).");
+				println!("Ceremony: {}", pending.ceremony_id.0);
+				println!("Your index: {}", pending.my_index);
+				println!("Contribution written to: {}", out);
+				println!();
+				println!("Next steps for other actors:");
+				println!(
+					"  grin-wallet multisig init -m {} -n {} --index <i> --ceremony-id {} -o contrib_i.json",
+					threshold, total, pending.ceremony_id.0
+				);
+				println!("  grin-wallet multisig import-contrib -i contrib_j.json  (for each peer)");
+				println!("  grin-wallet multisig export-shares -d shares_out/");
+				println!("  grin-wallet multisig import-share -i share_file.json  (from each peer)");
+				println!("  grin-wallet multisig finalize");
+			}
+		}
+		"pending" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			match libwallet::multisig::load_pending(&wdata, &key).map_err(Error::LibWallet)? {
+				None => println!("No pending DKG session."),
+				Some(p) => {
+					println!("Pending ceremony: {}", p.ceremony_id.0);
+					println!(
+						"Threshold: {}-of-{}",
+						p.params.threshold, p.params.total_actors
+					);
+					println!("My index: {}", p.my_index);
+					let got: usize = p.contributions.iter().filter(|c| c.is_some()).count();
+					println!("Contributions: {}/{}", got, p.params.total_actors);
+					let shares_got: usize =
+						p.my_share_ys_hex.iter().filter(|s| s.is_some()).count();
+					println!(
+						"Imported share accumulators: {}/{}",
+						shares_got, p.params.shares_per_actor
+					);
+				}
+			}
+		}
+		"clear-pending" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			libwallet::multisig::clear_pending(&wdata).map_err(Error::LibWallet)?;
+			println!("Pending DKG cleared.");
+		}
+		"import-contrib" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			let env =
+				libwallet::multisig::read_envelope_file(&file).map_err(Error::LibWallet)?;
+			let p = libwallet::multisig::dkg_import_contrib(&wdata, &key, &env)
+				.map_err(Error::LibWallet)?;
+			let got: usize = p.contributions.iter().filter(|c| c.is_some()).count();
+			println!(
+				"Imported contribution. Progress: {}/{}",
+				got, p.params.total_actors
+			);
+		}
+		"export-shares" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			let out_dir = args.out_dir.unwrap_or_else(|| "msig_shares".to_owned());
+			let paths = libwallet::multisig::dkg_export_shares(&wdata, &key, &out_dir)
+				.map_err(Error::LibWallet)?;
+			println!("Wrote {} share file(s) under {}:", paths.len(), out_dir);
+			for p in paths {
+				println!("  {}", p);
+			}
+			println!("Deliver each file securely to the named actor (prefer age-encrypted slatepack).");
+		}
+		"import-share" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			let env =
+				libwallet::multisig::read_envelope_file(&file).map_err(Error::LibWallet)?;
+			let p = libwallet::multisig::dkg_import_share(&wdata, &key, &env)
+				.map_err(Error::LibWallet)?;
+			let shares_got: usize = p.my_share_ys_hex.iter().filter(|s| s.is_some()).count();
+			println!(
+				"Imported share. Accumulators filled: {}/{}",
+				shares_got, p.params.shares_per_actor
+			);
+		}
+		"finalize" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::dkg_finalize(&mut **w, m, &wdata)?;
+				println!("DKG finalized and saved to wallet DB.");
+				println!("Ceremony: {}", st.config.ceremony_id.0);
+				println!("Actor: {}", st.my_actor.label);
+				Ok(())
+			})?;
+		}
+		"export-state" => {
+			let cid = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("ceremony id required".into()))?;
+			let out = args
+				.out
+				.ok_or_else(|| Error::ArgumentError("--out required".into()))?;
+			let uuid = Uuid::parse_str(&cid)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let ceremony = libwallet::multisig::CeremonyId(uuid);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::get_state(&mut **w, m, &ceremony)?;
+				libwallet::multisig::export_state_json(&st, &out)?;
+				println!("Exported state (SENSITIVE — contains share material) to {}", out);
+				Ok(())
+			})?;
+		}
+		"import-state" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::import_state_json(&mut **w, m, &file)?;
+				println!("Imported ceremony {}", st.config.ceremony_id.0);
+				Ok(())
+			})?;
+		}
+		"demo-tx" => {
+			let threshold = args.threshold.unwrap_or(2) as u32;
+			let total = args.total.unwrap_or(threshold.max(2) as usize) as u32;
+			if threshold > total {
+				return Err(Error::ArgumentError(
+					"threshold cannot exceed total actors".into(),
+				));
+			}
+			let fee = 1_000_000u32;
+			let res = owner_api
+				.multisig_demo_tx(threshold, total, fee)
+				.map_err(Error::LibWallet)?;
+			println!("E2E multisig demo OK ({}-of-{}).", res.threshold, res.total);
+			println!("  Funded value:  {}", res.fund_value);
+			println!("  Change value:  {} (fee {})", res.change_value, res.fee);
+			println!("  Tx hash:       {}", res.tx_hash);
+			println!("  Kernel excess: {}", res.kernel_excess);
+			if let Some(out) = args.out.as_ref() {
+				std::fs::write(out, &res.tx_hex)
+					.map_err(|e| Error::GenericError(format!("write tx hex: {}", e)))?;
+				println!("  Wrote tx hex to {}", out);
+			}
+			println!("  Transaction validates (rangeproofs + kernel sig + kernel sums).");
+			let _ = keychain_mask;
+		}
+		"post-tx" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required (tx hex)".into()))?;
+			let fluff = true;
+			let tx_hex = std::fs::read_to_string(&file)
+				.map_err(|e| Error::GenericError(format!("read {}: {}", file, e)))?
+				.trim()
+				.to_owned();
+			owner_api
+				.multisig_post_tx(keychain_mask, tx_hex, fluff)
+				.map_err(Error::LibWallet)?;
+			println!("Posted transaction from {} (fluff={})", file, fluff);
+		}
+		other => {
+			return Err(Error::ArgumentError(format!(
+				"unknown multisig subcommand '{}'",
+				other
+			)));
+		}
+	}
 	Ok(())
 }

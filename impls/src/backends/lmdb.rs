@@ -30,6 +30,10 @@ use crate::store::{self, option_to_not_found, to_key, to_key_u64};
 
 use crate::core::core::Transaction;
 use crate::core::ser;
+use crate::libwallet::multisig::{
+	decrypt_from_storage, encrypt_for_storage, multisig_db_key, CeremonyId, MultisigWalletState,
+	MULTISIG_PREFIX,
+};
 use crate::libwallet::{
 	AcctPathMapping, Context, Error, NodeClient, OutputData, ScannedBlockInfo, TxLogEntry,
 	WalletBackend, WalletInitStatus, WalletOutputBatch,
@@ -508,6 +512,37 @@ where
 		};
 		Ok(status)
 	}
+
+	fn get_multisig_state(
+		&mut self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: &CeremonyId,
+	) -> Result<MultisigWalletState, Error> {
+		let key = multisig_db_key(ceremony_id);
+		let mut state: MultisigWalletState =
+			option_to_not_found(self.db.get_ser(&key, None), || {
+				format!("Multisig ceremony: {}", ceremony_id.0)
+			})?;
+		let keychain = self.keychain(keychain_mask)?;
+		decrypt_from_storage(&keychain, &mut state)?;
+		Ok(state)
+	}
+
+	fn list_multisig_ceremonies(&self) -> Result<Vec<CeremonyId>, Error> {
+		let prefix_iter = self.db.iter(&[MULTISIG_PREFIX], move |k, _v| {
+			if k.len() != 1 + 16 || k[0] != MULTISIG_PREFIX {
+				return Err(store::Error::OtherErr("invalid multisig db key".into()));
+			}
+			let mut bytes = [0u8; 16];
+			bytes.copy_from_slice(&k[1..]);
+			Ok(CeremonyId(uuid::Uuid::from_bytes(bytes)))
+		});
+		let mut ids = Vec::new();
+		for id in prefix_iter.expect("multisig iter").into_iter() {
+			ids.push(id);
+		}
+		Ok(ids)
+	}
 }
 
 /// An atomic batch in which all changes can be committed all at once or
@@ -766,6 +801,30 @@ where
 			.as_ref()
 			.unwrap()
 			.delete(&ctx_key)
+			.map_err(|e| e.into())
+	}
+
+	fn save_multisig_state(&mut self, state: &MultisigWalletState) -> Result<(), Error> {
+		let keychain = self.keychain.as_ref().ok_or_else(|| {
+			Error::Multisig("keychain required to encrypt multisig state".into())
+		})?;
+		let encrypted = encrypt_for_storage(keychain, state)?;
+		let key = multisig_db_key(&state.config.ceremony_id);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&key, &encrypted)?;
+		Ok(())
+	}
+
+	fn delete_multisig_state(&mut self, ceremony_id: &CeremonyId) -> Result<(), Error> {
+		let key = multisig_db_key(ceremony_id);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.delete(&key)
 			.map_err(|e| e.into())
 	}
 

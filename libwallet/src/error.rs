@@ -324,6 +324,10 @@ pub enum Error {
 	/// Other
 	#[error("Generic error: {0}")]
 	GenericError(String),
+
+	/// Multisig / threshold wallet error
+	#[error("Multisig error: {0}")]
+	Multisig(String),
 }
 
 impl From<grin_store::Error> for Error {

@@ -28,6 +28,9 @@ use crate::impls::SlateSender as _;
 use crate::keychain::{Identifier, Keychain};
 use crate::libwallet::api_impl::owner_updater::{start_updater_log_thread, StatusMessage};
 use crate::libwallet::api_impl::{owner, owner_updater};
+use crate::libwallet::multisig::{
+	self, CeremonySummary, MultisigDemoTxResult, MultisigWalletState,
+};
 use crate::libwallet::{
 	AcctPathMapping, BuiltOutput, Error, InitTxArgs, IssueInvoiceTxArgs, NodeClient,
 	NodeHeightResult, OutputCommitMapping, PaymentProof, Slate, Slatepack, SlatepackAddress,
@@ -2488,6 +2491,107 @@ where
 			lock_output,
 			self.doctest_mode,
 		)
+	}
+
+	// -----------------------------------------------------------------------
+	// Multisig (experimental) Owner API
+	// -----------------------------------------------------------------------
+
+	/// List completed multisig ceremonies stored in this wallet.
+	pub fn multisig_list(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+	) -> Result<Vec<CeremonySummary>, Error> {
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::list_ceremonies(&mut **w, keychain_mask)
+	}
+
+	/// Initialize a local-sim M-of-N ceremony and store this actor's state.
+	///
+	/// Development only — all actors simulated in-process; only `my_index` is saved.
+	pub fn multisig_init_local_sim(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		threshold: u32,
+		total: u32,
+		my_index: u32,
+		shares_per_actor: Option<u32>,
+	) -> Result<String, Error> {
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let spa = shares_per_actor.map(|s| s as usize);
+		let st = multisig::init_local_sim(
+			&mut **w,
+			keychain_mask,
+			threshold as usize,
+			total as usize,
+			my_index as usize,
+			spa,
+		)?;
+		Ok(st.config.ceremony_id.0.to_string())
+	}
+
+	/// Load full multisig wallet state by ceremony UUID string.
+	pub fn multisig_get(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+	) -> Result<MultisigWalletState, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::get_state(&mut **w, keychain_mask, &multisig::CeremonyId(uuid))
+	}
+
+	/// Delete a stored multisig ceremony.
+	pub fn multisig_delete(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+	) -> Result<(), Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::delete_ceremony(&mut **w, keychain_mask, &multisig::CeremonyId(uuid))
+	}
+
+	/// In-process E2E demo: DKG → fund → spend (multiparty RP + kernel).
+	///
+	/// Returns a summary including `tx_hex` for inspection / optional post.
+	///
+	/// **Development / inspection only.** This simulates an entire quorum in
+	/// one process using throwaway keys; the resulting `tx_hex` spends coins
+	/// that do not exist on-chain. It does **not** mutate the wallet's chain
+	/// configuration (see C-01) and runs under the host's already-configured
+	/// chain type.
+	pub fn multisig_demo_tx(
+		&self,
+		threshold: u32,
+		total: u32,
+		fee: u32,
+	) -> Result<MultisigDemoTxResult, Error> {
+		let _ = self.wallet_inst.lock();
+		multisig::run_demo_tx(threshold as usize, total as usize, fee as u64)
+	}
+
+	/// Post a hex-encoded multisig transaction to the connected node.
+	pub fn multisig_post_tx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		tx_hex: String,
+		fluff: bool,
+	) -> Result<(), Error> {
+		let client = {
+			let mut w_lock = self.wallet_inst.lock();
+			let w = w_lock.lc_provider()?.wallet_inst()?;
+			let _ = w.keychain(keychain_mask)?;
+			w.w2n_client().clone()
+		};
+		let tx = multisig::tx_from_hex(&tx_hex)?;
+		owner::post_tx(&client, &tx, fluff)
 	}
 }
 

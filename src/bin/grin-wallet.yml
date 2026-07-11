@@ -48,6 +48,155 @@ subcommands:
             short: c
             long: create
             takes_value: true
+
+  - multisig:
+      about: "EXPERIMENTAL Multisig wallet (M-of-N threshold) - not for real funds"
+      subcommands:
+        - list:
+            about: List stored multisig ceremonies
+        - show:
+            about: Show details of a ceremony
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+        - delete:
+            about: Delete a stored ceremony from the wallet DB
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+        - init:
+            about: Initialize multisig (local-sim or multi-party DKG start)
+            args:
+              - threshold:
+                  help: Signature threshold M
+                  short: m
+                  long: threshold
+                  takes_value: true
+                  default_value: "2"
+              - total:
+                  help: Total actors N
+                  short: n
+                  long: total
+                  takes_value: true
+                  default_value: "3"
+              - index:
+                  help: This wallet actor index (0..N-1)
+                  long: index
+                  takes_value: true
+                  default_value: "0"
+              - shares:
+                  help: Shares per actor (raises poly degree)
+                  long: shares
+                  takes_value: true
+              - ceremony_id:
+                  help: Join an existing ceremony UUID (multi-party)
+                  long: ceremony-id
+                  takes_value: true
+              - local_sim:
+                  help: Run full DKG locally and save this actor (dev only)
+                  long: local-sim
+                  takes_value: false
+              - out:
+                  help: Output path for contribution JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_contrib.json"
+        - pending:
+            about: Show pending multi-party DKG status
+        - clear-pending:
+            about: Discard pending multi-party DKG session
+        - import-contrib:
+            about: Import a peer DKG contribution JSON
+            args:
+              - file:
+                  help: Path to contribution envelope JSON
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - export-shares:
+            about: Export partial shares for other actors (after all contribs)
+            args:
+              - dir:
+                  help: Output directory
+                  short: d
+                  long: dir
+                  takes_value: true
+                  default_value: "msig_shares"
+        - import-share:
+            about: Import a partial share JSON addressed to this actor
+            args:
+              - file:
+                  help: Path to share envelope JSON
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - finalize:
+            about: Finalize DKG, verify shares, save ceremony to wallet DB
+        - export-state:
+            about: Export ceremony state JSON (SENSITIVE)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - out:
+                  help: Output file
+                  short: o
+                  long: out
+                  takes_value: true
+                  required: true
+        - import-state:
+            about: Import ceremony state JSON into wallet DB
+            args:
+              - file:
+                  help: Path to state JSON
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - demo-tx:
+            about: In-process E2E demo (DKG + fund + spend with multiparty RP/kernel)
+            args:
+              - threshold:
+                  help: Signature threshold M
+                  short: m
+                  long: threshold
+                  takes_value: true
+                  default_value: "2"
+              - total:
+                  help: Total actors N
+                  short: n
+                  long: total
+                  takes_value: true
+                  default_value: "2"
+              - out:
+                  help: Optional path to write tx hex for post-tx
+                  short: o
+                  long: out
+                  takes_value: true
+        - post-tx:
+            about: Post a hex-encoded multisig transaction to the node
+            args:
+              - file:
+                  help: Path to file containing transaction hex
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+
   - rewind_hash:
       about: Return the hash of the wallet root public key.
   - scan_rewind_hash:

@@ -21,6 +21,7 @@ use crate::config::{TorConfig, WalletConfig};
 use crate::core::core::OutputFeatures;
 use crate::core::global;
 use crate::keychain::{Identifier, Keychain};
+use crate::libwallet::multisig::{CeremonySummary, MultisigDemoTxResult};
 use crate::libwallet::{
 	mwixnet::MixnetReqCreationParams, AcctPathMapping, Amount, BuiltOutput, Error, InitTxArgs,
 	IssueInvoiceTxArgs, NodeClient, NodeHeightResult, OutputCommitMapping, PaymentProof, Slate,
@@ -2022,6 +2023,38 @@ pub trait OwnerRpc {
 		lock_output: bool,
 		server_keys: Vec<String>,
 	) -> Result<SwapReq, Error>;
+
+	/// Experimental: list stored multisig ceremonies.
+	fn multisig_list(&self, token: Token) -> Result<Vec<CeremonySummary>, Error>;
+
+	/// Experimental: local-sim M-of-N init; returns ceremony UUID string.
+	fn multisig_init_local_sim(
+		&self,
+		token: Token,
+		threshold: u32,
+		total: u32,
+		my_index: u32,
+		shares_per_actor: Option<u32>,
+	) -> Result<String, Error>;
+
+	/// Experimental: delete a stored ceremony by UUID string.
+	fn multisig_delete(&self, token: Token, ceremony_id: String) -> Result<(), Error>;
+
+	/// Experimental: in-process E2E DKG→fund→spend demo.
+	fn multisig_demo_tx(
+		&self,
+		threshold: u32,
+		total: u32,
+		fee: u32,
+	) -> Result<MultisigDemoTxResult, Error>;
+
+	/// Experimental: post hex-encoded multisig transaction to the node.
+	fn multisig_post_tx(
+		&self,
+		token: Token,
+		tx_hex: String,
+		fluff: bool,
+	) -> Result<(), Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2468,6 +2501,50 @@ where
 			&commit,
 			lock_output,
 		)
+	}
+
+	fn multisig_list(&self, token: Token) -> Result<Vec<CeremonySummary>, Error> {
+		Owner::multisig_list(self, (&token.keychain_mask).as_ref())
+	}
+
+	fn multisig_init_local_sim(
+		&self,
+		token: Token,
+		threshold: u32,
+		total: u32,
+		my_index: u32,
+		shares_per_actor: Option<u32>,
+	) -> Result<String, Error> {
+		Owner::multisig_init_local_sim(
+			self,
+			(&token.keychain_mask).as_ref(),
+			threshold,
+			total,
+			my_index,
+			shares_per_actor,
+		)
+	}
+
+	fn multisig_delete(&self, token: Token, ceremony_id: String) -> Result<(), Error> {
+		Owner::multisig_delete(self, (&token.keychain_mask).as_ref(), ceremony_id)
+	}
+
+	fn multisig_demo_tx(
+		&self,
+		threshold: u32,
+		total: u32,
+		fee: u32,
+	) -> Result<MultisigDemoTxResult, Error> {
+		Owner::multisig_demo_tx(self, threshold, total, fee)
+	}
+
+	fn multisig_post_tx(
+		&self,
+		token: Token,
+		tx_hex: String,
+		fluff: bool,
+	) -> Result<(), Error> {
+		Owner::multisig_post_tx(self, (&token.keychain_mask).as_ref(), tx_hex, fluff)
 	}
 }
 

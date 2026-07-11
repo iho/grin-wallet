@@ -961,6 +961,51 @@ pub fn parse_verify_proof_args(args: &ArgMatches) -> Result<command::ProofVerify
 	})
 }
 
+/// Parse multisig subcommand args
+pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, ParseError> {
+	let (sub, sub_args) = match args.subcommand() {
+		(name, Some(a)) => (name.to_owned(), a),
+		_ => {
+			return Err(ParseError::ArgumentError(
+				"multisig requires a subcommand (list|init|...)\n  try: grin-wallet multisig --help"
+					.into(),
+			));
+		}
+	};
+	let parse_usize = |v: &str, name: &str| -> Result<usize, ParseError> {
+		v.parse::<usize>().map_err(|e| {
+			ParseError::ArgumentError(format!("Could not parse {} parameter: {}", name, e))
+		})
+	};
+	Ok(command::MultisigArgs {
+		subcommand: sub,
+		threshold: sub_args
+			.value_of("threshold")
+			.map(|v| parse_usize(v, "threshold"))
+			.transpose()?,
+		total: sub_args
+			.value_of("total")
+			.map(|v| parse_usize(v, "total"))
+			.transpose()?,
+		my_index: sub_args
+			.value_of("index")
+			.map(|v| parse_usize(v, "index"))
+			.transpose()?,
+		shares_per_actor: sub_args
+			.value_of("shares")
+			.map(|v| parse_usize(v, "shares"))
+			.transpose()?,
+		ceremony_id: sub_args
+			.value_of("ceremony")
+			.or_else(|| sub_args.value_of("ceremony_id"))
+			.map(|s| s.to_owned()),
+		local_sim: sub_args.is_present("local_sim"),
+		file: sub_args.value_of("file").map(|s| s.to_owned()),
+		out: sub_args.value_of("out").map(|s| s.to_owned()),
+		out_dir: sub_args.value_of("dir").map(|s| s.to_owned()),
+	})
+}
+
 pub fn wallet_command<C, F>(
 	wallet_args: &ArgMatches,
 	mut wallet_config: WalletConfig,
@@ -1277,6 +1322,10 @@ where
 		("verify_proof", Some(args)) => {
 			let a = arg_parse!(parse_verify_proof_args(&args));
 			command::proof_verify(owner_api, km, a)
+		}
+		("multisig", Some(args)) => {
+			let a = arg_parse!(parse_multisig_args(&args));
+			command::multisig(owner_api, km, a)
 		}
 		("address", Some(_)) => command::address(owner_api, &global_wallet_args, km),
 		("scan", Some(args)) => {
