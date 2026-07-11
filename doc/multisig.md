@@ -47,6 +47,14 @@ This is the first implementation slice of RFC-0023 style multisig:
 6. **PTE degree floor** (C-11): production params require
    `num_coefficients() ≥ 4`; tests use `new_allow_low_degree`.
 
+7. **View strategy A (C-10):** the public poly (`S_0`) is a permanent view key
+   for the epoch. Exporting config grants rewind forever for that epoch.
+
+8. **Public kernel offset (C-09):** offset derives from public material; co-owners
+   can recompute it. External observers without config cannot.
+
+9. **Envelope DoS caps (C-12):** max JSON size and list/hex field limits on parse.
+
 ## Quick API
 
 ```rust

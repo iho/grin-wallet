@@ -144,13 +144,13 @@ Verified: reverse-order quorums produce the same excess and valid rangeproofs.
 - `SecretKey` already uses `zeroize` on drop (secp crate).
 **Residual:** clones of secrets in hot paths still exist (hard to eliminate without larger API redesign); optional `ZeroizeOnDrop` wrappers later.
 
-### C-09 — Deterministic public offset — **Medium (privacy/documented trade-off)**
-`coin.rs::tx_offset` derives the kernel offset from the **public** `S_0` + session context. Anyone holding the (public) ceremony config — including removed actors, or a thief of any actor's wallet file — can recompute offsets and strip them from kernels for known sessions, weakening the offset's unlinkability role for this wallet's transactions.
-**Fix (WS1):** either accept and document (offset secrecy is not part of the threat model between co-owners), or derive from a shared *secret* session value (e.g. bound into the DKG output rather than S_0).
+### C-09 — Deterministic public offset — **Medium (privacy)** — ✅ DECIDED (v1)
+`tx_offset` derives from the **public** `S_0` + session context.
+**v1 product decision:** **Accept and document.** Offset secrecy is **not** part of the co-owner threat model: co-owners (and anyone with `MultisigConfig`) can recompute offsets for known sessions. Unlinkability against external chain observers remains (they lack `S_0` unless a config leak). A future epoch may bind offsets to a shared secret if product requires co-owner privacy of the offset itself.
 
-### C-10 — Rewind/view capability equals "has the public poly" — **Medium (design decision needed)**
-`derive_shared_nonce` and `view_mix` derive from `S_0`. Every actor (and anyone who obtains a wallet-state backup, and every **removed** actor forever) can rewind all wallet outputs. This matches RFC "strategy A" but is nowhere surfaced as a product decision; there is no per-epoch view-key option.
-**Fix (WS1):** decide strategy A vs B per the RFC discussion; document that exporting `MultisigConfig` = granting permanent view access for the epoch.
+### C-10 — Rewind/view capability equals "has the public poly" — **Medium** — ✅ DECIDED (strategy A for v1)
+View mix / shared BP nonce derive from `S_0` (public poly constant term).
+**v1 product decision: RFC strategy A.** Holding `MultisigConfig` (or any actor backup containing the public poly) grants **permanent view/rewind** of that epoch's outputs, including after an actor is removed. Product UX must warn: export/backup of config = view key; rotation requires re-DKG + sweep, not just roster change. Strategy B (epoch view keys) is deferred post-v1.
 
 ### C-11 — `ThresholdParams::new` does not enforce the PTE floor — **Medium** (review F-08) — ✅ FIXED (floor enforced; cryptanalysis residual)
 **Resolution:**
@@ -159,9 +159,12 @@ Verified: reverse-order quorums produce the same excess and valid rangeproofs.
 - CLI/DKG default remains `recommended_shares_per_actor` (already floor-compliant).
 **Residual:** commission PTE cryptanalysis to justify the numeric floor value.
 
-### C-12 — No DoS bounds on message parsing — **Medium**
-JSON envelopes are parsed without size limits, count limits (e.g. `commitment_hexes` length is checked against params only after parse), or streaming caps. Malicious peers can send megabyte envelopes or 10⁶ coefficients.
-**Fix (WS5):** hard caps (max actors, max coefficients, max message size) enforced before deserialization of inner fields.
+### C-12 — No DoS bounds on message parsing — **Medium** — ✅ FIXED
+**Resolution (`messages.rs`):**
+- Max JSON size `MAX_ENVELOPE_JSON_BYTES` (256 KiB) checked **before** full structural use (`from_payload_bytes`, `from_json_str`, file stat in `read_envelope_file`).
+- After parse: `validate_limits()` caps list lengths (`MAX_LIST_LEN` = 64), actor id/label size, hex field lengths, and rejects non-hex characters.
+- Session negotiator already had a parallel size check; both paths now consistent.
+Tests: oversized payload rejected; too many coefficients rejected; non-hex τ rejected.
 
 ### C-13 — Add-actor remains exposed — **Medium** (review F-03) — ✅ FIXED (v1)
 **Resolution:** `add_actor_masked_share` is no longer re-exported from the crate root and is `#[cfg(test)]` only. v1 membership change = re-DKG new epoch + on-chain sweep.
@@ -302,14 +305,15 @@ Negotiator
 4. ✅ C-07 canonical quorum + mix/offset role; C-11 PTE floor; C-13 add-actor gated.
 5. ✅ C-05 FROST kernel (binding factors + excess poly check).
 6. ✅ C-06 verifiable multiparty τ (identifiable abort).
-7. WS1 residual: RFC freeze text, C-09/C-10 product decisions, threat model write-up.
+7. ✅ C-09/C-10 v1 product decisions documented (public offset; strategy A view). Residual: formal RFC freeze text.
 8. ✅ WS4 negotiator + CLI + Owner RPC session methods. Residual: multi-process soak + DKG-as-session.
+9. ✅ C-12 envelope DoS caps.
 
 **P1 — before mainnet flag:**
-9. WS6 UTXO tracking + coin allocator + rotation sweep.
-10. ✅ C-08 AEAD state + Debug redaction (WS3 core); residual: restore drill runbook.
-11. WS5 fuzzed, frozen wire format; DoS caps (C-12).
-12. External audit + malicious-peer suite + 30-day soak.
+10. WS6 UTXO tracking + coin allocator + rotation sweep.
+11. ✅ C-08 AEAD state + Debug redaction (WS3 core); residual: restore drill runbook.
+12. WS5 residual: freeze wire format + fuzz `MultisigEnvelope` parser.
+13. External audit + malicious-peer suite + 30-day soak.
 
 **P2 — quality/optional:**
 11. Hardware-keykeeper interface design (Beam `private_key_keeper` pattern).

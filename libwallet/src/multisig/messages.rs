@@ -55,6 +55,21 @@ pub const MULTISIG_MSG_VERSION: u16 = 1;
 /// Magic prefix for payload identification (ASCII "GMS1").
 pub const MULTISIG_PAYLOAD_MAGIC: &[u8] = b"GMS1";
 
+// ---------------------------------------------------------------------------
+// DoS / parse caps (C-12)
+// ---------------------------------------------------------------------------
+
+/// Maximum JSON payload size (bytes) accepted for a multisig envelope (excl. magic).
+pub const MAX_ENVELOPE_JSON_BYTES: usize = 256 * 1024;
+/// Maximum length of an actor id / label on the wire.
+pub const MAX_ACTOR_ID_BYTES: usize = 256;
+/// Maximum roster / coefficient / contribution list length.
+pub const MAX_LIST_LEN: usize = 64;
+/// Maximum hex field length (e.g. proofs, signatures, session ids).
+pub const MAX_HEX_FIELD_LEN: usize = 16 * 1024;
+/// Maximum proof hex length (Bulletproofs are ~675 bytes → ~1400 hex chars; headroom).
+pub const MAX_PROOF_HEX_LEN: usize = 8 * 1024;
+
 /// Top-level envelope carried in a Slatepack payload.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct MultisigEnvelope {
@@ -332,6 +347,54 @@ pub fn proof_from_hex(hex: &str) -> Result<RangeProof, Error> {
 }
 
 // ---------------------------------------------------------------------------
+// DoS helpers (C-12)
+// ---------------------------------------------------------------------------
+
+fn check_list_len(name: &str, len: usize) -> Result<(), Error> {
+	if len > MAX_LIST_LEN {
+		return Err(Error::Multisig(format!(
+			"{} length {} exceeds max {}",
+			name, len, MAX_LIST_LEN
+		)));
+	}
+	Ok(())
+}
+
+fn check_hex_field(name: &str, hex: &str, max_len: usize) -> Result<(), Error> {
+	if hex.len() > max_len {
+		return Err(Error::Multisig(format!(
+			"{} too long ({} > {})",
+			name,
+			hex.len(),
+			max_len
+		)));
+	}
+	// Cheap character-class check (reject non-hex early).
+	if !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+		return Err(Error::Multisig(format!("{} is not valid hex", name)));
+	}
+	Ok(())
+}
+
+fn check_actor_id(actor: &ActorId) -> Result<(), Error> {
+	if actor.id.len() > MAX_ACTOR_ID_BYTES {
+		return Err(Error::Multisig(format!(
+			"actor id too long ({} > {})",
+			actor.id.len(),
+			MAX_ACTOR_ID_BYTES
+		)));
+	}
+	if actor.label.len() > MAX_ACTOR_ID_BYTES {
+		return Err(Error::Multisig(format!(
+			"actor label too long ({} > {})",
+			actor.label.len(),
+			MAX_ACTOR_ID_BYTES
+		)));
+	}
+	Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Builders from crypto types
 // ---------------------------------------------------------------------------
 
@@ -437,6 +500,8 @@ impl MultisigEnvelope {
 	}
 
 	/// Parse from payload bytes (magic + JSON).
+	///
+	/// Enforces C-12 size and structural caps before accepting the envelope.
 	pub fn from_payload_bytes(data: &[u8]) -> Result<Self, Error> {
 		if data.len() < MULTISIG_PAYLOAD_MAGIC.len() {
 			return Err(Error::Multisig("payload too short".into()));
@@ -444,16 +509,135 @@ impl MultisigEnvelope {
 		if &data[..MULTISIG_PAYLOAD_MAGIC.len()] != MULTISIG_PAYLOAD_MAGIC {
 			return Err(Error::Multisig("missing GMS1 magic".into()));
 		}
-		let env: MultisigEnvelope =
-			serde_json::from_slice(&data[MULTISIG_PAYLOAD_MAGIC.len()..])
-				.map_err(|e| Error::Multisig(format!("envelope parse: {}", e)))?;
-		if env.version != MULTISIG_MSG_VERSION {
+		let json = &data[MULTISIG_PAYLOAD_MAGIC.len()..];
+		if json.len() > MAX_ENVELOPE_JSON_BYTES {
 			return Err(Error::Multisig(format!(
-				"unsupported multisig msg version {}",
-				env.version
+				"envelope JSON too large ({} > {} bytes)",
+				json.len(),
+				MAX_ENVELOPE_JSON_BYTES
 			)));
 		}
+		let env: MultisigEnvelope = serde_json::from_slice(json)
+			.map_err(|e| Error::Multisig(format!("envelope parse: {}", e)))?;
+		env.validate_limits()?;
 		Ok(env)
+	}
+
+	/// Parse a plain JSON envelope (no GMS1 magic). Used by file/CLI paths.
+	pub fn from_json_str(s: &str) -> Result<Self, Error> {
+		if s.len() > MAX_ENVELOPE_JSON_BYTES {
+			return Err(Error::Multisig(format!(
+				"envelope JSON too large ({} > {} bytes)",
+				s.len(),
+				MAX_ENVELOPE_JSON_BYTES
+			)));
+		}
+		let env: MultisigEnvelope =
+			serde_json::from_str(s).map_err(|e| Error::Multisig(format!("envelope parse: {}", e)))?;
+		env.validate_limits()?;
+		Ok(env)
+	}
+
+	/// Structural DoS caps after deserialization (C-12).
+	pub fn validate_limits(&self) -> Result<(), Error> {
+		if self.version != MULTISIG_MSG_VERSION {
+			return Err(Error::Multisig(format!(
+				"unsupported multisig msg version {}",
+				self.version
+			)));
+		}
+		check_actor_id(&self.sender)?;
+		if let Some(sid) = &self.session_id_hex {
+			check_hex_field("session_id_hex", sid, MAX_HEX_FIELD_LEN)?;
+		}
+		if let Some(sig) = &self.sig_hex {
+			// ed25519 sig is 64 bytes → 128 hex chars; allow modest overhead.
+			check_hex_field("sig_hex", sig, 256)?;
+		}
+		match &self.body {
+			MultisigBody::DkgContribution(m) => {
+				check_list_len("commitment_hexes", m.commitment_hexes.len())?;
+				check_list_len("pop_sig_hexes", m.pop_sig_hexes.len())?;
+				if m.commitment_hexes.len() != m.pop_sig_hexes.len() {
+					return Err(Error::Multisig(
+						"commitment_hexes and pop_sig_hexes length mismatch".into(),
+					));
+				}
+				for (i, h) in m.commitment_hexes.iter().enumerate() {
+					check_hex_field(&format!("commitment_hexes[{}]", i), h, 128)?;
+				}
+				for (i, h) in m.pop_sig_hexes.iter().enumerate() {
+					check_hex_field(&format!("pop_sig_hexes[{}]", i), h, 256)?;
+				}
+			}
+			MultisigBody::DkgPartialShare(m) => {
+				check_actor_id(&m.recipient)?;
+				if m.share_index > MAX_LIST_LEN {
+					return Err(Error::Multisig("share_index too large".into()));
+				}
+				check_hex_field("share_hex", &m.share_hex, 128)?;
+				check_hex_field("x_hex", &m.x_hex, 128)?;
+			}
+			MultisigBody::DkgPublicPoly(m) => {
+				check_list_len("coefficient_hexes", m.coefficient_hexes.len())?;
+				check_list_len("actors", m.actors.len())?;
+				for a in &m.actors {
+					check_actor_id(a)?;
+				}
+				for (i, h) in m.coefficient_hexes.iter().enumerate() {
+					check_hex_field(&format!("coefficient_hexes[{}]", i), h, 128)?;
+				}
+			}
+			MultisigBody::RpRound1(m) => {
+				if m.actor_index >= MAX_LIST_LEN {
+					return Err(Error::Multisig("actor_index too large".into()));
+				}
+				check_hex_field("commit_hex", &m.session.commit_hex, 128)?;
+				check_hex_field("shared_nonce_hex", &m.session.shared_nonce_hex, 128)?;
+				if let Some(ed) = &m.session.extra_data_hex {
+					check_hex_field("extra_data_hex", ed, MAX_HEX_FIELD_LEN)?;
+				}
+				check_hex_field("t_one_hex", &m.t_one_hex, 128)?;
+				check_hex_field("t_two_hex", &m.t_two_hex, 128)?;
+			}
+			MultisigBody::RpRound2(m) => {
+				if m.actor_index >= MAX_LIST_LEN {
+					return Err(Error::Multisig("actor_index too large".into()));
+				}
+				check_hex_field("tau_hex", &m.tau_hex, 128)?;
+			}
+			MultisigBody::RpFinal(m) => {
+				check_hex_field("commit_hex", &m.commit_hex, 128)?;
+				check_hex_field("proof_hex", &m.proof_hex, MAX_PROOF_HEX_LEN)?;
+			}
+			MultisigBody::KernelSigningCommit(m) => {
+				if m.actor_index >= MAX_LIST_LEN {
+					return Err(Error::Multisig("actor_index too large".into()));
+				}
+				check_hex_field("session_id_hex", &m.session.session_id_hex, MAX_HEX_FIELD_LEN)?;
+				check_hex_field("offset_hex", &m.session.offset_hex, 128)?;
+				check_list_len("inputs", m.session.inputs.len())?;
+				check_list_len("outputs", m.session.outputs.len())?;
+				check_hex_field("pub_d_hex", &m.pub_d_hex, 128)?;
+				check_hex_field("pub_e_hex", &m.pub_e_hex, 128)?;
+				check_hex_field("pub_excess_hex", &m.pub_excess_hex, 128)?;
+			}
+			MultisigBody::KernelPartialSig(m) => {
+				if m.actor_index >= MAX_LIST_LEN {
+					return Err(Error::Multisig("actor_index too large".into()));
+				}
+				check_hex_field("session_id_hex", &m.session_id_hex, MAX_HEX_FIELD_LEN)?;
+				check_hex_field("partial_sig_hex", &m.partial_sig_hex, 256)?;
+				check_hex_field("pub_excess_hex", &m.pub_excess_hex, 128)?;
+			}
+			MultisigBody::KernelFinal(m) => {
+				check_hex_field("session_id_hex", &m.session_id_hex, MAX_HEX_FIELD_LEN)?;
+				check_hex_field("sig_hex", &m.sig_hex, 256)?;
+				check_hex_field("excess_sum_hex", &m.excess_sum_hex, 128)?;
+				check_hex_field("nonce_sum_hex", &m.nonce_sum_hex, 128)?;
+			}
+		}
+		Ok(())
 	}
 
 	/// Wrap in a plaintext Slatepack (optionally encrypt afterward).
@@ -788,6 +972,7 @@ pub fn aggregate_rp_round1_msgs(
 mod tests {
 	use super::*;
 	use crate::grin_util::secp::{ContextFlag, Secp256k1};
+	use crate::multisig::coin::CoinId;
 	use crate::multisig::dkg::{generate_dealer_contribution, run_dkg_local};
 	use crate::multisig::kernel::run_kernel_sign_local;
 	use crate::multisig::rangeproof::run_rangeproof_local;
@@ -809,6 +994,49 @@ mod tests {
 		assert!(bytes.starts_with(MULTISIG_PAYLOAD_MAGIC));
 		let back = MultisigEnvelope::from_payload_bytes(&bytes).unwrap();
 		assert_eq!(env, back);
+	}
+
+	#[test]
+	fn rejects_oversized_payload() {
+		// C-12: refuse to parse multi-megabyte JSON.
+		let mut huge = MULTISIG_PAYLOAD_MAGIC.to_vec();
+		huge.extend(std::iter::repeat(b'a').take(MAX_ENVELOPE_JSON_BYTES + 1));
+		assert!(MultisigEnvelope::from_payload_bytes(&huge).is_err());
+	}
+
+	#[test]
+	fn rejects_too_many_coefficients() {
+		let env = MultisigEnvelope::new(
+			CeremonyId::new(),
+			ActorId::from_index(0),
+			MultisigBody::DkgContribution(DkgContributionMsg {
+				params: ThresholdParams::new_allow_low_degree(2, 2).unwrap(),
+				commitment_hexes: (0..MAX_LIST_LEN + 1)
+					.map(|i| format!("{:064x}", i))
+					.collect(),
+				pop_sig_hexes: (0..MAX_LIST_LEN + 1)
+					.map(|i| format!("{:064x}", i))
+					.collect(),
+			}),
+		);
+		let bytes = env.to_payload_bytes().unwrap();
+		// Serialization succeeds; parse validation rejects.
+		assert!(MultisigEnvelope::from_payload_bytes(&bytes).is_err());
+	}
+
+	#[test]
+	fn rejects_non_hex_fields() {
+		let env = MultisigEnvelope::new(
+			CeremonyId::new(),
+			ActorId::from_index(0),
+			MultisigBody::RpRound2(RpRound2Msg {
+				coin: CoinId::new(1, 1),
+				actor_index: 0,
+				tau_hex: "not-hex!!".into(),
+			}),
+		);
+		let bytes = env.to_payload_bytes().unwrap();
+		assert!(MultisigEnvelope::from_payload_bytes(&bytes).is_err());
 	}
 
 	#[test]

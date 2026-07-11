@@ -65,10 +65,11 @@ pub use kernel::{
 	SigningCommitment,
 };
 pub use messages::{
-	build_dkg_contribution, build_dkg_partial_share, build_kernel_final,
-	build_kernel_partial_sig, build_kernel_signing_commit, build_rp_final, build_rp_round1,
-	build_rp_round2, parse_dkg_contribution, parse_kernel_signing_commit, parse_rp_round1,
-	MultisigBody, MultisigEnvelope, MULTISIG_MSG_VERSION, MULTISIG_PAYLOAD_MAGIC,
+	build_dkg_contribution, build_dkg_partial_share, build_kernel_final, build_kernel_partial_sig,
+	build_kernel_signing_commit, build_rp_final, build_rp_round1, build_rp_round2,
+	parse_dkg_contribution, parse_kernel_signing_commit, parse_rp_round1, MultisigBody,
+	MultisigEnvelope, MAX_ENVELOPE_JSON_BYTES, MAX_LIST_LEN, MULTISIG_MSG_VERSION,
+	MULTISIG_PAYLOAD_MAGIC,
 };
 pub use ops::{
 	clear_pending, delete_ceremony, derive_session_key, dkg_export_shares, dkg_finalize,

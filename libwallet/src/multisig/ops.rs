@@ -711,13 +711,22 @@ pub fn write_envelope_file(path: &str, env: &MultisigEnvelope) -> Result<(), Err
 }
 
 /// Read MultisigEnvelope JSON from path (also accepts raw GMS1 payload).
+///
+/// Enforces C-12 size and structural caps.
 pub fn read_envelope_file(path: &str) -> Result<MultisigEnvelope, Error> {
+	let meta = fs::metadata(path).map_err(|e| Error::Multisig(format!("stat: {}", e)))?;
+	if meta.len() as usize > super::messages::MAX_ENVELOPE_JSON_BYTES + 64 {
+		return Err(Error::Multisig(format!(
+			"envelope file too large ({} bytes)",
+			meta.len()
+		)));
+	}
 	let mut f = File::open(path).map_err(|e| Error::Multisig(format!("open: {}", e)))?;
 	let mut s = String::new();
 	f.read_to_string(&mut s)
 		.map_err(|e| Error::Multisig(format!("read: {}", e)))?;
-	// Try plain JSON envelope first
-	if let Ok(env) = serde_json::from_str::<MultisigEnvelope>(&s) {
+	// Try plain JSON envelope first (with C-12 caps).
+	if let Ok(env) = MultisigEnvelope::from_json_str(&s) {
 		return Ok(env);
 	}
 	// Try GMS1 payload
@@ -1032,8 +1041,7 @@ where
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let quorum = rebuild_quorum_from_record(&secp, &state, &record)?;
 	let mut neg = Negotiator::resume(&secp, &state.config.public_poly, &quorum, record)?;
-	let env: MultisigEnvelope = serde_json::from_str(peer_envelope_json)
-		.map_err(|e| Error::Multisig(format!("parse peer envelope: {}", e)))?;
+	let env = MultisigEnvelope::from_json_str(peer_envelope_json)?;
 	let outbound = neg.apply(&env)?;
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	let mut outbound_json = Vec::new();
