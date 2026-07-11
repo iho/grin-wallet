@@ -27,6 +27,8 @@ use crate::grin_util::logger::LoggingConfig;
 use crate::grin_util::secp::key::{PublicKey, SecretKey};
 use crate::grin_util::secp::{self, pedersen, Secp256k1};
 use crate::grin_util::{ToHex, ZeroingString};
+use crate::multisig::types::{CeremonyId, MultisigWalletState};
+use crate::multisig::utxo::{CoinNumberMeta, MultisigUtxo};
 use crate::slate_versions::ser as dalek_ser;
 use crate::InitTxArgs;
 use chrono::prelude::*;
@@ -236,6 +238,32 @@ where
 
 	/// Flag whether the wallet needs a full UTXO scan on next update attempt
 	fn init_status(&mut self) -> Result<WalletInitStatus, Error>;
+
+	/// Load a multisig wallet state by ceremony id (decrypts share material).
+	fn get_multisig_state(
+		&mut self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: &CeremonyId,
+	) -> Result<MultisigWalletState, Error>;
+
+	/// List all stored multisig ceremony ids.
+	fn list_multisig_ceremonies(&self) -> Result<Vec<CeremonyId>, Error>;
+
+	/// Load one tracked multisig UTXO (WS6).
+	fn get_multisig_utxo(
+		&self,
+		ceremony_id: &CeremonyId,
+		coin_number: u64,
+	) -> Result<MultisigUtxo, Error>;
+
+	/// List multisig UTXOs for a ceremony (empty ceremony filter = all).
+	fn list_multisig_utxos(
+		&self,
+		ceremony_id: Option<&CeremonyId>,
+	) -> Result<Vec<MultisigUtxo>, Error>;
+
+	/// Coin-number high-water meta for a ceremony.
+	fn get_multisig_coin_meta(&self, ceremony_id: &CeremonyId) -> Result<CoinNumberMeta, Error>;
 }
 
 /// Batch trait to update the output data backend atomically. Trying to use a
@@ -304,6 +332,29 @@ where
 
 	/// Delete the private context associated with the slate id
 	fn delete_private_context(&mut self, slate_id: &[u8]) -> Result<(), Error>;
+
+	/// Save multisig wallet state (encrypts shares with keychain-derived AEAD).
+	fn save_multisig_state(&mut self, state: &MultisigWalletState) -> Result<(), Error>;
+
+	/// Delete multisig wallet state for a ceremony.
+	fn delete_multisig_state(&mut self, ceremony_id: &CeremonyId) -> Result<(), Error>;
+
+	/// Save or update a tracked multisig UTXO (WS6).
+	fn save_multisig_utxo(&mut self, utxo: &MultisigUtxo) -> Result<(), Error>;
+
+	/// Delete a tracked multisig UTXO.
+	fn delete_multisig_utxo(
+		&mut self,
+		ceremony_id: &CeremonyId,
+		coin_number: u64,
+	) -> Result<(), Error>;
+
+	/// Save coin-number high-water meta for a ceremony.
+	fn save_multisig_coin_meta(
+		&mut self,
+		ceremony_id: &CeremonyId,
+		meta: &CoinNumberMeta,
+	) -> Result<(), Error>;
 
 	/// Write the wallet data to backend file
 	fn commit(&self) -> Result<(), Error>;

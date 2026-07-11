@@ -27,7 +27,7 @@ use crate::libwallet::{
 	SlatepackAddress, Slatepacker, SlatepackerArgs, WalletLCProvider,
 };
 use crate::util::secp::key::SecretKey;
-use crate::util::{Mutex, ZeroingString};
+use crate::util::{Mutex, ToHex, ZeroingString};
 use crate::{controller, display};
 use ::core::time;
 use qr_code::QrCode;
@@ -1473,5 +1473,1214 @@ where
 			}
 		}
 	})?;
+	Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Multisig (experimental)
+// ---------------------------------------------------------------------------
+
+/// Multisig CLI arguments
+pub struct MultisigArgs {
+	pub subcommand: String,
+	pub threshold: Option<usize>,
+	pub total: Option<usize>,
+	pub my_index: Option<usize>,
+	pub shares_per_actor: Option<usize>,
+	pub ceremony_id: Option<String>,
+	pub local_sim: bool,
+	pub file: Option<String>,
+	pub out: Option<String>,
+	pub out_dir: Option<String>,
+	/// Ordered Slatepack addresses of all actors (multi-party roster). Enables
+	/// encrypted share delivery; all parties must supply the same list.
+	pub addresses: Option<Vec<String>>,
+	/// Session id hex (WS4).
+	pub session_id: Option<String>,
+	/// Shared session tag string (WS4 create).
+	pub session_tag: Option<String>,
+	/// Coin number (CreateOutput).
+	pub coin_number: Option<u64>,
+	/// Coin value nanogrins (CreateOutput).
+	pub coin_value: Option<u64>,
+	/// Fee nanogrins (Spend).
+	pub fee: Option<u64>,
+	/// Input coins as "number:value".
+	pub inputs: Option<Vec<String>>,
+	/// Output coins as "number:value".
+	pub outputs: Option<Vec<String>>,
+	/// Abort reason.
+	pub reason: Option<String>,
+	/// Delete session file after abort.
+	pub delete: bool,
+	/// Optional label (allocate-coin).
+	pub label: Option<String>,
+	/// Commitment hex (recognize-utxo).
+	pub commit_hex: Option<String>,
+	/// Proof hex file path or hex string.
+	pub proof: Option<String>,
+	/// Block height (recognize-utxo).
+	pub height: Option<u64>,
+	/// Register if recognized.
+	pub register: bool,
+	/// Start PMMR index (scan-utxos).
+	pub start_index: Option<u64>,
+	/// End PMMR index (scan-utxos).
+	pub end_index: Option<u64>,
+	/// Max outputs per batch (scan-utxos).
+	pub max_outputs: Option<u64>,
+	/// Amount for select-utxos.
+	pub amount: Option<u64>,
+	/// Min confirmations for select-utxos.
+	pub min_confirmations: Option<u64>,
+	/// Target ceremony for plan-epoch-sweep.
+	pub target_ceremony_id: Option<String>,
+}
+
+fn msig_wallet_data_dir<L, C, K>(owner_api: &Owner<L, C, K>) -> Result<String, Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let tld = owner_api
+		.get_top_level_directory()
+		.map_err(Error::LibWallet)?;
+	let dir = libwallet::multisig::wallet_data_dir(&tld);
+	Ok(dir.display().to_string())
+}
+
+/// Derive the keychain-bound key used to encrypt pending DKG state at rest
+/// (C-03). Opens the wallet so the pending file can never be read or written
+/// without unlocking the wallet.
+fn msig_pending_key<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+) -> Result<libwallet::multisig::PendingKey, Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	let mut key: Option<libwallet::multisig::PendingKey> = None;
+	controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+		let mut w_lock = api.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let kc = w.keychain(m)?;
+		key = Some(libwallet::multisig::derive_pending_key(&kc)?);
+		Ok(())
+	})?;
+	key.ok_or_else(|| Error::GenericError("failed to derive multisig pending key".into()))
+}
+
+/// Multisig command dispatcher
+pub fn multisig<L, C, K>(
+	owner_api: &mut Owner<L, C, K>,
+	keychain_mask: Option<&SecretKey>,
+	args: MultisigArgs,
+) -> Result<(), Error>
+where
+	L: WalletLCProvider<'static, C, K> + 'static,
+	C: NodeClient + 'static,
+	K: keychain::Keychain + 'static,
+{
+	println!();
+	println!("WARNING: Multisig is EXPERIMENTAL — do not use with real funds.");
+	println!();
+
+	match args.subcommand.as_str() {
+		"list" => {
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let list = libwallet::multisig::list_ceremonies(&mut **w, m)?;
+				if list.is_empty() {
+					println!("No multisig ceremonies stored.");
+				} else {
+					println!(
+						"{:<40} {:>5} {:>5} {:<16} {:>6}",
+						"Ceremony ID", "M", "N", "Actor", "Shares"
+					);
+					println!("{}", "-".repeat(80));
+					for s in list {
+						println!(
+							"{:<40} {:>5} {:>5} {:<16} {:>6}",
+							s.ceremony_id, s.threshold, s.total_actors, s.my_label, s.num_shares
+						);
+					}
+				}
+				Ok(())
+			})?;
+		}
+		"show" => {
+			let cid = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("ceremony id required".into()))?;
+			let uuid = Uuid::parse_str(&cid)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let ceremony = libwallet::multisig::CeremonyId(uuid);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::get_state(&mut **w, m, &ceremony)?;
+				println!("Ceremony:    {}", st.config.ceremony_id.0);
+				println!(
+					"Threshold:   {}-of-{}",
+					st.config.params.threshold, st.config.params.total_actors
+				);
+				println!("Shares/actor:{}", st.config.params.shares_per_actor);
+				println!(
+					"My actor:    {} ({})",
+					st.my_actor.label,
+					st.my_actor.id.to_hex()
+				);
+				println!("Shares:      {}", st.shares.len());
+				println!("Actors:");
+				for (i, a) in st.config.actors.iter().enumerate() {
+					println!("  [{}] {}", i, a.label);
+				}
+				println!(
+					"Public poly coefficients: {}",
+					st.config.public_poly.coefficients.len()
+				);
+				Ok(())
+			})?;
+		}
+		"delete" => {
+			let cid = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("ceremony id required".into()))?;
+			let uuid = Uuid::parse_str(&cid)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let ceremony = libwallet::multisig::CeremonyId(uuid);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				libwallet::multisig::delete_ceremony(&mut **w, m, &ceremony)?;
+				println!("Deleted ceremony {}", cid);
+				Ok(())
+			})?;
+		}
+		"init" => {
+			let threshold = args.threshold.unwrap_or(2);
+			let total = args.total.unwrap_or(3);
+			let my_index = args.my_index.unwrap_or(0);
+			if args.local_sim {
+				controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+					let mut w_lock = api.wallet_inst.lock();
+					let w = w_lock.lc_provider()?.wallet_inst()?;
+					let st = libwallet::multisig::init_local_sim(
+						&mut **w,
+						m,
+						threshold,
+						total,
+						my_index,
+						args.shares_per_actor,
+					)?;
+					println!("Local-sim DKG complete.");
+					println!("Ceremony: {}", st.config.ceremony_id.0);
+					println!(
+						"Threshold: {}-of-{} (shares/actor={})",
+						st.config.params.threshold,
+						st.config.params.total_actors,
+						st.config.params.shares_per_actor
+					);
+					println!("This wallet is actor: {}", st.my_actor.label);
+					Ok(())
+				})?;
+			} else {
+				let wdata = msig_wallet_data_dir(owner_api)?;
+				let key = msig_pending_key(owner_api, keychain_mask)?;
+				let sign_key = owner_api
+					.get_slatepack_secret_key(keychain_mask, 0)
+					.map_err(Error::LibWallet)?;
+				let out = args.out.unwrap_or_else(|| "msig_contrib.json".to_owned());
+				let ceremony = match args.ceremony_id.as_ref() {
+					Some(s) => {
+						let u = Uuid::parse_str(s)
+							.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+						Some(libwallet::multisig::CeremonyId(u))
+					}
+					None => None,
+				};
+				let pending = libwallet::multisig::dkg_start(
+					&wdata,
+					&key,
+					Some(&sign_key),
+					threshold,
+					total,
+					my_index,
+					args.shares_per_actor,
+					args.addresses.clone(),
+					ceremony,
+					&out,
+				)
+				.map_err(Error::LibWallet)?;
+				println!("DKG started (multi-party).");
+				println!("Ceremony: {}", pending.ceremony_id.0);
+				println!("Your index: {}", pending.my_index);
+				println!("Contribution written to: {}", out);
+				println!();
+				println!("Next steps for other actors:");
+				println!(
+					"  grin-wallet multisig init -m {} -n {} --index <i> --ceremony-id {} -o contrib_i.json",
+					threshold, total, pending.ceremony_id.0
+				);
+				println!(
+					"  grin-wallet multisig import-contrib -i contrib_j.json  (for each peer)"
+				);
+				println!("  grin-wallet multisig export-shares -d shares_out/");
+				println!(
+					"  grin-wallet multisig import-share -i share_file.json  (from each peer)"
+				);
+				println!("  grin-wallet multisig finalize");
+			}
+		}
+		"pending" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			match libwallet::multisig::load_pending(&wdata, &key).map_err(Error::LibWallet)? {
+				None => println!("No pending DKG session."),
+				Some(p) => {
+					println!("Pending ceremony: {}", p.ceremony_id.0);
+					println!(
+						"Threshold: {}-of-{}",
+						p.params.threshold, p.params.total_actors
+					);
+					println!("My index: {}", p.my_index);
+					let got: usize = p.contributions.iter().filter(|c| c.is_some()).count();
+					println!("Contributions: {}/{}", got, p.params.total_actors);
+					let shares_got: usize =
+						p.my_share_ys_hex.iter().filter(|s| s.is_some()).count();
+					println!(
+						"Imported share accumulators: {}/{}",
+						shares_got, p.params.shares_per_actor
+					);
+				}
+			}
+		}
+		"clear-pending" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			libwallet::multisig::clear_pending(&wdata).map_err(Error::LibWallet)?;
+			println!("Pending DKG cleared.");
+		}
+		"import-contrib" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			let env = libwallet::multisig::read_envelope_file(&file).map_err(Error::LibWallet)?;
+			let p = libwallet::multisig::dkg_import_contrib(&wdata, &key, &env)
+				.map_err(Error::LibWallet)?;
+			let got: usize = p.contributions.iter().filter(|c| c.is_some()).count();
+			println!(
+				"Imported contribution. Progress: {}/{}",
+				got, p.params.total_actors
+			);
+		}
+		"export-shares" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			let sender_addr = owner_api
+				.get_slatepack_address(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			let sign_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			let out_dir = args.out_dir.unwrap_or_else(|| "msig_shares".to_owned());
+			let paths = libwallet::multisig::dkg_export_shares(
+				&wdata,
+				&key,
+				&sender_addr,
+				&sign_key,
+				&out_dir,
+			)
+			.map_err(Error::LibWallet)?;
+			println!(
+				"Wrote {} encrypted share file(s) under {}:",
+				paths.len(),
+				out_dir
+			);
+			for p in paths {
+				println!("  {}", p);
+			}
+			println!(
+				"Each file is an age-encrypted slatepack addressed to one actor; \
+				 deliver it to that actor and import with `multisig import-share`."
+			);
+		}
+		"import-share" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let key = msig_pending_key(owner_api, keychain_mask)?;
+			let dec_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			let env = libwallet::multisig::read_encrypted_share_file(&file, &dec_key)
+				.map_err(Error::LibWallet)?;
+			let p = libwallet::multisig::dkg_import_share(&wdata, &key, &env)
+				.map_err(Error::LibWallet)?;
+			let shares_got: usize = p.my_share_ys_hex.iter().filter(|s| s.is_some()).count();
+			println!(
+				"Imported share. Accumulators filled: {}/{}",
+				shares_got, p.params.shares_per_actor
+			);
+		}
+		"finalize" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::dkg_finalize(&mut **w, m, &wdata)?;
+				println!("DKG finalized and saved to wallet DB.");
+				println!("Ceremony: {}", st.config.ceremony_id.0);
+				println!("Actor: {}", st.my_actor.label);
+				Ok(())
+			})?;
+		}
+		"export-state" => {
+			let cid = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("ceremony id required".into()))?;
+			let out = args
+				.out
+				.ok_or_else(|| Error::ArgumentError("--out required".into()))?;
+			let uuid = Uuid::parse_str(&cid)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let ceremony = libwallet::multisig::CeremonyId(uuid);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::get_state(&mut **w, m, &ceremony)?;
+				// AEAD-sealed under keychain-derived key (C-08) — not plaintext JSON.
+				libwallet::multisig::export_state_sealed(&mut **w, m, &st, &out)?;
+				println!(
+					"Exported sealed multisig state (keychain-encrypted) to {}",
+					out
+				);
+				Ok(())
+			})?;
+		}
+		"import-state" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::import_state_sealed(&mut **w, m, &file)?;
+				println!("Imported ceremony {}", st.config.ceremony_id.0);
+				Ok(())
+			})?;
+		}
+		"demo-tx" => {
+			let threshold = args.threshold.unwrap_or(2) as u32;
+			let total = args.total.unwrap_or(threshold.max(2) as usize) as u32;
+			if threshold > total {
+				return Err(Error::ArgumentError(
+					"threshold cannot exceed total actors".into(),
+				));
+			}
+			let fee = 1_000_000u32;
+			let res = owner_api
+				.multisig_demo_tx(threshold, total, fee)
+				.map_err(Error::LibWallet)?;
+			println!("E2E multisig demo OK ({}-of-{}).", res.threshold, res.total);
+			println!("  Funded value:  {}", res.fund_value);
+			println!("  Change value:  {} (fee {})", res.change_value, res.fee);
+			println!("  Tx hash:       {}", res.tx_hash);
+			println!("  Kernel excess: {}", res.kernel_excess);
+			if let Some(out) = args.out.as_ref() {
+				std::fs::write(out, &res.tx_hex)
+					.map_err(|e| Error::GenericError(format!("write tx hex: {}", e)))?;
+				println!("  Wrote tx hex to {}", out);
+			}
+			println!("  Transaction validates (rangeproofs + kernel sig + kernel sums).");
+			let _ = keychain_mask;
+		}
+		"post-tx" => {
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required (tx hex)".into()))?;
+			let fluff = true;
+			let tx_hex = std::fs::read_to_string(&file)
+				.map_err(|e| Error::GenericError(format!("read {}: {}", file, e)))?
+				.trim()
+				.to_owned();
+			owner_api
+				.multisig_post_tx(keychain_mask, tx_hex, fluff)
+				.map_err(Error::LibWallet)?;
+			println!("Posted transaction from {} (fluff={})", file, fluff);
+		}
+		"session-list" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let list = libwallet::multisig::session_list(&mut **w, m, &wdata)?;
+				if list.is_empty() {
+					println!("No durable sessions.");
+				} else {
+					println!(
+						"{:<20} {:<14} {:<12} {:>5} {:>5}/{:<5}",
+						"Session (hex..)", "Kind", "Phase", "Idx", "Have", "N"
+					);
+					println!("{}", "-".repeat(70));
+					for s in list {
+						let sid = if s.session_id_hex.len() > 16 {
+							format!("{}…", &s.session_id_hex[..16])
+						} else {
+							s.session_id_hex.clone()
+						};
+						println!(
+							"{:<20} {:<14} {:<12} {:>5} {:>5}/{:<5}",
+							sid,
+							format!("{:?}", s.kind),
+							format!("{:?}", s.phase),
+							s.my_index,
+							s.collected,
+							s.quorum_size
+						);
+					}
+				}
+				Ok(())
+			})?;
+		}
+		"session-status" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let s = libwallet::multisig::session_status(&mut **w, m, &wdata, &sid)?;
+				println!("Session:  {}", s.session_id_hex);
+				println!("Kind:     {:?}", s.kind);
+				println!("Phase:    {:?}", s.phase);
+				println!("My index: {} / {}", s.my_index, s.quorum_size);
+				println!("Collected this phase: {}/{}", s.collected, s.quorum_size);
+				if let Some(r) = s.abort_reason {
+					println!("Aborted:  {}", r);
+				}
+				Ok(())
+			})?;
+		}
+		"session-create-output" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let coin_number = args
+				.coin_number
+				.ok_or_else(|| Error::ArgumentError("--coin-number required".into()))?;
+			let coin_value = args
+				.coin_value
+				.ok_or_else(|| Error::ArgumentError("--coin-value required".into()))?;
+			let tag = args
+				.session_tag
+				.clone()
+				.unwrap_or_else(|| "create-output".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out.json".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::session_create_output(
+					&mut **w,
+					m,
+					&wdata,
+					&libwallet::multisig::CeremonyId(uuid),
+					coin_number,
+					coin_value,
+					&tag,
+					&out,
+					None,
+				)?;
+				println!("CreateOutput session started.");
+				println!("  Session id: {}", st.session_id_hex);
+				println!("  Phase:      {:?}", st.phase);
+				println!("  Wrote:      {}", out);
+				println!("  Exchange this envelope with quorum peers, then session-apply.");
+				Ok(())
+			})?;
+		}
+		"session-create-multitx" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let parse_coin = |s: &str| -> Result<libwallet::multisig::CoinId, Error> {
+				let parts: Vec<_> = s.split(':').collect();
+				if parts.len() != 2 {
+					return Err(Error::ArgumentError(
+						"coin must be number:value".into(),
+					));
+				}
+				let n = parts[0]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin number: {}", e)))?;
+				let v = parts[1]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin value: {}", e)))?;
+				Ok(libwallet::multisig::CoinId::new(n, v))
+			};
+			let inputs = args
+				.inputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			let outputs = args
+				.outputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			if inputs.is_empty() || outputs.is_empty() {
+				return Err(Error::ArgumentError(
+					"--input and --output required".into(),
+				));
+			}
+			let fee = args.fee.unwrap_or(1_000_000);
+			let tag = args
+				.session_tag
+				.clone()
+				.unwrap_or_else(|| "multitx".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out.json".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let res = libwallet::multisig::session_create_multitx_raw(
+					&mut **w,
+					m,
+					&wdata,
+					&libwallet::multisig::CeremonyId(uuid),
+					inputs,
+					outputs,
+					fee,
+					&tag,
+					None,
+				)?;
+				std::fs::write(&out, res.envelope_json.as_bytes())
+					.map_err(|e| libwallet::Error::Multisig(format!("write: {}", e)))?;
+				println!(
+					"MultiTx session {} phase={:?}",
+					res.status.session_id_hex, res.status.phase
+				);
+				println!("  Wrote: {}", out);
+				Ok(())
+			})?;
+		}
+		"session-create-spend" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let parse_coin = |s: &str| -> Result<libwallet::multisig::CoinId, Error> {
+				let parts: Vec<_> = s.split(':').collect();
+				if parts.len() != 2 {
+					return Err(Error::ArgumentError(
+						"coin must be number:value".into(),
+					));
+				}
+				let n = parts[0]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin number: {}", e)))?;
+				let v = parts[1]
+					.parse::<u64>()
+					.map_err(|e| Error::ArgumentError(format!("coin value: {}", e)))?;
+				Ok(libwallet::multisig::CoinId::new(n, v))
+			};
+			let inputs = args
+				.inputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			let outputs = args
+				.outputs
+				.clone()
+				.unwrap_or_default()
+				.iter()
+				.map(|s| parse_coin(s))
+				.collect::<Result<Vec<_>, _>>()?;
+			if inputs.is_empty() || outputs.is_empty() {
+				return Err(Error::ArgumentError(
+					"--input and --output required (number:value)".into(),
+				));
+			}
+			let fee = args.fee.unwrap_or(1_000_000);
+			let tag = args.session_tag.clone().unwrap_or_else(|| "spend".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out.json".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::session_create_spend(
+					&mut **w,
+					m,
+					&wdata,
+					&libwallet::multisig::CeremonyId(uuid),
+					inputs,
+					outputs,
+					fee,
+					&tag,
+					&out,
+					None,
+				)?;
+				println!("Spend session started.");
+				println!("  Session id: {}", st.session_id_hex);
+				println!("  Phase:      {:?}", st.phase);
+				println!("  Wrote:      {}", out);
+				Ok(())
+			})?;
+		}
+		"session-apply" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let file = args
+				.file
+				.ok_or_else(|| Error::ArgumentError("--file required".into()))?;
+			let out_dir = args
+				.out_dir
+				.clone()
+				.unwrap_or_else(|| "msig_sess_out".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			// Decrypt key for age-encrypted share slatepacks (optional).
+			let dec_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.ok();
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let (st, paths) = libwallet::multisig::session_apply_with_key(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					&file,
+					&out_dir,
+					dec_key.as_ref(),
+				)?;
+				println!("Applied peer envelope.");
+				println!("  Phase:     {:?}", st.phase);
+				println!("  Collected: {}/{}", st.collected, st.quorum_size);
+				if paths.is_empty() {
+					println!("  No new outbound messages.");
+				} else {
+					println!("  Outbound:");
+					for p in paths {
+						println!("    {}", p);
+					}
+				}
+				if st.phase == libwallet::multisig::SessionPhase::Complete {
+					println!("  Session COMPLETE.");
+				}
+				Ok(())
+			})?;
+		}
+		"session-abort" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let reason = args
+				.reason
+				.clone()
+				.unwrap_or_else(|| "user abort".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let st = libwallet::multisig::session_abort(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					&reason,
+					args.delete,
+				)?;
+				println!("Session aborted: {:?}", st.phase);
+				if let Some(r) = st.abort_reason {
+					println!("  Reason: {}", r);
+				}
+				Ok(())
+			})?;
+		}
+		"list-utxos" => {
+			let ceremony = args.ceremony_id.as_ref().map(|c| {
+				Uuid::parse_str(c)
+					.map(|u| libwallet::multisig::CeremonyId(u))
+					.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))
+			});
+			let ceremony = match ceremony {
+				Some(Ok(c)) => Some(c),
+				Some(Err(e)) => return Err(e),
+				None => None,
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let list = libwallet::multisig::list_utxos(&mut **w, ceremony.as_ref())?;
+				if list.is_empty() {
+					println!("No multisig UTXOs tracked.");
+				} else {
+					println!(
+						"{:<38} {:>8} {:>16} {:<12} {:>8}",
+						"Ceremony", "Coin#", "Value", "Status", "Height"
+					);
+					println!("{}", "-".repeat(90));
+					for u in list {
+						println!(
+							"{:<38} {:>8} {:>16} {:<12} {:>8}",
+							u.ceremony_id.0,
+							u.coin.number,
+							u.coin.value,
+							format!("{:?}", u.status),
+							u.height
+						);
+					}
+				}
+				let _ = m;
+				Ok(())
+			})?;
+		}
+		"allocate-coin" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let value = args
+				.coin_value
+				.ok_or_else(|| Error::ArgumentError("--coin-value required".into()))?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let u = libwallet::multisig::allocate_coin(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					value,
+					args.label.clone(),
+				)?;
+				println!("Reserved coin #{} value={}", u.coin.number, u.coin.value);
+				println!("  Commit: {}", u.commit_hex);
+				println!("  Status: {:?}", u.status);
+				Ok(())
+			})?;
+		}
+		"register-utxo" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let number = args
+				.coin_number
+				.ok_or_else(|| Error::ArgumentError("--coin-number required".into()))?;
+			let value = args
+				.coin_value
+				.ok_or_else(|| Error::ArgumentError("--coin-value required".into()))?;
+			let proof = if let Some(p) = args.proof.as_ref() {
+				let s = std::fs::read_to_string(p)
+					.unwrap_or_else(|_| p.clone())
+					.trim()
+					.to_owned();
+				Some(
+					libwallet::multisig::messages::proof_from_hex(&s)
+						.map_err(|e| Error::LibWallet(e))?,
+				)
+			} else {
+				None
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let u = libwallet::multisig::register_utxo(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					libwallet::multisig::CoinId::new(number, value),
+					proof.as_ref(),
+					args.session_id.clone(),
+					libwallet::multisig::MultisigUtxoStatus::Unconfirmed,
+				)?;
+				println!(
+					"Registered UTXO coin #{} value={} status={:?}",
+					u.coin.number, u.coin.value, u.status
+				);
+				println!("  Commit: {}", u.commit_hex);
+				Ok(())
+			})?;
+		}
+		"recognize-utxo" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let commit = args
+				.commit_hex
+				.ok_or_else(|| Error::ArgumentError("--commit required".into()))?;
+			let proof_path = args
+				.proof
+				.ok_or_else(|| Error::ArgumentError("--proof required".into()))?;
+			let proof_hex = std::fs::read_to_string(&proof_path)
+				.map_err(|e| Error::GenericError(format!("read proof: {}", e)))?
+				.trim()
+				.to_owned();
+			let height = args.height.unwrap_or(0);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let rec = libwallet::multisig::recognize_and_register(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					&commit,
+					&proof_hex,
+					height,
+					args.register,
+				)?;
+				match rec {
+					Some(r) => {
+						println!(
+							"Recognized multisig coin #{} value={}",
+							r.coin.number, r.coin.value
+						);
+						if args.register {
+							println!("  Registered as Unspent at height {}", height);
+						}
+					}
+					None => println!("Not recognized under this ceremony view key."),
+				}
+				Ok(())
+			})?;
+		}
+		"scan-utxos" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let start = args.start_index.unwrap_or(1);
+			let end = args.end_index;
+			let max = args.max_outputs.unwrap_or(1000);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let found = libwallet::multisig::scan_ceremony_utxos(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					start,
+					end,
+					max,
+				)?;
+				if found.is_empty() {
+					println!("No multisig outputs recognized in scanned range.");
+				} else {
+					println!("Recognized {} multisig UTXO(s):", found.len());
+					for u in found {
+						println!(
+							"  coin #{} value={} status={:?} height={} mmr={:?}",
+							u.coin.number, u.coin.value, u.status, u.height, u.mmr_index
+						);
+					}
+				}
+				Ok(())
+			})?;
+		}
+		"refresh-utxos" => {
+			let ceremony = args.ceremony_id.as_ref().map(|c| {
+				Uuid::parse_str(c)
+					.map(libwallet::multisig::CeremonyId)
+					.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))
+			});
+			let ceremony = match ceremony {
+				Some(Ok(c)) => Some(c),
+				Some(Err(e)) => return Err(e),
+				None => None,
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let r = libwallet::multisig::refresh_multisig_utxos(
+					&mut **w,
+					m,
+					ceremony.as_ref(),
+				)?;
+				println!(
+					"Multisig refresh: examined={} confirmed={} marked_spent={}",
+					r.examined, r.confirmed, r.marked_spent
+				);
+				Ok(())
+			})?;
+		}
+		"select-utxos" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let amount = args
+				.amount
+				.ok_or_else(|| Error::ArgumentError("--amount required".into()))?;
+			let min_conf = args.min_confirmations.unwrap_or(1);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let height = w.w2n_client().get_chain_tip().map(|(h, _)| h).unwrap_or(0);
+				let (selected, total) = libwallet::multisig::select_spendable_utxos(
+					&mut **w,
+					&libwallet::multisig::CeremonyId(uuid),
+					amount,
+					height,
+					min_conf,
+				)?;
+				println!(
+					"Selected {} coin(s), total {} (need {}) at height {}",
+					selected.len(),
+					total,
+					amount,
+					height
+				);
+				for u in selected {
+					println!(
+						"  coin #{} value={} height={}",
+						u.coin.number, u.coin.value, u.height
+					);
+				}
+				let _ = m;
+				Ok(())
+			})?;
+		}
+		"plan-epoch-sweep" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required (source)".into()))?;
+			let src = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let tgt = match args.target_ceremony_id.as_ref() {
+				Some(t) => Some(
+					Uuid::parse_str(t)
+						.map(libwallet::multisig::CeremonyId)
+						.map_err(|e| Error::ArgumentError(format!("bad target ceremony: {}", e)))?,
+				),
+				None => None,
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let plan = libwallet::multisig::plan_epoch_sweep(
+					&mut **w,
+					&libwallet::multisig::CeremonyId(src),
+					tgt.as_ref(),
+				)?;
+				println!("Epoch sweep plan");
+				println!("  Source: {}", plan.source_ceremony_id);
+				if let Some(t) = &plan.target_ceremony_id {
+					println!("  Target: {}", t);
+				}
+				println!("  Coins:  {} (total value {})", plan.coins.len(), plan.total_value);
+				for c in &plan.coins {
+					println!("    #{} value={}", c.number, c.value);
+				}
+				println!("  Note: {}", plan.note);
+				let _ = m;
+				Ok(())
+			})?;
+		}
+		"expire-sessions" => {
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let expired =
+					libwallet::multisig::expire_stale_sessions(&mut **w, m, &wdata)?;
+				if expired.is_empty() {
+					println!("No expired multisig sessions.");
+				} else {
+					println!("Expired {} session(s):", expired.len());
+					for st in expired {
+						println!(
+							"  {} phase={:?} reason={:?}",
+							st.session_id_hex, st.phase, st.abort_reason
+						);
+					}
+				}
+				Ok(())
+			})?;
+		}
+		"assemble-tx" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| format!("msig_tx_{}.hex", &sid[..sid.len().min(16)]));
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let tx_hex = libwallet::multisig::assemble_tx_from_spend_session(
+					&mut **w, m, &wdata, &sid,
+				)?;
+				std::fs::write(&out, tx_hex.as_bytes())
+					.map_err(|e| libwallet::Error::Multisig(format!("write tx: {}", e)))?;
+				println!("Assembled transaction ({} bytes hex) → {}", tx_hex.len(), out);
+				println!("Post with: grin-wallet multisig post-tx -i {}", out);
+				Ok(())
+			})?;
+		}
+		"session-dkg-create" => {
+			let threshold = args
+				.threshold
+				.ok_or_else(|| Error::ArgumentError("--threshold required".into()))?;
+			let total = args
+				.total
+				.ok_or_else(|| Error::ArgumentError("--total required".into()))?;
+			let my_index = args
+				.my_index
+				.ok_or_else(|| Error::ArgumentError("--index required".into()))?;
+			let tag = args
+				.session_tag
+				.clone()
+				.unwrap_or_else(|| "dkg".into());
+			let out = args
+				.out
+				.clone()
+				.unwrap_or_else(|| "msig_dkg_contrib.json".into());
+			let ceremony = match args.ceremony_id.as_ref() {
+				Some(c) => Some(
+					Uuid::parse_str(c)
+						.map(libwallet::multisig::CeremonyId)
+						.map_err(|e| Error::ArgumentError(format!("bad ceremony: {}", e)))?,
+				),
+				None => None,
+			};
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let sign_key = if args.addresses.is_some() {
+				Some(
+					owner_api
+						.get_slatepack_secret_key(keychain_mask, 0)
+						.map_err(Error::LibWallet)?,
+				)
+			} else {
+				None
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let res = libwallet::multisig::session_dkg_create_raw(
+					&mut **w,
+					m,
+					&wdata,
+					threshold,
+					total,
+					my_index,
+					args.shares_per_actor,
+					ceremony,
+					&tag,
+					args.addresses.clone(),
+					sign_key.as_ref(),
+				)?;
+				std::fs::write(&out, res.envelope_json.as_bytes())
+					.map_err(|e| libwallet::Error::Multisig(format!("write: {}", e)))?;
+				println!(
+					"DKG session {} phase={:?}",
+					res.status.session_id_hex, res.status.phase
+				);
+				println!("Contribution → {}", out);
+				Ok(())
+			})?;
+		}
+		"session-dkg-export-shares" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let out_dir = args
+				.out_dir
+				.clone()
+				.unwrap_or_else(|| "msig_dkg_shares".into());
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			let sender = owner_api
+				.get_slatepack_address(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			let sign_key = owner_api
+				.get_slatepack_secret_key(keychain_mask, 0)
+				.map_err(Error::LibWallet)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let paths = libwallet::multisig::session_dkg_export_shares_armored(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					&sender,
+					&sign_key,
+					&out_dir,
+				)?;
+				println!("Exported {} encrypted share slatepack(s):", paths.len());
+				for p in paths {
+					println!("  {}", p);
+				}
+				Ok(())
+			})?;
+		}
+		"session-dkg-finalize" => {
+			let sid = args
+				.session_id
+				.ok_or_else(|| Error::ArgumentError("--session required".into()))?;
+			let wdata = msig_wallet_data_dir(owner_api)?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let state = libwallet::multisig::session_dkg_finalize(
+					&mut **w,
+					m,
+					&wdata,
+					&sid,
+					args.delete,
+				)?;
+				println!(
+					"DKG finalized ceremony {} ({}-of-{})",
+					state.config.ceremony_id.0,
+					state.config.params.threshold,
+					state.config.params.total_actors
+				);
+				Ok(())
+			})?;
+		}
+		other => {
+			return Err(Error::ArgumentError(format!(
+				"unknown multisig subcommand '{}'",
+				other
+			)));
+		}
+	}
 	Ok(())
 }

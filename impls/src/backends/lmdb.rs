@@ -30,6 +30,11 @@ use crate::store::{self, option_to_not_found, to_key, to_key_u64};
 
 use crate::core::core::Transaction;
 use crate::core::ser;
+use crate::libwallet::multisig::{
+	decrypt_from_storage, encrypt_for_storage, multisig_coin_meta_db_key, multisig_db_key,
+	multisig_utxo_db_key, CeremonyId, CoinNumberMeta, EncryptedMultisigState, MultisigUtxo,
+	MultisigWalletState, MULTISIG_PREFIX, MULTISIG_UTXO_PREFIX,
+};
 use crate::libwallet::{
 	AcctPathMapping, Context, Error, NodeClient, OutputData, ScannedBlockInfo, TxLogEntry,
 	WalletBackend, WalletInitStatus, WalletOutputBatch,
@@ -508,6 +513,83 @@ where
 		};
 		Ok(status)
 	}
+
+	fn get_multisig_state(
+		&mut self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: &CeremonyId,
+	) -> Result<MultisigWalletState, Error> {
+		let key = multisig_db_key(ceremony_id);
+		let sealed: EncryptedMultisigState =
+			option_to_not_found(self.db.get_ser(&key, None), || {
+				format!("Multisig ceremony: {}", ceremony_id.0)
+			})?;
+		let keychain = self.keychain(keychain_mask)?;
+		decrypt_from_storage(&keychain, &sealed)
+	}
+
+	fn list_multisig_ceremonies(&self) -> Result<Vec<CeremonyId>, Error> {
+		let prefix_iter = self.db.iter(&[MULTISIG_PREFIX], move |k, _v| {
+			if k.len() != 1 + 16 || k[0] != MULTISIG_PREFIX {
+				return Err(store::Error::OtherErr("invalid multisig db key".into()));
+			}
+			let mut bytes = [0u8; 16];
+			bytes.copy_from_slice(&k[1..]);
+			Ok(CeremonyId(uuid::Uuid::from_bytes(bytes)))
+		});
+		let mut ids = Vec::new();
+		for id in prefix_iter.expect("multisig iter").into_iter() {
+			ids.push(id);
+		}
+		Ok(ids)
+	}
+
+	fn get_multisig_utxo(
+		&self,
+		ceremony_id: &CeremonyId,
+		coin_number: u64,
+	) -> Result<MultisigUtxo, Error> {
+		let key = multisig_utxo_db_key(ceremony_id, coin_number);
+		option_to_not_found(self.db.get_ser(&key, None), || {
+			format!("Multisig UTXO: {} #{}", ceremony_id.0, coin_number)
+		})
+		.map_err(|e| e.into())
+	}
+
+	fn list_multisig_utxos(
+		&self,
+		ceremony_id: Option<&CeremonyId>,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		let prefix_iter = self.db.iter(&[MULTISIG_UTXO_PREFIX], move |k, _v| {
+			Ok(k.to_vec())
+		});
+		let mut out = Vec::new();
+		for k in prefix_iter.expect("multisig utxo key iter").into_iter() {
+			if let Some(cid) = ceremony_id {
+				if k.len() < 17 || &k[1..17] != cid.0.as_bytes() {
+					continue;
+				}
+			}
+			if let Some(u) = self.db.get_ser::<MultisigUtxo>(&k, None)? {
+				out.push(u);
+			}
+		}
+		out.sort_by(|a, b| {
+			a.ceremony_id
+				.0
+				.cmp(&b.ceremony_id.0)
+				.then(a.coin.number.cmp(&b.coin.number))
+		});
+		Ok(out)
+	}
+
+	fn get_multisig_coin_meta(&self, ceremony_id: &CeremonyId) -> Result<CoinNumberMeta, Error> {
+		let key = multisig_coin_meta_db_key(ceremony_id);
+		match self.db.get_ser(&key, None)? {
+			Some(m) => Ok(m),
+			None => Ok(CoinNumberMeta::default()),
+		}
+	}
 }
 
 /// An atomic batch in which all changes can be committed all at once or
@@ -767,6 +849,68 @@ where
 			.unwrap()
 			.delete(&ctx_key)
 			.map_err(|e| e.into())
+	}
+
+	fn save_multisig_state(&mut self, state: &MultisigWalletState) -> Result<(), Error> {
+		let keychain = self.keychain.as_ref().ok_or_else(|| {
+			Error::Multisig("keychain required to encrypt multisig state".into())
+		})?;
+		let encrypted = encrypt_for_storage(keychain, state)?;
+		let key = multisig_db_key(&state.config.ceremony_id);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&key, &encrypted)?;
+		Ok(())
+	}
+
+	fn delete_multisig_state(&mut self, ceremony_id: &CeremonyId) -> Result<(), Error> {
+		let key = multisig_db_key(ceremony_id);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.delete(&key)
+			.map_err(|e| e.into())
+	}
+
+	fn save_multisig_utxo(&mut self, utxo: &MultisigUtxo) -> Result<(), Error> {
+		let key = multisig_utxo_db_key(&utxo.ceremony_id, utxo.coin.number);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&key, utxo)?;
+		Ok(())
+	}
+
+	fn delete_multisig_utxo(
+		&mut self,
+		ceremony_id: &CeremonyId,
+		coin_number: u64,
+	) -> Result<(), Error> {
+		let key = multisig_utxo_db_key(ceremony_id, coin_number);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.delete(&key)
+			.map_err(|e| e.into())
+	}
+
+	fn save_multisig_coin_meta(
+		&mut self,
+		ceremony_id: &CeremonyId,
+		meta: &CoinNumberMeta,
+	) -> Result<(), Error> {
+		let key = multisig_coin_meta_db_key(ceremony_id);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&key, meta)?;
+		Ok(())
 	}
 
 	fn commit(&self) -> Result<(), Error> {

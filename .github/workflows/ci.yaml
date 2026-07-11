@@ -7,12 +7,27 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        job_args: [api, config, controller, impls, libwallet, .]
+        job_args: [api, config, controller, impls, libwallet, integration, .]
     steps:
       - uses: actions/checkout@v3
       - name: Test ${{ matrix.job_args }}
         working-directory: ${{ matrix.job_args }}
-        run: cargo test --release
+        # Multi-process node+wallet tests need serial execution (ports / RocksDB).
+        run: |
+          if [ "${{ matrix.job_args }}" = "integration" ]; then
+            cargo test --release -- --test-threads=1
+          else
+            cargo test --release
+          fi
+
+  # Explicit multisig filter (experimental module) for fast signal on PRs.
+  multisig-unit:
+    name: Multisig unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: cargo test multisig
+        run: cargo test -p grin_wallet_libwallet multisig --release
 
   macos-tests:
     name: macOS Tests

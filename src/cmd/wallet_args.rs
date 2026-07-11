@@ -961,6 +961,115 @@ pub fn parse_verify_proof_args(args: &ArgMatches) -> Result<command::ProofVerify
 	})
 }
 
+/// Parse multisig subcommand args
+pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, ParseError> {
+	let (sub, sub_args) = match args.subcommand() {
+		(name, Some(a)) => (name.to_owned(), a),
+		_ => {
+			return Err(ParseError::ArgumentError(
+				"multisig requires a subcommand (list|init|...)\n  try: grin-wallet multisig --help"
+					.into(),
+			));
+		}
+	};
+	let parse_usize = |v: &str, name: &str| -> Result<usize, ParseError> {
+		v.parse::<usize>().map_err(|e| {
+			ParseError::ArgumentError(format!("Could not parse {} parameter: {}", name, e))
+		})
+	};
+	let parse_u64 = |v: &str, name: &str| -> Result<u64, ParseError> {
+		v.parse::<u64>().map_err(|e| {
+			ParseError::ArgumentError(format!("Could not parse {} parameter: {}", name, e))
+		})
+	};
+	Ok(command::MultisigArgs {
+		subcommand: sub,
+		threshold: sub_args
+			.value_of("threshold")
+			.map(|v| parse_usize(v, "threshold"))
+			.transpose()?,
+		total: sub_args
+			.value_of("total")
+			.map(|v| parse_usize(v, "total"))
+			.transpose()?,
+		my_index: sub_args
+			.value_of("index")
+			.map(|v| parse_usize(v, "index"))
+			.transpose()?,
+		shares_per_actor: sub_args
+			.value_of("shares")
+			.map(|v| parse_usize(v, "shares"))
+			.transpose()?,
+		ceremony_id: sub_args
+			.value_of("ceremony")
+			.or_else(|| sub_args.value_of("ceremony_id"))
+			.map(|s| s.to_owned()),
+		local_sim: sub_args.is_present("local_sim"),
+		file: sub_args.value_of("file").map(|s| s.to_owned()),
+		out: sub_args.value_of("out").map(|s| s.to_owned()),
+		out_dir: sub_args.value_of("dir").map(|s| s.to_owned()),
+		addresses: sub_args.value_of("addresses").map(|s| {
+			s.split(',')
+				.map(|a| a.trim().to_owned())
+				.filter(|a| !a.is_empty())
+				.collect()
+		}),
+		session_id: sub_args.value_of("session").map(|s| s.to_owned()),
+		session_tag: sub_args.value_of("session_tag").map(|s| s.to_owned()),
+		coin_number: sub_args
+			.value_of("coin_number")
+			.map(|v| parse_u64(v, "coin-number"))
+			.transpose()?,
+		coin_value: sub_args
+			.value_of("coin_value")
+			.map(|v| parse_u64(v, "coin-value"))
+			.transpose()?,
+		fee: sub_args
+			.value_of("fee")
+			.map(|v| parse_u64(v, "fee"))
+			.transpose()?,
+		inputs: sub_args.values_of("input").map(|vs| {
+			vs.map(|s| s.to_owned()).collect()
+		}),
+		outputs: sub_args.values_of("output").map(|vs| {
+			vs.map(|s| s.to_owned()).collect()
+		}),
+		reason: sub_args.value_of("reason").map(|s| s.to_owned()),
+		delete: sub_args.is_present("delete"),
+		label: sub_args.value_of("label").map(|s| s.to_owned()),
+		commit_hex: sub_args.value_of("commit").map(|s| s.to_owned()),
+		proof: sub_args.value_of("proof").map(|s| s.to_owned()),
+		height: sub_args
+			.value_of("height")
+			.map(|v| parse_u64(v, "height"))
+			.transpose()?,
+		register: sub_args.is_present("register"),
+		start_index: sub_args
+			.value_of("start_index")
+			.map(|v| parse_u64(v, "start-index"))
+			.transpose()?,
+		end_index: sub_args
+			.value_of("end_index")
+			.map(|v| parse_u64(v, "end-index"))
+			.transpose()?,
+		max_outputs: sub_args
+			.value_of("max")
+			.map(|v| parse_u64(v, "max"))
+			.transpose()?,
+		amount: sub_args
+			.value_of("amount")
+			.map(|v| parse_u64(v, "amount"))
+			.transpose()?,
+		min_confirmations: sub_args
+			.value_of("min_confirmations")
+			.map(|v| parse_u64(v, "min-confirmations"))
+			.transpose()?,
+		target_ceremony_id: sub_args
+			.value_of("target_ceremony")
+			.map(|s| s.to_owned()),
+	})
+}
+
 pub fn wallet_command<C, F>(
 	wallet_args: &ArgMatches,
 	mut wallet_config: WalletConfig,
@@ -1277,6 +1386,10 @@ where
 		("verify_proof", Some(args)) => {
 			let a = arg_parse!(parse_verify_proof_args(&args));
 			command::proof_verify(owner_api, km, a)
+		}
+		("multisig", Some(args)) => {
+			let a = arg_parse!(parse_multisig_args(&args));
+			command::multisig(owner_api, km, a)
 		}
 		("address", Some(_)) => command::address(owner_api, &global_wallet_args, km),
 		("scan", Some(args)) => {

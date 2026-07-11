@@ -28,6 +28,11 @@ use crate::impls::SlateSender as _;
 use crate::keychain::{Identifier, Keychain};
 use crate::libwallet::api_impl::owner_updater::{start_updater_log_thread, StatusMessage};
 use crate::libwallet::api_impl::{owner, owner_updater};
+use crate::libwallet::multisig::{
+	self, CeremonySummary, CoinId, MultisigDemoTxResult, MultisigSessionApplyResult,
+	MultisigSessionStartResult, MultisigUtxo, MultisigUtxoStatus, MultisigWalletState,
+	RecognizedMultisigOutput, SessionStatus,
+};
 use crate::libwallet::{
 	AcctPathMapping, BuiltOutput, Error, InitTxArgs, IssueInvoiceTxArgs, NodeClient,
 	NodeHeightResult, OutputCommitMapping, PaymentProof, Slate, Slatepack, SlatepackAddress,
@@ -2487,6 +2492,591 @@ where
 			commitment,
 			lock_output,
 			self.doctest_mode,
+		)
+	}
+
+	// -----------------------------------------------------------------------
+	// Multisig (experimental) Owner API
+	// -----------------------------------------------------------------------
+
+	/// List completed multisig ceremonies stored in this wallet.
+	pub fn multisig_list(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+	) -> Result<Vec<CeremonySummary>, Error> {
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::list_ceremonies(&mut **w, keychain_mask)
+	}
+
+	/// Initialize a local-sim M-of-N ceremony and store this actor's state.
+	///
+	/// Development only — all actors simulated in-process; only `my_index` is saved.
+	pub fn multisig_init_local_sim(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		threshold: u32,
+		total: u32,
+		my_index: u32,
+		shares_per_actor: Option<u32>,
+	) -> Result<String, Error> {
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		let spa = shares_per_actor.map(|s| s as usize);
+		let st = multisig::init_local_sim(
+			&mut **w,
+			keychain_mask,
+			threshold as usize,
+			total as usize,
+			my_index as usize,
+			spa,
+		)?;
+		Ok(st.config.ceremony_id.0.to_string())
+	}
+
+	/// Load full multisig wallet state by ceremony UUID string.
+	pub fn multisig_get(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+	) -> Result<MultisigWalletState, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::get_state(&mut **w, keychain_mask, &multisig::CeremonyId(uuid))
+	}
+
+	/// Delete a stored multisig ceremony.
+	pub fn multisig_delete(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+	) -> Result<(), Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::delete_ceremony(&mut **w, keychain_mask, &multisig::CeremonyId(uuid))
+	}
+
+	/// In-process E2E demo: DKG → fund → spend (multiparty RP + kernel).
+	///
+	/// Returns a summary including `tx_hex` for inspection / optional post.
+	///
+	/// **Development / inspection only.** This simulates an entire quorum in
+	/// one process using throwaway keys; the resulting `tx_hex` spends coins
+	/// that do not exist on-chain. It does **not** mutate the wallet's chain
+	/// configuration (see C-01) and runs under the host's already-configured
+	/// chain type.
+	pub fn multisig_demo_tx(
+		&self,
+		threshold: u32,
+		total: u32,
+		fee: u32,
+	) -> Result<MultisigDemoTxResult, Error> {
+		let _ = self.wallet_inst.lock();
+		multisig::run_demo_tx(threshold as usize, total as usize, fee as u64)
+	}
+
+	/// Post a hex-encoded multisig transaction to the connected node.
+	pub fn multisig_post_tx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		tx_hex: String,
+		fluff: bool,
+	) -> Result<(), Error> {
+		let client = {
+			let mut w_lock = self.wallet_inst.lock();
+			let w = w_lock.lc_provider()?.wallet_inst()?;
+			let _ = w.keychain(keychain_mask)?;
+			w.w2n_client().clone()
+		};
+		let tx = multisig::tx_from_hex(&tx_hex)?;
+		owner::post_tx(&client, &tx, fluff)
+	}
+
+	// -----------------------------------------------------------------------
+	// Multisig sessions (WS4 negotiator) — experimental
+	// -----------------------------------------------------------------------
+
+	fn multisig_wallet_data_dir(&self) -> Result<String, Error> {
+		let tld = self.get_top_level_directory()?;
+		Ok(multisig::wallet_data_dir(&tld).display().to_string())
+	}
+
+	/// List durable multiparty sessions sealed on disk.
+	pub fn multisig_session_list(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+	) -> Result<Vec<SessionStatus>, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_list(&mut **w, keychain_mask, &wdata)
+	}
+
+	/// Status of one sealed session (session_id as hex).
+	pub fn multisig_session_status(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+	) -> Result<SessionStatus, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_status(&mut **w, keychain_mask, &wdata, &session_id_hex)
+	}
+
+	/// Start a CreateOutput session; returns status + first envelope JSON.
+	pub fn multisig_session_create_output(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_create_output_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&multisig::CeremonyId(uuid),
+			coin_number,
+			coin_value,
+			&session_tag,
+			None,
+		)
+	}
+
+	/// Start a Spend session; inputs/outputs as `[[number, value], ...]`.
+	pub fn multisig_session_create_spend(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let inputs: Vec<CoinId> = inputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let outputs: Vec<CoinId> = outputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_create_spend_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&multisig::CeremonyId(uuid),
+			inputs,
+			outputs,
+			fee,
+			&session_tag,
+			None,
+		)
+	}
+
+	/// Apply a peer envelope JSON string to a session.
+	pub fn multisig_session_apply(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		peer_envelope_json: String,
+	) -> Result<MultisigSessionApplyResult, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_apply_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&session_id_hex,
+			&peer_envelope_json,
+		)
+	}
+
+	/// Abort a session (wipe secrets); optionally delete the sealed file.
+	pub fn multisig_session_abort(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		reason: String,
+		delete_file: bool,
+	) -> Result<SessionStatus, Error> {
+		let wdata = self.multisig_wallet_data_dir()?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_abort(
+			&mut **w,
+			keychain_mask,
+			&wdata,
+			&session_id_hex,
+			&reason,
+			delete_file,
+		)
+	}
+
+	// -----------------------------------------------------------------------
+	// Multisig UTXO tracking (WS6) — experimental
+	// -----------------------------------------------------------------------
+
+	/// List tracked multisig UTXOs (optional ceremony UUID filter).
+	pub fn multisig_list_utxos(
+		&self,
+		_keychain_mask: Option<&SecretKey>,
+		ceremony_id: Option<String>,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		let cid = match ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::list_utxos(&mut **w, cid.as_ref())
+	}
+
+	/// Allocate next coin number (Reserved) for a ceremony.
+	pub fn multisig_allocate_coin(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		value: u64,
+		label: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::allocate_coin(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			value,
+			label,
+		)
+	}
+
+	/// Register a created multisig output.
+	pub fn multisig_register_utxo(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		proof_hex: Option<String>,
+		session_id_hex: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let proof = match proof_hex {
+			Some(h) => Some(
+				multisig::messages::proof_from_hex(&h)
+					.map_err(|e| Error::GenericError(format!("{}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::register_utxo(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			CoinId::new(coin_number, coin_value),
+			proof.as_ref(),
+			session_id_hex,
+			MultisigUtxoStatus::Unconfirmed,
+		)
+	}
+
+	/// Rewind-recognize a chain output; optionally register as Unspent.
+	pub fn multisig_recognize_utxo(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		commit_hex: String,
+		proof_hex: String,
+		height: u64,
+		register: bool,
+	) -> Result<Option<RecognizedMultisigOutput>, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::recognize_and_register(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			&commit_hex,
+			&proof_hex,
+			height,
+			register,
+		)
+	}
+
+	/// Scan the node UTXO PMMR for outputs belonging to a ceremony (shared-nonce
+	/// rewind). Recognized outputs are registered/updated as Unspent.
+	pub fn multisig_scan_utxos(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		start_index: u64,
+		end_index: Option<u64>,
+		max_outputs: u64,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::scan_ceremony_utxos(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			start_index,
+			end_index,
+			max_outputs,
+		)
+	}
+
+	/// Light refresh of tracked multisig UTXOs against the node UTXO set.
+	pub fn multisig_refresh_utxos(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: Option<String>,
+	) -> Result<multisig::MultisigRefreshResult, Error> {
+		let cid = match ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::refresh_multisig_utxos(&mut **w, keychain_mask, cid.as_ref())
+	}
+
+	/// Select spendable multisig UTXOs for a target amount (greedy).
+	pub fn multisig_select_utxos(
+		&self,
+		_keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		amount: u64,
+		current_height: u64,
+		min_confirmations: u64,
+	) -> Result<(Vec<MultisigUtxo>, u64), Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::select_spendable_utxos(
+			&mut **w,
+			&multisig::CeremonyId(uuid),
+			amount,
+			current_height,
+			min_confirmations,
+		)
+	}
+
+	/// Plan an epoch sweep of Unspent coins from an old ceremony.
+	pub fn multisig_plan_epoch_sweep(
+		&self,
+		_keychain_mask: Option<&SecretKey>,
+		source_ceremony_id: String,
+		target_ceremony_id: Option<String>,
+	) -> Result<multisig::EpochSweepPlan, Error> {
+		let src = Uuid::parse_str(&source_ceremony_id)
+			.map(multisig::CeremonyId)
+			.map_err(|e| Error::GenericError(format!("bad source ceremony id: {}", e)))?;
+		let tgt = match target_ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad target ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::plan_epoch_sweep(&mut **w, &src, tgt.as_ref())
+	}
+
+	/// Abort open sessions past their deadline and unlock locked UTXOs.
+	pub fn multisig_expire_sessions(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+	) -> Result<Vec<SessionStatus>, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::expire_stale_sessions(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+		)
+	}
+
+	/// Assemble a postable tx hex from a completed Spend session + tracked proofs.
+	pub fn multisig_assemble_tx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+	) -> Result<String, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::assemble_tx_from_spend_session(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&session_id_hex,
+		)
+	}
+
+	/// Start a MultiTx session (RP each output then FROST kernel).
+	pub fn multisig_session_create_multitx(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+		quorum_indices: Option<Vec<usize>>,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let inputs: Vec<CoinId> = inputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let outputs: Vec<CoinId> = outputs
+			.into_iter()
+			.map(|(n, v)| CoinId::new(n, v))
+			.collect();
+		let qi = quorum_indices.as_ref().map(|v| v.as_slice());
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_create_multitx_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&multisig::CeremonyId(uuid),
+			inputs,
+			outputs,
+			fee,
+			&session_tag,
+			qi,
+		)
+	}
+
+	/// Start a durable DKG session (index or address roster; experimental).
+	pub fn multisig_session_dkg_create(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		threshold: usize,
+		total: usize,
+		my_index: usize,
+		shares_per_actor: Option<usize>,
+		ceremony_id: Option<String>,
+		session_tag: String,
+		addresses: Option<Vec<String>>,
+	) -> Result<MultisigSessionStartResult, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let cid = match ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let sign_key = if addresses.is_some() {
+			Some(self.get_slatepack_secret_key(keychain_mask, 0)?)
+		} else {
+			None
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_dkg_create_raw(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			threshold,
+			total,
+			my_index,
+			shares_per_actor,
+			cid,
+			&session_tag,
+			addresses,
+			sign_key.as_ref(),
+		)
+	}
+
+	/// Export age-encrypted DKG partial shares for a session (address roster).
+	pub fn multisig_session_dkg_export_shares(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		out_dir: String,
+	) -> Result<Vec<String>, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let sender = self.get_slatepack_address(keychain_mask, 0)?;
+		let sign_key = self.get_slatepack_secret_key(keychain_mask, 0)?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_dkg_export_shares_armored(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&session_id_hex,
+			&sender,
+			&sign_key,
+			&out_dir,
+		)
+	}
+
+	/// Finalize a completed DKG session into LMDB ceremony state.
+	pub fn multisig_session_dkg_finalize(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		session_id_hex: String,
+		delete_session_file: bool,
+	) -> Result<MultisigWalletState, Error> {
+		let tld = self.get_top_level_directory()?;
+		let wdata = multisig::wallet_data_dir(&tld);
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::session_dkg_finalize(
+			&mut **w,
+			keychain_mask,
+			&wdata.display().to_string(),
+			&session_id_hex,
+			delete_session_file,
 		)
 	}
 }

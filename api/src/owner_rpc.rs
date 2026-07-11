@@ -21,6 +21,11 @@ use crate::config::{TorConfig, WalletConfig};
 use crate::core::core::OutputFeatures;
 use crate::core::global;
 use crate::keychain::{Identifier, Keychain};
+use crate::libwallet::multisig::{
+	CeremonySummary, EpochSweepPlan, MultisigDemoTxResult, MultisigRefreshResult,
+	MultisigSessionApplyResult, MultisigSessionStartResult, MultisigUtxo, RecognizedMultisigOutput,
+	SessionStatus,
+};
 use crate::libwallet::{
 	mwixnet::MixnetReqCreationParams, AcctPathMapping, Amount, BuiltOutput, Error, InitTxArgs,
 	IssueInvoiceTxArgs, NodeClient, NodeHeightResult, OutputCommitMapping, PaymentProof, Slate,
@@ -2022,6 +2027,210 @@ pub trait OwnerRpc {
 		lock_output: bool,
 		server_keys: Vec<String>,
 	) -> Result<SwapReq, Error>;
+
+	/// Experimental: list stored multisig ceremonies.
+	fn multisig_list(&self, token: Token) -> Result<Vec<CeremonySummary>, Error>;
+
+	/// Experimental: local-sim M-of-N init; returns ceremony UUID string.
+	fn multisig_init_local_sim(
+		&self,
+		token: Token,
+		threshold: u32,
+		total: u32,
+		my_index: u32,
+		shares_per_actor: Option<u32>,
+	) -> Result<String, Error>;
+
+	/// Experimental: delete a stored ceremony by UUID string.
+	fn multisig_delete(&self, token: Token, ceremony_id: String) -> Result<(), Error>;
+
+	/// Experimental: in-process E2E DKG→fund→spend demo.
+	fn multisig_demo_tx(
+		&self,
+		threshold: u32,
+		total: u32,
+		fee: u32,
+	) -> Result<MultisigDemoTxResult, Error>;
+
+	/// Experimental: post hex-encoded multisig transaction to the node.
+	fn multisig_post_tx(
+		&self,
+		token: Token,
+		tx_hex: String,
+		fluff: bool,
+	) -> Result<(), Error>;
+
+	/// Experimental: list durable multiparty sessions (WS4).
+	fn multisig_session_list(&self, token: Token) -> Result<Vec<SessionStatus>, Error>;
+
+	/// Experimental: status of one sealed session (session id hex).
+	fn multisig_session_status(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<SessionStatus, Error>;
+
+	/// Experimental: start CreateOutput session; returns status + first envelope JSON.
+	fn multisig_session_create_output(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: start Spend session. `inputs`/`outputs` are `[[number,value],...]`.
+	fn multisig_session_create_spend(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: apply peer envelope JSON to a session.
+	fn multisig_session_apply(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		peer_envelope_json: String,
+	) -> Result<MultisigSessionApplyResult, Error>;
+
+	/// Experimental: abort a session and wipe secrets.
+	fn multisig_session_abort(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		reason: String,
+		delete_file: bool,
+	) -> Result<SessionStatus, Error>;
+
+	/// Experimental: list tracked multisig UTXOs (WS6).
+	fn multisig_list_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<Vec<MultisigUtxo>, Error>;
+
+	/// Experimental: allocate next coin number (Reserved).
+	fn multisig_allocate_coin(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		value: u64,
+		label: Option<String>,
+	) -> Result<MultisigUtxo, Error>;
+
+	/// Experimental: register a created multisig output.
+	fn multisig_register_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		proof_hex: Option<String>,
+		session_id_hex: Option<String>,
+	) -> Result<MultisigUtxo, Error>;
+
+	/// Experimental: rewind-recognize a chain output; optional register.
+	fn multisig_recognize_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		commit_hex: String,
+		proof_hex: String,
+		height: u64,
+		register: bool,
+	) -> Result<Option<RecognizedMultisigOutput>, Error>;
+
+	/// Experimental: scan node PMMR for multisig outputs of a ceremony (WS6).
+	fn multisig_scan_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		start_index: u64,
+		end_index: Option<u64>,
+		max_outputs: u64,
+	) -> Result<Vec<MultisigUtxo>, Error>;
+
+	/// Experimental: light refresh of tracked multisig UTXOs vs node UTXO set.
+	fn multisig_refresh_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<MultisigRefreshResult, Error>;
+
+	/// Experimental: greedy select spendable multisig UTXOs for an amount.
+	fn multisig_select_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		amount: u64,
+		current_height: u64,
+		min_confirmations: u64,
+	) -> Result<(Vec<MultisigUtxo>, u64), Error>;
+
+	/// Experimental: plan epoch sweep from an old ceremony's Unspent coins.
+	fn multisig_plan_epoch_sweep(
+		&self,
+		token: Token,
+		source_ceremony_id: String,
+		target_ceremony_id: Option<String>,
+	) -> Result<EpochSweepPlan, Error>;
+
+	/// Experimental: abort sessions past their deadline.
+	fn multisig_expire_sessions(&self, token: Token) -> Result<Vec<SessionStatus>, Error>;
+
+	/// Experimental: assemble postable tx hex from a completed Spend session.
+	fn multisig_assemble_tx(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<String, Error>;
+
+	/// Experimental: start MultiTx (rangeproofs then FROST kernel).
+	fn multisig_session_create_multitx(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+		quorum_indices: Option<Vec<usize>>,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: start durable DKG session (index or address roster).
+	fn multisig_session_dkg_create(
+		&self,
+		token: Token,
+		threshold: usize,
+		total: usize,
+		my_index: usize,
+		shares_per_actor: Option<usize>,
+		ceremony_id: Option<String>,
+		session_tag: String,
+		addresses: Option<Vec<String>>,
+	) -> Result<MultisigSessionStartResult, Error>;
+
+	/// Experimental: export age-encrypted DKG partial shares for a session.
+	fn multisig_session_dkg_export_shares(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		out_dir: String,
+	) -> Result<Vec<String>, Error>;
+
+	/// Experimental: finalize completed DKG session into LMDB.
+	fn multisig_session_dkg_finalize(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		delete_session_file: bool,
+	) -> Result<crate::libwallet::multisig::MultisigWalletState, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2467,6 +2676,338 @@ where
 			&req_params,
 			&commit,
 			lock_output,
+		)
+	}
+
+	fn multisig_list(&self, token: Token) -> Result<Vec<CeremonySummary>, Error> {
+		Owner::multisig_list(self, (&token.keychain_mask).as_ref())
+	}
+
+	fn multisig_init_local_sim(
+		&self,
+		token: Token,
+		threshold: u32,
+		total: u32,
+		my_index: u32,
+		shares_per_actor: Option<u32>,
+	) -> Result<String, Error> {
+		Owner::multisig_init_local_sim(
+			self,
+			(&token.keychain_mask).as_ref(),
+			threshold,
+			total,
+			my_index,
+			shares_per_actor,
+		)
+	}
+
+	fn multisig_delete(&self, token: Token, ceremony_id: String) -> Result<(), Error> {
+		Owner::multisig_delete(self, (&token.keychain_mask).as_ref(), ceremony_id)
+	}
+
+	fn multisig_demo_tx(
+		&self,
+		threshold: u32,
+		total: u32,
+		fee: u32,
+	) -> Result<MultisigDemoTxResult, Error> {
+		Owner::multisig_demo_tx(self, threshold, total, fee)
+	}
+
+	fn multisig_post_tx(
+		&self,
+		token: Token,
+		tx_hex: String,
+		fluff: bool,
+	) -> Result<(), Error> {
+		Owner::multisig_post_tx(self, (&token.keychain_mask).as_ref(), tx_hex, fluff)
+	}
+
+	fn multisig_session_list(&self, token: Token) -> Result<Vec<SessionStatus>, Error> {
+		Owner::multisig_session_list(self, (&token.keychain_mask).as_ref())
+	}
+
+	fn multisig_session_status(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<SessionStatus, Error> {
+		Owner::multisig_session_status(self, (&token.keychain_mask).as_ref(), session_id_hex)
+	}
+
+	fn multisig_session_create_output(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_create_output(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			coin_number,
+			coin_value,
+			session_tag,
+		)
+	}
+
+	fn multisig_session_create_spend(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_create_spend(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			inputs,
+			outputs,
+			fee,
+			session_tag,
+		)
+	}
+
+	fn multisig_session_apply(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		peer_envelope_json: String,
+	) -> Result<MultisigSessionApplyResult, Error> {
+		Owner::multisig_session_apply(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			peer_envelope_json,
+		)
+	}
+
+	fn multisig_session_abort(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		reason: String,
+		delete_file: bool,
+	) -> Result<SessionStatus, Error> {
+		Owner::multisig_session_abort(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			reason,
+			delete_file,
+		)
+	}
+
+	fn multisig_list_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		Owner::multisig_list_utxos(self, (&token.keychain_mask).as_ref(), ceremony_id)
+	}
+
+	fn multisig_allocate_coin(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		value: u64,
+		label: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		Owner::multisig_allocate_coin(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			value,
+			label,
+		)
+	}
+
+	fn multisig_register_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		proof_hex: Option<String>,
+		session_id_hex: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		Owner::multisig_register_utxo(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			coin_number,
+			coin_value,
+			proof_hex,
+			session_id_hex,
+		)
+	}
+
+	fn multisig_recognize_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		commit_hex: String,
+		proof_hex: String,
+		height: u64,
+		register: bool,
+	) -> Result<Option<RecognizedMultisigOutput>, Error> {
+		Owner::multisig_recognize_utxo(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			commit_hex,
+			proof_hex,
+			height,
+			register,
+		)
+	}
+
+	fn multisig_scan_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		start_index: u64,
+		end_index: Option<u64>,
+		max_outputs: u64,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		Owner::multisig_scan_utxos(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			start_index,
+			end_index,
+			max_outputs,
+		)
+	}
+
+	fn multisig_refresh_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<MultisigRefreshResult, Error> {
+		Owner::multisig_refresh_utxos(self, (&token.keychain_mask).as_ref(), ceremony_id)
+	}
+
+	fn multisig_select_utxos(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		amount: u64,
+		current_height: u64,
+		min_confirmations: u64,
+	) -> Result<(Vec<MultisigUtxo>, u64), Error> {
+		Owner::multisig_select_utxos(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			amount,
+			current_height,
+			min_confirmations,
+		)
+	}
+
+	fn multisig_plan_epoch_sweep(
+		&self,
+		token: Token,
+		source_ceremony_id: String,
+		target_ceremony_id: Option<String>,
+	) -> Result<EpochSweepPlan, Error> {
+		Owner::multisig_plan_epoch_sweep(
+			self,
+			(&token.keychain_mask).as_ref(),
+			source_ceremony_id,
+			target_ceremony_id,
+		)
+	}
+
+	fn multisig_expire_sessions(&self, token: Token) -> Result<Vec<SessionStatus>, Error> {
+		Owner::multisig_expire_sessions(self, (&token.keychain_mask).as_ref())
+	}
+
+	fn multisig_assemble_tx(
+		&self,
+		token: Token,
+		session_id_hex: String,
+	) -> Result<String, Error> {
+		Owner::multisig_assemble_tx(self, (&token.keychain_mask).as_ref(), session_id_hex)
+	}
+
+	fn multisig_session_create_multitx(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		inputs: Vec<(u64, u64)>,
+		outputs: Vec<(u64, u64)>,
+		fee: u64,
+		session_tag: String,
+		quorum_indices: Option<Vec<usize>>,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_create_multitx(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			inputs,
+			outputs,
+			fee,
+			session_tag,
+			quorum_indices,
+		)
+	}
+
+	fn multisig_session_dkg_create(
+		&self,
+		token: Token,
+		threshold: usize,
+		total: usize,
+		my_index: usize,
+		shares_per_actor: Option<usize>,
+		ceremony_id: Option<String>,
+		session_tag: String,
+		addresses: Option<Vec<String>>,
+	) -> Result<MultisigSessionStartResult, Error> {
+		Owner::multisig_session_dkg_create(
+			self,
+			(&token.keychain_mask).as_ref(),
+			threshold,
+			total,
+			my_index,
+			shares_per_actor,
+			ceremony_id,
+			session_tag,
+			addresses,
+		)
+	}
+
+	fn multisig_session_dkg_export_shares(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		out_dir: String,
+	) -> Result<Vec<String>, Error> {
+		Owner::multisig_session_dkg_export_shares(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			out_dir,
+		)
+	}
+
+	fn multisig_session_dkg_finalize(
+		&self,
+		token: Token,
+		session_id_hex: String,
+		delete_session_file: bool,
+	) -> Result<crate::libwallet::multisig::MultisigWalletState, Error> {
+		Owner::multisig_session_dkg_finalize(
+			self,
+			(&token.keychain_mask).as_ref(),
+			session_id_hex,
+			delete_session_file,
 		)
 	}
 }

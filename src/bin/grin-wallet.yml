@@ -48,6 +48,546 @@ subcommands:
             short: c
             long: create
             takes_value: true
+
+  - multisig:
+      about: "EXPERIMENTAL Multisig wallet (M-of-N threshold) - not for real funds"
+      subcommands:
+        - list:
+            about: List stored multisig ceremonies
+        - show:
+            about: Show details of a ceremony
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+        - delete:
+            about: Delete a stored ceremony from the wallet DB
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+        - init:
+            about: Initialize multisig (local-sim or multi-party DKG start)
+            args:
+              - threshold:
+                  help: Signature threshold M
+                  short: m
+                  long: threshold
+                  takes_value: true
+                  default_value: "2"
+              - total:
+                  help: Total actors N
+                  short: n
+                  long: total
+                  takes_value: true
+                  default_value: "3"
+              - index:
+                  help: This wallet actor index (0..N-1)
+                  long: index
+                  takes_value: true
+                  default_value: "0"
+              - shares:
+                  help: Shares per actor (raises poly degree)
+                  long: shares
+                  takes_value: true
+              - ceremony_id:
+                  help: Join an existing ceremony UUID (multi-party)
+                  long: ceremony-id
+                  takes_value: true
+              - addresses:
+                  help: "Comma-separated Slatepack addresses of all N actors, in roster order (enables encrypted share delivery; all parties must pass the same list)"
+                  long: addresses
+                  takes_value: true
+              - local_sim:
+                  help: Run full DKG locally and save this actor (dev only)
+                  long: local-sim
+                  takes_value: false
+              - out:
+                  help: Output path for contribution JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_contrib.json"
+        - pending:
+            about: Show pending multi-party DKG status
+        - clear-pending:
+            about: Discard pending multi-party DKG session
+        - import-contrib:
+            about: Import a peer DKG contribution JSON
+            args:
+              - file:
+                  help: Path to contribution envelope JSON
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - export-shares:
+            about: Export partial shares for other actors (after all contribs)
+            args:
+              - dir:
+                  help: Output directory
+                  short: d
+                  long: dir
+                  takes_value: true
+                  default_value: "msig_shares"
+        - import-share:
+            about: Import a partial share JSON addressed to this actor
+            args:
+              - file:
+                  help: Path to share envelope JSON
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - finalize:
+            about: Finalize DKG, verify shares, save ceremony to wallet DB
+        - export-state:
+            about: Export ceremony state JSON (SENSITIVE)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - out:
+                  help: Output file
+                  short: o
+                  long: out
+                  takes_value: true
+                  required: true
+        - import-state:
+            about: Import ceremony state JSON into wallet DB
+            args:
+              - file:
+                  help: Path to state JSON
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - demo-tx:
+            about: In-process E2E demo (DKG + fund + spend with multiparty RP/kernel)
+            args:
+              - threshold:
+                  help: Signature threshold M
+                  short: m
+                  long: threshold
+                  takes_value: true
+                  default_value: "2"
+              - total:
+                  help: Total actors N
+                  short: n
+                  long: total
+                  takes_value: true
+                  default_value: "2"
+              - out:
+                  help: Optional path to write tx hex for post-tx
+                  short: o
+                  long: out
+                  takes_value: true
+        - post-tx:
+            about: Post a hex-encoded multisig transaction to the node
+            args:
+              - file:
+                  help: Path to file containing transaction hex
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+        - session-list:
+            about: List durable multiparty sessions (WS4 negotiator)
+        - session-status:
+            about: Show status of a sealed session
+            args:
+              - session:
+                  help: Session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+        - session-create-output:
+            about: Start CreateOutput session (multiparty rangeproof); write first envelope
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - coin_number:
+                  help: Coin number
+                  long: coin-number
+                  takes_value: true
+                  required: true
+              - coin_value:
+                  help: Coin value (nanogrins)
+                  long: coin-value
+                  takes_value: true
+                  required: true
+              - session_tag:
+                  help: Shared session tag (all parties must use the same string)
+                  long: session-tag
+                  takes_value: true
+                  default_value: "create-output"
+              - out:
+                  help: Path for our first outbound envelope JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_sess_out.json"
+        - session-create-spend:
+            about: Start Spend session (FROST kernel); write first envelope
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - input:
+                  help: "Input coin as number:value (repeatable)"
+                  long: input
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - output:
+                  help: "Output coin as number:value (repeatable)"
+                  long: output
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - fee:
+                  help: Fee in nanogrins
+                  long: fee
+                  takes_value: true
+                  default_value: "1000000"
+              - session_tag:
+                  help: Shared session tag (all parties must use the same string)
+                  long: session-tag
+                  takes_value: true
+                  default_value: "spend"
+              - out:
+                  help: Path for our first outbound envelope JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_sess_out.json"
+        - session-create-multitx:
+            about: Start MultiTx (RP each output then FROST); write first envelope
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - input:
+                  help: "Input coin as number:value (repeatable)"
+                  long: input
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - output:
+                  help: "Output coin as number:value (repeatable)"
+                  long: output
+                  takes_value: true
+                  multiple: true
+                  required: true
+              - fee:
+                  help: Fee in nanogrins
+                  long: fee
+                  takes_value: true
+                  default_value: "1000000"
+              - session_tag:
+                  help: Shared session tag
+                  long: session-tag
+                  takes_value: true
+                  default_value: "multitx"
+              - out:
+                  help: Path for first outbound envelope JSON
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_sess_out.json"
+        - session-apply:
+            about: Apply a peer envelope to a session; write new outbound envelopes
+            args:
+              - session:
+                  help: Session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - file:
+                  help: Peer envelope JSON path
+                  short: i
+                  long: file
+                  takes_value: true
+                  required: true
+              - dir:
+                  help: Directory for outbound envelopes
+                  short: d
+                  long: dir
+                  takes_value: true
+                  default_value: "msig_sess_out"
+        - session-abort:
+            about: Abort a session and wipe local secrets
+            args:
+              - session:
+                  help: Session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - reason:
+                  help: Abort reason
+                  long: reason
+                  takes_value: true
+                  default_value: "user abort"
+              - delete:
+                  help: Delete sealed session file after abort
+                  long: delete
+                  takes_value: false
+        - list-utxos:
+            about: List tracked multisig UTXOs (WS6)
+            args:
+              - ceremony:
+                  help: Optional ceremony UUID filter
+                  short: c
+                  long: ceremony
+                  takes_value: true
+        - allocate-coin:
+            about: Reserve next coin number for a ceremony (value agreed by quorum)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - coin_value:
+                  help: Output value (nanogrins)
+                  long: coin-value
+                  takes_value: true
+                  required: true
+              - label:
+                  help: Optional label
+                  long: label
+                  takes_value: true
+        - register-utxo:
+            about: Register a created multisig output (after CreateOutput)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - coin_number:
+                  help: Coin number
+                  long: coin-number
+                  takes_value: true
+                  required: true
+              - coin_value:
+                  help: Coin value (nanogrins)
+                  long: coin-value
+                  takes_value: true
+                  required: true
+              - proof:
+                  help: Optional rangeproof hex file
+                  long: proof
+                  takes_value: true
+              - session:
+                  help: Optional creating session id hex
+                  long: session
+                  takes_value: true
+        - recognize-utxo:
+            about: Try rewind-recognize a chain output as multisig and optionally register
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - commit:
+                  help: Commitment hex (33-byte compressed)
+                  long: commit
+                  takes_value: true
+                  required: true
+              - proof:
+                  help: Path to file with rangeproof hex
+                  long: proof
+                  takes_value: true
+                  required: true
+              - height:
+                  help: Confirming block height
+                  long: height
+                  takes_value: true
+                  default_value: "0"
+              - register:
+                  help: Persist as Unspent if recognized
+                  long: register
+                  takes_value: false
+        - scan-utxos:
+            about: Scan node UTXO PMMR for outputs of a ceremony (shared-nonce rewind)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - start_index:
+                  help: Start PMMR index (default 1)
+                  long: start-index
+                  takes_value: true
+                  default_value: "1"
+              - end_index:
+                  help: Optional end PMMR index
+                  long: end-index
+                  takes_value: true
+              - max:
+                  help: Max outputs per batch (capped at 1000)
+                  long: max
+                  takes_value: true
+                  default_value: "1000"
+        - refresh-utxos:
+            about: Light refresh of tracked multisig UTXOs against the node UTXO set
+            args:
+              - ceremony:
+                  help: Optional ceremony UUID filter
+                  short: c
+                  long: ceremony
+                  takes_value: true
+        - select-utxos:
+            about: Greedy select spendable multisig UTXOs for an amount
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - amount:
+                  help: Target amount (nanogrins)
+                  long: amount
+                  takes_value: true
+                  required: true
+              - min_confirmations:
+                  help: Minimum confirmations (default 1)
+                  long: min-confirmations
+                  takes_value: true
+                  default_value: "1"
+        - plan-epoch-sweep:
+            about: List Unspent coins to migrate from an old ceremony (re-DKG plan)
+            args:
+              - ceremony:
+                  help: Source (old) ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - target_ceremony:
+                  help: Optional target (new) ceremony UUID
+                  long: target-ceremony
+                  takes_value: true
+        - expire-sessions:
+            about: Abort open multisig sessions past their deadline and unlock UTXOs
+        - assemble-tx:
+            about: Assemble postable tx hex from a completed Spend session + UTXO proofs
+            args:
+              - session:
+                  help: Completed spend session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - out:
+                  help: Output path for transaction hex
+                  short: o
+                  long: out
+                  takes_value: true
+        - session-dkg-create:
+            about: Start durable DKG session (index or address roster); write contribution
+            args:
+              - threshold:
+                  help: Threshold M
+                  short: t
+                  long: threshold
+                  takes_value: true
+                  required: true
+              - total:
+                  help: Total actors N
+                  short: n
+                  long: total
+                  takes_value: true
+                  required: true
+              - index:
+                  help: This actor index 0..N-1
+                  short: i
+                  long: index
+                  takes_value: true
+                  required: true
+              - shares:
+                  help: Shares per actor (default recommended)
+                  long: shares
+                  takes_value: true
+              - ceremony:
+                  help: Optional ceremony UUID (default random)
+                  short: c
+                  long: ceremony
+                  takes_value: true
+              - session_tag:
+                  help: Shared session tag (all parties must match)
+                  long: session-tag
+                  takes_value: true
+                  default_value: "dkg"
+              - addresses:
+                  help: Comma-separated ordered Slatepack addresses (all N actors)
+                  long: addresses
+                  takes_value: true
+              - out:
+                  help: Contribution envelope path
+                  short: o
+                  long: out
+                  takes_value: true
+                  default_value: "msig_dkg_contrib.json"
+        - session-dkg-export-shares:
+            about: Export age-encrypted DKG partial shares (address roster, C-02)
+            args:
+              - session:
+                  help: DKG session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - dir:
+                  help: Output directory for share slatepacks
+                  short: d
+                  long: dir
+                  takes_value: true
+                  default_value: "msig_dkg_shares"
+        - session-dkg-finalize:
+            about: Finalize completed DKG session into wallet LMDB
+            args:
+              - session:
+                  help: DKG session id (hex)
+                  long: session
+                  short: s
+                  takes_value: true
+                  required: true
+              - delete:
+                  help: Delete sealed session file after finalize
+                  long: delete
+                  takes_value: false
+
   - rewind_hash:
       about: Return the hash of the wallet root public key.
   - scan_rewind_hash:
