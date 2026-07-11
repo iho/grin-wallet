@@ -23,7 +23,7 @@ use crate::core::global;
 use crate::keychain::{Identifier, Keychain};
 use crate::libwallet::multisig::{
 	CeremonySummary, MultisigDemoTxResult, MultisigSessionApplyResult, MultisigSessionStartResult,
-	SessionStatus,
+	MultisigUtxo, RecognizedMultisigOutput, SessionStatus,
 };
 use crate::libwallet::{
 	mwixnet::MixnetReqCreationParams, AcctPathMapping, Amount, BuiltOutput, Error, InitTxArgs,
@@ -2106,6 +2106,44 @@ pub trait OwnerRpc {
 		reason: String,
 		delete_file: bool,
 	) -> Result<SessionStatus, Error>;
+
+	/// Experimental: list tracked multisig UTXOs (WS6).
+	fn multisig_list_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<Vec<MultisigUtxo>, Error>;
+
+	/// Experimental: allocate next coin number (Reserved).
+	fn multisig_allocate_coin(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		value: u64,
+		label: Option<String>,
+	) -> Result<MultisigUtxo, Error>;
+
+	/// Experimental: register a created multisig output.
+	fn multisig_register_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		proof_hex: Option<String>,
+		session_id_hex: Option<String>,
+	) -> Result<MultisigUtxo, Error>;
+
+	/// Experimental: rewind-recognize a chain output; optional register.
+	fn multisig_recognize_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		commit_hex: String,
+		proof_hex: String,
+		height: u64,
+		register: bool,
+	) -> Result<Option<RecognizedMultisigOutput>, Error>;
 }
 
 impl<L, C, K> OwnerRpc for Owner<L, C, K>
@@ -2675,6 +2713,70 @@ where
 			session_id_hex,
 			reason,
 			delete_file,
+		)
+	}
+
+	fn multisig_list_utxos(
+		&self,
+		token: Token,
+		ceremony_id: Option<String>,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		Owner::multisig_list_utxos(self, (&token.keychain_mask).as_ref(), ceremony_id)
+	}
+
+	fn multisig_allocate_coin(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		value: u64,
+		label: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		Owner::multisig_allocate_coin(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			value,
+			label,
+		)
+	}
+
+	fn multisig_register_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		proof_hex: Option<String>,
+		session_id_hex: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		Owner::multisig_register_utxo(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			coin_number,
+			coin_value,
+			proof_hex,
+			session_id_hex,
+		)
+	}
+
+	fn multisig_recognize_utxo(
+		&self,
+		token: Token,
+		ceremony_id: String,
+		commit_hex: String,
+		proof_hex: String,
+		height: u64,
+		register: bool,
+	) -> Result<Option<RecognizedMultisigOutput>, Error> {
+		Owner::multisig_recognize_utxo(
+			self,
+			(&token.keychain_mask).as_ref(),
+			ceremony_id,
+			commit_hex,
+			proof_hex,
+			height,
+			register,
 		)
 	}
 }

@@ -31,9 +31,9 @@ use crate::store::{self, option_to_not_found, to_key, to_key_u64};
 use crate::core::core::Transaction;
 use crate::core::ser;
 use crate::libwallet::multisig::{
-	decrypt_from_storage, encrypt_for_storage, multisig_db_key, CeremonyId, EncryptedMultisigState,
-	MultisigWalletState,
-	MULTISIG_PREFIX,
+	decrypt_from_storage, encrypt_for_storage, multisig_coin_meta_db_key, multisig_db_key,
+	multisig_utxo_db_key, CeremonyId, CoinNumberMeta, EncryptedMultisigState, MultisigUtxo,
+	MultisigWalletState, MULTISIG_PREFIX, MULTISIG_UTXO_PREFIX,
 };
 use crate::libwallet::{
 	AcctPathMapping, Context, Error, NodeClient, OutputData, ScannedBlockInfo, TxLogEntry,
@@ -543,6 +543,53 @@ where
 		}
 		Ok(ids)
 	}
+
+	fn get_multisig_utxo(
+		&self,
+		ceremony_id: &CeremonyId,
+		coin_number: u64,
+	) -> Result<MultisigUtxo, Error> {
+		let key = multisig_utxo_db_key(ceremony_id, coin_number);
+		option_to_not_found(self.db.get_ser(&key, None), || {
+			format!("Multisig UTXO: {} #{}", ceremony_id.0, coin_number)
+		})
+		.map_err(|e| e.into())
+	}
+
+	fn list_multisig_utxos(
+		&self,
+		ceremony_id: Option<&CeremonyId>,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		let prefix_iter = self.db.iter(&[MULTISIG_UTXO_PREFIX], move |k, _v| {
+			Ok(k.to_vec())
+		});
+		let mut out = Vec::new();
+		for k in prefix_iter.expect("multisig utxo key iter").into_iter() {
+			if let Some(cid) = ceremony_id {
+				if k.len() < 17 || &k[1..17] != cid.0.as_bytes() {
+					continue;
+				}
+			}
+			if let Some(u) = self.db.get_ser::<MultisigUtxo>(&k, None)? {
+				out.push(u);
+			}
+		}
+		out.sort_by(|a, b| {
+			a.ceremony_id
+				.0
+				.cmp(&b.ceremony_id.0)
+				.then(a.coin.number.cmp(&b.coin.number))
+		});
+		Ok(out)
+	}
+
+	fn get_multisig_coin_meta(&self, ceremony_id: &CeremonyId) -> Result<CoinNumberMeta, Error> {
+		let key = multisig_coin_meta_db_key(ceremony_id);
+		match self.db.get_ser(&key, None)? {
+			Some(m) => Ok(m),
+			None => Ok(CoinNumberMeta::default()),
+		}
+	}
 }
 
 /// An atomic batch in which all changes can be committed all at once or
@@ -826,6 +873,44 @@ where
 			.unwrap()
 			.delete(&key)
 			.map_err(|e| e.into())
+	}
+
+	fn save_multisig_utxo(&mut self, utxo: &MultisigUtxo) -> Result<(), Error> {
+		let key = multisig_utxo_db_key(&utxo.ceremony_id, utxo.coin.number);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&key, utxo)?;
+		Ok(())
+	}
+
+	fn delete_multisig_utxo(
+		&mut self,
+		ceremony_id: &CeremonyId,
+		coin_number: u64,
+	) -> Result<(), Error> {
+		let key = multisig_utxo_db_key(ceremony_id, coin_number);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.delete(&key)
+			.map_err(|e| e.into())
+	}
+
+	fn save_multisig_coin_meta(
+		&mut self,
+		ceremony_id: &CeremonyId,
+		meta: &CoinNumberMeta,
+	) -> Result<(), Error> {
+		let key = multisig_coin_meta_db_key(ceremony_id);
+		self.db
+			.borrow()
+			.as_ref()
+			.unwrap()
+			.put_ser(&key, meta)?;
+		Ok(())
 	}
 
 	fn commit(&self) -> Result<(), Error> {

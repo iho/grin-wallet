@@ -276,14 +276,13 @@ Negotiator
 3. Size/count caps before parse (C-12); fuzz the parser (`cargo-fuzz` target for `MultisigEnvelope`).
 4. Freeze the v1 format (keep JSON if frozen and fuzzed, or move to binary ser like the rest of Grin — decide once, in WS1).
 
-### WS6 — Wallet & API integration (6–12 weeks)
+### WS6 — Wallet & API integration (6–12 weeks) — **UTXO foundation landed**
 
-1. **Remove C-01 immediately** (first PR of the effort): no `set_local_chain_type` outside tests; `multisig_demo_tx` behind a dev feature.
-2. Multisig UTXO tracking: new wallet DB records (commit, coin number, value, epoch, status, confirming height, proof); update from chain scan using the shared-nonce rewind path already proven in `rangeproof.rs::rewind_rangeproof`.
-3. Coin-number allocator: proposer picks `max(known)+1`, quorum **confirms** inside the signed session transcript; reorg handling = coin identity is (number, value), commitment recomputable, never reuse a number across concurrent sessions (persist reservations).
-4. Send/receive against external parties: nest the quorum MPC inside the standard sender/receiver slate flow (`[Alice actors MPC] ↔ slatepack ↔ [Bob actors MPC]`); payjoin support per RFC §10.
-5. Epoch rotation: re-DKG under new roster + sweep command that spends all old-epoch UTXOs to new-epoch coins.
-6. CLI/Owner API: replace demo commands with session lifecycle (`create/advance/status/abort`), quorum status display, backup/restore commands.
+1. ✅ C-01 removed earlier.
+2. ✅ Multisig UTXO tracking: `MultisigUtxo` in LMDB (`U` prefix), status lifecycle, height/mmr fields; CLI `list-utxos` / `register-utxo` / `recognize-utxo`; Owner RPC counterparts.
+3. ✅ Coin-number allocator: high-water meta (`N` prefix) + `allocate_coin` → Reserved UTXO; next = max(known, high_water)+1.
+4. ✅ Recognition via shared-nonce rewind (`try_recognize_output`) without enumerating coin numbers.
+5. Residual: full chain scan loop hook into `owner_updater`; concurrent-session reservation locks in session transcript; send/receive nesting in standard slate flow; epoch rotation sweep.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 
@@ -310,7 +309,7 @@ Negotiator
 9. ✅ C-12 envelope DoS caps.
 
 **P1 — before mainnet flag:**
-10. WS6 UTXO tracking + coin allocator + rotation sweep.
+10. ✅ WS6 UTXO foundation (track/allocate/recognize). Residual: chain-scan hook + rotation sweep.
 11. ✅ C-08 AEAD state + Debug redaction (WS3 core); residual: restore drill runbook.
 12. WS5 residual: freeze wire format + fuzz `MultisigEnvelope` parser.
 13. External audit + malicious-peer suite + 30-day soak.

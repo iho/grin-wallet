@@ -1513,6 +1513,16 @@ pub struct MultisigArgs {
 	pub reason: Option<String>,
 	/// Delete session file after abort.
 	pub delete: bool,
+	/// Optional label (allocate-coin).
+	pub label: Option<String>,
+	/// Commitment hex (recognize-utxo).
+	pub commit_hex: Option<String>,
+	/// Proof hex file path or hex string.
+	pub proof: Option<String>,
+	/// Block height (recognize-utxo).
+	pub height: Option<u64>,
+	/// Register if recognized.
+	pub register: bool,
 }
 
 fn msig_wallet_data_dir<L, C, K>(owner_api: &Owner<L, C, K>) -> Result<String, Error>
@@ -2116,6 +2126,157 @@ where
 				println!("Session aborted: {:?}", st.phase);
 				if let Some(r) = st.abort_reason {
 					println!("  Reason: {}", r);
+				}
+				Ok(())
+			})?;
+		}
+		"list-utxos" => {
+			let ceremony = args.ceremony_id.as_ref().map(|c| {
+				Uuid::parse_str(c)
+					.map(|u| libwallet::multisig::CeremonyId(u))
+					.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))
+			});
+			let ceremony = match ceremony {
+				Some(Ok(c)) => Some(c),
+				Some(Err(e)) => return Err(e),
+				None => None,
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let list = libwallet::multisig::list_utxos(&mut **w, ceremony.as_ref())?;
+				if list.is_empty() {
+					println!("No multisig UTXOs tracked.");
+				} else {
+					println!(
+						"{:<38} {:>8} {:>16} {:<12} {:>8}",
+						"Ceremony", "Coin#", "Value", "Status", "Height"
+					);
+					println!("{}", "-".repeat(90));
+					for u in list {
+						println!(
+							"{:<38} {:>8} {:>16} {:<12} {:>8}",
+							u.ceremony_id.0,
+							u.coin.number,
+							u.coin.value,
+							format!("{:?}", u.status),
+							u.height
+						);
+					}
+				}
+				let _ = m;
+				Ok(())
+			})?;
+		}
+		"allocate-coin" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let value = args
+				.coin_value
+				.ok_or_else(|| Error::ArgumentError("--coin-value required".into()))?;
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let u = libwallet::multisig::allocate_coin(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					value,
+					args.label.clone(),
+				)?;
+				println!("Reserved coin #{} value={}", u.coin.number, u.coin.value);
+				println!("  Commit: {}", u.commit_hex);
+				println!("  Status: {:?}", u.status);
+				Ok(())
+			})?;
+		}
+		"register-utxo" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let number = args
+				.coin_number
+				.ok_or_else(|| Error::ArgumentError("--coin-number required".into()))?;
+			let value = args
+				.coin_value
+				.ok_or_else(|| Error::ArgumentError("--coin-value required".into()))?;
+			let proof = if let Some(p) = args.proof.as_ref() {
+				let s = std::fs::read_to_string(p)
+					.unwrap_or_else(|_| p.clone())
+					.trim()
+					.to_owned();
+				Some(
+					libwallet::multisig::messages::proof_from_hex(&s)
+						.map_err(|e| Error::LibWallet(e))?,
+				)
+			} else {
+				None
+			};
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let u = libwallet::multisig::register_utxo(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					libwallet::multisig::CoinId::new(number, value),
+					proof.as_ref(),
+					args.session_id.clone(),
+					libwallet::multisig::MultisigUtxoStatus::Unconfirmed,
+				)?;
+				println!(
+					"Registered UTXO coin #{} value={} status={:?}",
+					u.coin.number, u.coin.value, u.status
+				);
+				println!("  Commit: {}", u.commit_hex);
+				Ok(())
+			})?;
+		}
+		"recognize-utxo" => {
+			let ceremony = args
+				.ceremony_id
+				.ok_or_else(|| Error::ArgumentError("--ceremony required".into()))?;
+			let uuid = Uuid::parse_str(&ceremony)
+				.map_err(|e| Error::ArgumentError(format!("bad ceremony id: {}", e)))?;
+			let commit = args
+				.commit_hex
+				.ok_or_else(|| Error::ArgumentError("--commit required".into()))?;
+			let proof_path = args
+				.proof
+				.ok_or_else(|| Error::ArgumentError("--proof required".into()))?;
+			let proof_hex = std::fs::read_to_string(&proof_path)
+				.map_err(|e| Error::GenericError(format!("read proof: {}", e)))?
+				.trim()
+				.to_owned();
+			let height = args.height.unwrap_or(0);
+			controller::owner_single_use(None, keychain_mask, Some(owner_api), |api, m| {
+				let mut w_lock = api.wallet_inst.lock();
+				let w = w_lock.lc_provider()?.wallet_inst()?;
+				let rec = libwallet::multisig::recognize_and_register(
+					&mut **w,
+					m,
+					&libwallet::multisig::CeremonyId(uuid),
+					&commit,
+					&proof_hex,
+					height,
+					args.register,
+				)?;
+				match rec {
+					Some(r) => {
+						println!(
+							"Recognized multisig coin #{} value={}",
+							r.coin.number, r.coin.value
+						);
+						if args.register {
+							println!("  Registered as Unspent at height {}", height);
+						}
+					}
+					None => println!("Not recognized under this ceremony view key."),
 				}
 				Ok(())
 			})?;

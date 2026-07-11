@@ -1036,6 +1036,14 @@ pub fn parse_multisig_args(args: &ArgMatches) -> Result<command::MultisigArgs, P
 		}),
 		reason: sub_args.value_of("reason").map(|s| s.to_owned()),
 		delete: sub_args.is_present("delete"),
+		label: sub_args.value_of("label").map(|s| s.to_owned()),
+		commit_hex: sub_args.value_of("commit").map(|s| s.to_owned()),
+		proof: sub_args.value_of("proof").map(|s| s.to_owned()),
+		height: sub_args
+			.value_of("height")
+			.map(|v| parse_u64(v, "height"))
+			.transpose()?,
+		register: sub_args.is_present("register"),
 	})
 }
 

@@ -833,6 +833,209 @@ pub fn wallet_data_dir(top_level: &str) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// Multisig UTXO tracking (WS6)
+// ---------------------------------------------------------------------------
+
+use super::utxo::{
+	next_coin_number_from_list, try_recognize_output, utxo_from_create_output, verify_utxo_commit,
+	CoinNumberMeta, MultisigUtxo, MultisigUtxoStatus, RecognizedMultisigOutput,
+};
+use crate::grin_util::secp::pedersen::RangeProof;
+
+/// List tracked multisig UTXOs (optional ceremony filter).
+pub fn list_utxos<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	ceremony_id: Option<&CeremonyId>,
+) -> Result<Vec<MultisigUtxo>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	w.list_multisig_utxos(ceremony_id)
+}
+
+/// Allocate the next coin number for a ceremony and persist a Reserved UTXO row.
+///
+/// The commitment is the public derivation for `(number, value)` so peers can
+/// independently recompute it. Value must be agreed by the quorum before
+/// CreateOutput.
+pub fn allocate_coin<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	value: u64,
+	label: Option<String>,
+) -> Result<MultisigUtxo, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let existing = w.list_multisig_utxos(Some(ceremony_id))?;
+	let meta = w.get_multisig_coin_meta(ceremony_id)?;
+	let number = next_coin_number_from_list(&existing, meta.high_water);
+	let coin = CoinId::new(number, value);
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let commit =
+		super::rangeproof::coin_pedersen_commit_public(&secp, &state.config.public_poly, &coin)?;
+	let mut utxo = MultisigUtxo::new_unconfirmed(
+		ceremony_id.clone(),
+		coin,
+		&commit,
+		None,
+		None,
+	);
+	utxo.status = MultisigUtxoStatus::Reserved;
+	utxo.label = label;
+	let new_meta = CoinNumberMeta {
+		high_water: number,
+	};
+	{
+		let mut batch = w.batch(keychain_mask)?;
+		batch.save_multisig_utxo(&utxo)?;
+		batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+		batch.commit()?;
+	}
+	Ok(utxo)
+}
+
+/// Register (or update) a multisig UTXO after CreateOutput completes.
+pub fn register_utxo<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	coin: CoinId,
+	proof: Option<&RangeProof>,
+	session_id_hex: Option<String>,
+	status: MultisigUtxoStatus,
+) -> Result<MultisigUtxo, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let mut utxo = if let Some(p) = proof {
+		utxo_from_create_output(
+			&secp,
+			&state.config.public_poly,
+			ceremony_id.clone(),
+			coin,
+			p,
+			session_id_hex,
+		)?
+	} else {
+		let commit = super::rangeproof::coin_pedersen_commit_public(
+			&secp,
+			&state.config.public_poly,
+			&coin,
+		)?;
+		MultisigUtxo::new_unconfirmed(ceremony_id.clone(), coin, &commit, None, session_id_hex)
+	};
+	utxo.status = status;
+	verify_utxo_commit(&secp, &state.config.public_poly, &utxo)?;
+	// Bump high-water if needed.
+	let meta = w.get_multisig_coin_meta(ceremony_id)?;
+	let new_meta = CoinNumberMeta {
+		high_water: meta.high_water.max(utxo.coin.number),
+	};
+	{
+		let mut batch = w.batch(keychain_mask)?;
+		batch.save_multisig_utxo(&utxo)?;
+		batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+		batch.commit()?;
+	}
+	Ok(utxo)
+}
+
+/// Mark a UTXO status (e.g. Locked for spend, Spent after broadcast).
+pub fn set_utxo_status<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	coin_number: u64,
+	status: MultisigUtxoStatus,
+	height: Option<u64>,
+) -> Result<MultisigUtxo, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let mut utxo = w.get_multisig_utxo(ceremony_id, coin_number)?;
+	utxo.status = status;
+	if let Some(h) = height {
+		utxo.height = h;
+	}
+	let mut batch = w.batch(keychain_mask)?;
+	batch.save_multisig_utxo(&utxo)?;
+	batch.commit()?;
+	Ok(utxo)
+}
+
+/// Try to recognize a chain output (commit + proof hex) as a multisig UTXO
+/// for a ceremony, and optionally register it as Unspent at `height`.
+pub fn recognize_and_register<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	ceremony_id: &CeremonyId,
+	commit_hex: &str,
+	proof_hex: &str,
+	height: u64,
+	register: bool,
+) -> Result<Option<RecognizedMultisigOutput>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let state = get_state(w, keychain_mask, ceremony_id)?;
+	let secp = Secp256k1::with_caps(ContextFlag::Commit);
+	let commit_bytes = crate::grin_util::from_hex(commit_hex)
+		.map_err(|e| Error::Multisig(format!("commit hex: {}", e)))?;
+	if commit_bytes.len() != 33 {
+		return Err(Error::Multisig("commit must be 33 bytes".into()));
+	}
+	let mut ca = [0u8; 33];
+	ca.copy_from_slice(&commit_bytes);
+	let commit = crate::grin_util::secp::pedersen::Commitment(ca);
+	let proof = super::messages::proof_from_hex(proof_hex)?;
+	let rec = try_recognize_output(
+		&secp,
+		&state.config.public_poly,
+		commit,
+		proof,
+		None,
+	)?;
+	if let Some(ref r) = rec {
+		if register {
+			let proof2 = super::messages::proof_from_hex(proof_hex)?;
+			let mut utxo = MultisigUtxo::new_unconfirmed(
+				ceremony_id.clone(),
+				r.coin.clone(),
+				&r.commit,
+				Some(&proof2),
+				None,
+			);
+			utxo.status = MultisigUtxoStatus::Unspent;
+			utxo.height = height;
+			let meta = w.get_multisig_coin_meta(ceremony_id)?;
+			let new_meta = CoinNumberMeta {
+				high_water: meta.high_water.max(r.coin.number),
+			};
+			let mut batch = w.batch(keychain_mask)?;
+			batch.save_multisig_utxo(&utxo)?;
+			batch.save_multisig_coin_meta(ceremony_id, &new_meta)?;
+			batch.commit()?;
+		}
+	}
+	Ok(rec)
+}
+
+// ---------------------------------------------------------------------------
 // Session lifecycle (WS4 CLI / API surface)
 // ---------------------------------------------------------------------------
 

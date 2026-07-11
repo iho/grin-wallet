@@ -25,6 +25,7 @@ This is the first implementation slice of RFC-0023 style multisig:
 | E2E tx build (multiparty RP + kernel, validates) | |
 | Durable negotiator (CreateOutput + Spend, crash-resume) | |
 | Session CLI + Owner RPC (`multisig_session_*`) | Multi-process soak tests |
+| Multisig UTXO track/allocate/recognize (WS6) | Full chain-scan integration |
 | Unit / integration tests | |
 
 ## Design choices vs draft RFC
@@ -272,6 +273,19 @@ Owner JSON-RPC (experimental, token required):
 | `multisig_session_create_spend` | Start Spend; returns envelope JSON |
 | `multisig_session_apply` | Apply peer envelope JSON |
 | `multisig_session_abort` | Abort + wipe secrets |
+| `multisig_list_utxos` | Tracked multisig UTXOs |
+| `multisig_allocate_coin` | Reserve next coin number |
+| `multisig_register_utxo` | Register after CreateOutput |
+| `multisig_recognize_utxo` | Shared-nonce rewind + optional register |
+
+## Multisig UTXOs (WS6)
+
+```bash
+grin-wallet multisig allocate-coin -c <ceremony> --coin-value 1000000000
+grin-wallet multisig register-utxo -c <ceremony> --coin-number 1 --coin-value 1000000000
+grin-wallet multisig list-utxos -c <ceremony>
+grin-wallet multisig recognize-utxo -c <ceremony> --commit <hex> --proof proof.hex --height 100 --register
+```
 
 ## Next implementation steps
 

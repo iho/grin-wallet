@@ -317,6 +317,87 @@ subcommands:
                   help: Delete sealed session file after abort
                   long: delete
                   takes_value: false
+        - list-utxos:
+            about: List tracked multisig UTXOs (WS6)
+            args:
+              - ceremony:
+                  help: Optional ceremony UUID filter
+                  short: c
+                  long: ceremony
+                  takes_value: true
+        - allocate-coin:
+            about: Reserve next coin number for a ceremony (value agreed by quorum)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - coin_value:
+                  help: Output value (nanogrins)
+                  long: coin-value
+                  takes_value: true
+                  required: true
+              - label:
+                  help: Optional label
+                  long: label
+                  takes_value: true
+        - register-utxo:
+            about: Register a created multisig output (after CreateOutput)
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - coin_number:
+                  help: Coin number
+                  long: coin-number
+                  takes_value: true
+                  required: true
+              - coin_value:
+                  help: Coin value (nanogrins)
+                  long: coin-value
+                  takes_value: true
+                  required: true
+              - proof:
+                  help: Optional rangeproof hex file
+                  long: proof
+                  takes_value: true
+              - session:
+                  help: Optional creating session id hex
+                  long: session
+                  takes_value: true
+        - recognize-utxo:
+            about: Try rewind-recognize a chain output as multisig and optionally register
+            args:
+              - ceremony:
+                  help: Ceremony UUID
+                  short: c
+                  long: ceremony
+                  takes_value: true
+                  required: true
+              - commit:
+                  help: Commitment hex (33-byte compressed)
+                  long: commit
+                  takes_value: true
+                  required: true
+              - proof:
+                  help: Path to file with rangeproof hex
+                  long: proof
+                  takes_value: true
+                  required: true
+              - height:
+                  help: Confirming block height
+                  long: height
+                  takes_value: true
+                  default_value: "0"
+              - register:
+                  help: Persist as Unspent if recognized
+                  long: register
+                  takes_value: false
 
   - rewind_hash:
       about: Return the hash of the wallet root public key.

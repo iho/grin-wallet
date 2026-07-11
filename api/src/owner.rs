@@ -30,7 +30,8 @@ use crate::libwallet::api_impl::owner_updater::{start_updater_log_thread, Status
 use crate::libwallet::api_impl::{owner, owner_updater};
 use crate::libwallet::multisig::{
 	self, CeremonySummary, CoinId, MultisigDemoTxResult, MultisigSessionApplyResult,
-	MultisigSessionStartResult, MultisigWalletState, SessionStatus,
+	MultisigSessionStartResult, MultisigUtxo, MultisigUtxoStatus, MultisigWalletState,
+	RecognizedMultisigOutput, SessionStatus,
 };
 use crate::libwallet::{
 	AcctPathMapping, BuiltOutput, Error, InitTxArgs, IssueInvoiceTxArgs, NodeClient,
@@ -2726,6 +2727,107 @@ where
 			&session_id_hex,
 			&reason,
 			delete_file,
+		)
+	}
+
+	// -----------------------------------------------------------------------
+	// Multisig UTXO tracking (WS6) — experimental
+	// -----------------------------------------------------------------------
+
+	/// List tracked multisig UTXOs (optional ceremony UUID filter).
+	pub fn multisig_list_utxos(
+		&self,
+		_keychain_mask: Option<&SecretKey>,
+		ceremony_id: Option<String>,
+	) -> Result<Vec<MultisigUtxo>, Error> {
+		let cid = match ceremony_id {
+			Some(s) => Some(
+				Uuid::parse_str(&s)
+					.map(multisig::CeremonyId)
+					.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::list_utxos(&mut **w, cid.as_ref())
+	}
+
+	/// Allocate next coin number (Reserved) for a ceremony.
+	pub fn multisig_allocate_coin(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		value: u64,
+		label: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::allocate_coin(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			value,
+			label,
+		)
+	}
+
+	/// Register a created multisig output.
+	pub fn multisig_register_utxo(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		coin_number: u64,
+		coin_value: u64,
+		proof_hex: Option<String>,
+		session_id_hex: Option<String>,
+	) -> Result<MultisigUtxo, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let proof = match proof_hex {
+			Some(h) => Some(
+				multisig::messages::proof_from_hex(&h)
+					.map_err(|e| Error::GenericError(format!("{}", e)))?,
+			),
+			None => None,
+		};
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::register_utxo(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			CoinId::new(coin_number, coin_value),
+			proof.as_ref(),
+			session_id_hex,
+			MultisigUtxoStatus::Unconfirmed,
+		)
+	}
+
+	/// Rewind-recognize a chain output; optionally register as Unspent.
+	pub fn multisig_recognize_utxo(
+		&self,
+		keychain_mask: Option<&SecretKey>,
+		ceremony_id: String,
+		commit_hex: String,
+		proof_hex: String,
+		height: u64,
+		register: bool,
+	) -> Result<Option<RecognizedMultisigOutput>, Error> {
+		let uuid = Uuid::parse_str(&ceremony_id)
+			.map_err(|e| Error::GenericError(format!("bad ceremony id: {}", e)))?;
+		let mut w_lock = self.wallet_inst.lock();
+		let w = w_lock.lc_provider()?.wallet_inst()?;
+		multisig::recognize_and_register(
+			&mut **w,
+			keychain_mask,
+			&multisig::CeremonyId(uuid),
+			&commit_hex,
+			&proof_hex,
+			height,
+			register,
 		)
 	}
 }

@@ -51,6 +51,7 @@ pub mod share;
 pub mod store;
 pub mod tx;
 pub mod types;
+pub mod utxo;
 
 pub use coin::{coin_blinding_factor, coin_commitment_components, coin_x, CoinId};
 pub use dkg::{
@@ -72,13 +73,14 @@ pub use messages::{
 	MULTISIG_PAYLOAD_MAGIC,
 };
 pub use ops::{
-	clear_pending, delete_ceremony, derive_session_key, dkg_export_shares, dkg_finalize,
-	dkg_import_contrib, dkg_import_share, dkg_start, export_state_json, export_state_sealed,
-	get_state, import_state_json, import_state_sealed, init_local_sim, list_ceremonies, load_pending,
-	read_encrypted_share_file, read_envelope_file, session_abort, session_apply, session_apply_raw,
+	allocate_coin, clear_pending, delete_ceremony, derive_session_key, dkg_export_shares,
+	dkg_finalize, dkg_import_contrib, dkg_import_share, dkg_start, export_state_json,
+	export_state_sealed, get_state, import_state_json, import_state_sealed, init_local_sim,
+	list_ceremonies, list_utxos, load_pending, read_encrypted_share_file, read_envelope_file,
+	recognize_and_register, register_utxo, session_abort, session_apply, session_apply_raw,
 	session_create_output, session_create_output_raw, session_create_spend, session_create_spend_raw,
-	session_list, session_status, wallet_data_dir, write_envelope_file, CeremonySummary,
-	MultisigSessionApplyResult, MultisigSessionStartResult, PendingDkg, PendingKey,
+	session_list, session_status, set_utxo_status, wallet_data_dir, write_envelope_file,
+	CeremonySummary, MultisigSessionApplyResult, MultisigSessionStartResult, PendingDkg, PendingKey,
 };
 pub use poly::{eval_public_poly, eval_secret_poly, verify_share, PublicPoly, SecretPoly};
 pub use rangeproof::{
@@ -112,4 +114,9 @@ pub use tx::{
 pub use types::{
 	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,
 	MIN_SHARES_FOR_DEGREE,
+};
+pub use utxo::{
+	multisig_coin_meta_db_key, multisig_utxo_db_key, next_coin_number_from_list, parse_utxo_db_key,
+	try_recognize_output, utxo_from_create_output, verify_utxo_commit, CoinNumberMeta, MultisigUtxo,
+	MultisigUtxoStatus, RecognizedMultisigOutput, MULTISIG_COIN_META_PREFIX, MULTISIG_UTXO_PREFIX,
 };
