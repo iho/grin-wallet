@@ -509,6 +509,198 @@ pub fn excess_commitment(
 	Ok(Commitment::from_pubkey(secp, &agg.excess_sum)?)
 }
 
+/// Partial excess for **cross-epoch** spends: inputs under `old_*`, outputs
+/// under `new_*`. Both quorums must be the same actors (matching x-coords after
+/// canonical sort) with shares from two DKG epochs (C-13 re-DKG path).
+pub fn partial_excess_cross_epoch(
+	secp: &Secp256k1,
+	old_poly: &PublicPoly,
+	old_quorum: &[ActorPoint],
+	new_poly: &PublicPoly,
+	new_quorum: &[ActorPoint],
+	j: usize,
+	session: &KernelSession,
+) -> Result<SecretKey, Error> {
+	let old_q = canonical_quorum(old_quorum)?;
+	let new_q = canonical_quorum(new_quorum)?;
+	if old_q.len() != new_q.len() {
+		return Err(Error::Multisig(
+			"cross-epoch quorums must have the same size".into(),
+		));
+	}
+	if j >= old_q.len() {
+		return Err(Error::Multisig("actor index out of range".into()));
+	}
+	for i in 0..old_q.len() {
+		if old_q[i].x.0 != new_q[i].x.0 {
+			return Err(Error::Multisig(
+				"cross-epoch quorums must share actor x-coordinates (same roster)".into(),
+			));
+		}
+	}
+	let seed_old = view_seed_from_public_poly(secp, old_poly)?;
+	let seed_new = view_seed_from_public_poly(secp, new_poly)?;
+
+	let mut acc: Option<SecretKey> = None;
+	let add_coin =
+		|acc: &mut Option<SecretKey>,
+		 quorum: &[ActorPoint],
+		 seed: &[u8],
+		 coin: &CoinId,
+		 sign_positive: bool|
+		 -> Result<(), Error> {
+			let mut part = coin_partial_poly_key(secp, quorum, j, coin)?;
+			if j == 0 {
+				let x = coin_x(secp, coin)?;
+				let mix = view_mix(secp, seed, &x)?;
+				part = sk_add(secp, &part, &mix)?;
+			}
+			match acc {
+				None => {
+					*acc = Some(if sign_positive {
+						part
+					} else {
+						sk_neg(secp, &part)?
+					});
+				}
+				Some(a) => {
+					*a = if sign_positive {
+						sk_add(secp, a, &part)?
+					} else {
+						sk_sub(secp, a, &part)?
+					};
+				}
+			}
+			Ok(())
+		};
+
+	for c in &session.outputs {
+		add_coin(&mut acc, &new_q, &seed_new, c, true)?;
+	}
+	for c in &session.inputs {
+		add_coin(&mut acc, &old_q, &seed_old, c, false)?;
+	}
+	let mut excess =
+		acc.ok_or_else(|| Error::Multisig("kernel session has no inputs or outputs".into()))?;
+	if j == 0 {
+		excess = sk_sub(secp, &excess, &session.offset)?;
+	}
+	Ok(excess)
+}
+
+/// Kernel session for cross-epoch spends: offset binds **both** view seeds.
+pub fn create_cross_epoch_kernel_session(
+	secp: &Secp256k1,
+	old_poly: &PublicPoly,
+	new_poly: &PublicPoly,
+	session_id: impl AsRef<[u8]>,
+	features: KernelFeatures,
+	inputs: Vec<CoinId>,
+	outputs: Vec<CoinId>,
+) -> Result<KernelSession, Error> {
+	let mut ctx = session_id.as_ref().to_vec();
+	ctx.extend_from_slice(b"|xe|");
+	ctx.extend_from_slice(b"|inputs|");
+	for c in &inputs {
+		ctx.extend_from_slice(&c.number.to_be_bytes());
+		ctx.extend_from_slice(&c.value.to_be_bytes());
+	}
+	ctx.extend_from_slice(b"|outputs|");
+	for c in &outputs {
+		ctx.extend_from_slice(&c.number.to_be_bytes());
+		ctx.extend_from_slice(&c.value.to_be_bytes());
+	}
+	if let KernelFeatures::Plain { fee } = &features {
+		ctx.extend_from_slice(b"|fee|");
+		ctx.extend_from_slice(&u64::from(*fee).to_be_bytes());
+	}
+	let seed_old = view_seed_from_public_poly(secp, old_poly)?;
+	let seed_new = view_seed_from_public_poly(secp, new_poly)?;
+	let mut omsg = seed_old;
+	omsg.extend_from_slice(&seed_new);
+	omsg.extend_from_slice(&ctx);
+	let offset = hash_to_scalar(secp, HashDomain::Offset, &omsg)?;
+	Ok(KernelSession {
+		session_id: session_id.as_ref().to_vec(),
+		features,
+		offset,
+		inputs,
+		outputs,
+	})
+}
+
+/// In-process FROST sign for a cross-epoch spend (local sim / tests).
+pub fn run_kernel_sign_local_cross_epoch(
+	secp: &Secp256k1,
+	old_poly: &PublicPoly,
+	old_quorum: &[ActorPoint],
+	new_poly: &PublicPoly,
+	new_quorum: &[ActorPoint],
+	session_id: impl AsRef<[u8]>,
+	fee: u64,
+	inputs: Vec<CoinId>,
+	outputs: Vec<CoinId>,
+) -> Result<(Signature, AggregatedKernelPubs, KernelSession), Error> {
+	let old_q = canonical_quorum(old_quorum)?;
+	let new_q = canonical_quorum(new_quorum)?;
+	if old_q.len() != new_q.len() {
+		return Err(Error::Multisig("cross-epoch quorum size mismatch".into()));
+	}
+	for i in 0..old_q.len() {
+		if old_q[i].x.0 != new_q[i].x.0 {
+			return Err(Error::Multisig(
+				"cross-epoch quorums must share actor x-coordinates".into(),
+			));
+		}
+	}
+	let mut sid = session_id.as_ref().to_vec();
+	sid.extend_from_slice(b"|xeq|");
+	sid.extend_from_slice(&quorum_transcript(&old_q)?);
+	sid.extend_from_slice(&quorum_transcript(&new_q)?);
+
+	let features = plain_features(fee)?;
+	let session =
+		create_cross_epoch_kernel_session(secp, old_poly, new_poly, &sid, features, inputs, outputs)?;
+
+	let mut secrets = Vec::new();
+	let mut commitments = Vec::new();
+	for j in 0..old_q.len() {
+		let partial_excess = partial_excess_cross_epoch(
+			secp, old_poly, &old_q, new_poly, &new_q, j, &session,
+		)?;
+		let d = aggsig::create_secnonce(secp)
+			.map_err(|e| Error::Multisig(format!("secnonce d: {}", e)))?;
+		let e = aggsig::create_secnonce(secp)
+			.map_err(|e| Error::Multisig(format!("secnonce e: {}", e)))?;
+		let pub_d = PublicKey::from_secret_key(secp, &d)?;
+		let pub_e = PublicKey::from_secret_key(secp, &e)?;
+		let pub_excess = PublicKey::from_secret_key(secp, &partial_excess)?;
+		let sec = ActorKernelSecrets {
+			partial_excess,
+			d,
+			e,
+			commitment: SigningCommitment {
+				pub_d,
+				pub_e,
+				pub_excess,
+			},
+		};
+		commitments.push(sec.commitment.clone());
+		secrets.push(sec);
+	}
+
+	let agg = aggregate_frost(secp, &session, &commitments)?;
+	let mut partials = Vec::new();
+	for (j, sec) in secrets.iter().enumerate() {
+		let ps = kernel_partial_sign(secp, sec, &commitments, j, &agg, &session)?;
+		verify_kernel_partial(secp, &ps, &sec.commitment.pub_excess, &agg, &session)?;
+		partials.push(ps);
+	}
+	let final_sig = kernel_aggregate_sigs(secp, &partials, &agg)?;
+	verify_kernel_sig(secp, &final_sig, &agg, &session)?;
+	Ok((final_sig, agg, session))
+}
+
 /// In-process multiparty kernel sign for a quorum (tests / local sim).
 ///
 /// Returns `(final_signature, aggregated_pubs, session)`.

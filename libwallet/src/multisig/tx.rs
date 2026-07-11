@@ -347,6 +347,102 @@ pub fn build_epoch_sweep_local(
 	)
 }
 
+/// Cross-epoch MultiTx (local sim): spend **old**-poly inputs into **new**-poly
+/// outputs. Both quorums must be the same roster (matching x-coordinates) with
+/// shares from two successive DKG epochs (C-13 re-DKG + sweep).
+///
+/// Networked multiparty would run CreateOutput under the new ceremony, then a
+/// specialized cross-epoch FROST Spend; this path is the in-process equivalent.
+pub fn build_cross_epoch_spend(
+	secp: &Secp256k1,
+	old_poly: &PublicPoly,
+	old_quorum: &[ActorPoint],
+	new_poly: &PublicPoly,
+	new_quorum: &[ActorPoint],
+	inputs: &[MultisigOutput],
+	new_output_coins: &[CoinId],
+	fee: u64,
+	session_id: impl AsRef<[u8]>,
+) -> Result<MultisigSpendResult, Error> {
+	use super::kernel::{excess_commitment, run_kernel_sign_local_cross_epoch};
+	use super::rangeproof::coin_pedersen_commit_public;
+
+	if inputs.is_empty() || new_output_coins.is_empty() {
+		return Err(Error::Multisig(
+			"cross-epoch spend needs inputs and outputs".into(),
+		));
+	}
+	let in_sum: u64 = inputs.iter().map(|o| o.coin.value).sum();
+	let out_sum: u64 = new_output_coins.iter().map(|c| c.value).sum();
+	if in_sum != out_sum.saturating_add(fee) {
+		return Err(Error::Multisig(format!(
+			"value imbalance: inputs {} != outputs {} + fee {}",
+			in_sum, out_sum, fee
+		)));
+	}
+	// Verify input commits against old poly.
+	for o in inputs {
+		let expected = coin_pedersen_commit_public(secp, old_poly, &o.coin)?;
+		if expected != o.commit {
+			return Err(Error::Multisig(format!(
+				"input coin #{} commit does not match old poly",
+				o.coin.number
+			)));
+		}
+	}
+
+	// New outputs: multiparty RP under the **new** ceremony.
+	let mut new_outputs = Vec::with_capacity(new_output_coins.len());
+	for coin in new_output_coins {
+		new_outputs.push(create_multisig_output(secp, new_poly, new_quorum, coin)?);
+	}
+
+	let in_ids: Vec<CoinId> = inputs.iter().map(|o| o.coin.clone()).collect();
+	let out_ids: Vec<CoinId> = new_output_coins.to_vec();
+	let (sig, agg, session) = run_kernel_sign_local_cross_epoch(
+		secp,
+		old_poly,
+		old_quorum,
+		new_poly,
+		new_quorum,
+		session_id.as_ref(),
+		fee,
+		in_ids,
+		out_ids,
+	)?;
+
+	let excess = excess_commitment(secp, &agg)?;
+	let kernel = TxKernel {
+		features: session.features.clone(),
+		excess,
+		excess_sig: sig,
+	};
+	kernel
+		.verify()
+		.map_err(|e| Error::Multisig(format!("kernel verify: {}", e)))?;
+
+	let tx_inputs: Vec<Input> = inputs
+		.iter()
+		.map(|o| Input::new(OutputFeatures::Plain, o.commit))
+		.collect();
+	let tx_outputs: Vec<Output> = new_outputs
+		.iter()
+		.map(|o| Output::new(OutputFeatures::Plain, o.commit, o.proof))
+		.collect();
+	let offset = BlindingFactor::from_secret_key(session.offset.clone());
+	let tx = Transaction::new(Inputs::from(tx_inputs.as_slice()), &tx_outputs, &[kernel])
+		.with_offset(offset);
+	tx.validate(Weighting::AsTransaction)
+		.map_err(|e| Error::Multisig(format!("tx validate failed: {}", e)))?;
+
+	Ok(MultisigSpendResult {
+		tx,
+		outputs: new_outputs,
+		excess,
+		session_id: session.session_id,
+	})
+}
+
 /// Serialize a transaction to hex (protocol v3 body encoding).
 pub fn tx_to_hex(tx: &Transaction) -> Result<String, Error> {
 	let bytes = ser::ser_vec(tx, ser::ProtocolVersion(3))
@@ -429,6 +525,7 @@ mod tests {
 	use crate::grin_core::global;
 	use crate::grin_util::secp::{ContextFlag, Secp256k1};
 	use crate::multisig::dkg::run_dkg_local;
+	use crate::multisig::share::{canonical_quorum, ActorPoint};
 	use crate::multisig::types::{ActorId, CeremonyId, ThresholdParams};
 
 	fn setup_2of3(secp: &Secp256k1) -> (PublicPoly, Vec<ActorPoint>, MultisigWalletState) {
@@ -436,10 +533,11 @@ mod tests {
 		let params = ThresholdParams::new_allow_low_degree(2, 3).unwrap();
 		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
 		let states = run_dkg_local(secp, CeremonyId::new(), params, actors).unwrap();
-		let q = vec![
+		let q = canonical_quorum(&[
 			ActorPoint::from(&states[0].shares[0]),
 			ActorPoint::from(&states[1].shares[0]),
-		];
+		])
+		.unwrap();
 		(states[0].config.public_poly.clone(), q, states[0].clone())
 	}
 
@@ -549,6 +647,99 @@ mod tests {
 		assert_eq!(res.outputs[0].coin.number, 99);
 		assert_eq!(res.outputs[0].coin.value, 1_000_000 - fee);
 		res.tx.validate(Weighting::AsTransaction).unwrap();
+	}
+
+	#[test]
+	fn cross_epoch_spend_validates() {
+		// Same roster re-DKGs to a new poly, then spends old UTXO → new epoch coin.
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 3).unwrap();
+		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
+		let old_states =
+			run_dkg_local(&secp, CeremonyId::new(), params.clone(), actors.clone()).unwrap();
+		let new_states =
+			run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
+		let old_pp = old_states[0].config.public_poly.clone();
+		let new_pp = new_states[0].config.public_poly.clone();
+		// Same two actors (indices 0,1) form both quorums — x coords match by actor id.
+		let old_q = canonical_quorum(&[
+			ActorPoint::from(&old_states[0].shares[0]),
+			ActorPoint::from(&old_states[1].shares[0]),
+		])
+		.unwrap();
+		let new_q = canonical_quorum(&[
+			ActorPoint::from(&new_states[0].shares[0]),
+			ActorPoint::from(&new_states[1].shares[0]),
+		])
+		.unwrap();
+		// Confirm x-coords align after sort.
+		for (a, b) in old_q.iter().zip(new_q.iter()) {
+			assert_eq!(a.x.0, b.x.0);
+		}
+		assert_ne!(
+			old_pp.coefficients, new_pp.coefficients,
+			"epochs must have distinct polys"
+		);
+
+		let fee = 1_000u64;
+		let funding =
+			create_multisig_output(&secp, &old_pp, &old_q, &CoinId::new(1, 1_000_000)).unwrap();
+		let res = build_cross_epoch_spend(
+			&secp,
+			&old_pp,
+			&old_q,
+			&new_pp,
+			&new_q,
+			&[funding],
+			&[CoinId::new(10, 1_000_000 - fee)],
+			fee,
+			b"cross-epoch",
+		)
+		.unwrap();
+		assert_eq!(res.outputs.len(), 1);
+		// Output commit must match **new** poly.
+		let expected = super::super::rangeproof::coin_pedersen_commit_public(
+			&secp,
+			&new_pp,
+			&res.outputs[0].coin,
+		)
+		.unwrap();
+		assert_eq!(res.outputs[0].commit, expected);
+		res.tx.validate(Weighting::AsTransaction).unwrap();
+	}
+
+	#[test]
+	fn multiparty_soak_rounds() {
+		// Lightweight soak: repeated fund→spend cycles for a 2-of-3 quorum.
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, _) = setup_2of3(&secp);
+		let fee = 1_000u64;
+		for round in 0..5u64 {
+			let fund_n = round * 10 + 1;
+			let chg_n = round * 10 + 2;
+			let funding = create_multisig_output(
+				&secp,
+				&pp,
+				&q,
+				&CoinId::new(fund_n, 500_000 + round * 1_000),
+			)
+			.unwrap();
+			let value = funding.coin.value;
+			let spend = build_self_send(
+				&secp,
+				&pp,
+				&q,
+				&[funding],
+				chg_n,
+				fee,
+				format!("soak-{}", round).as_bytes(),
+			)
+			.unwrap();
+			assert_eq!(spend.outputs[0].coin.value, value - fee);
+			spend.tx.validate(Weighting::AsTransaction).unwrap();
+		}
 	}
 
 	#[test]

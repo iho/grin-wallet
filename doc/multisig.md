@@ -12,9 +12,9 @@ This is the first implementation slice of RFC-0023 style multisig:
 | Done | Not done |
 | --- | --- |
 | Joint Feldman DKG + DKG session (index & address roster) | Multi-process soak on real wallets |
-| PoP on coefficient commitments | Cross-epoch MultiTx (two polys) |
+| PoP on coefficient commitments | Networked cross-epoch session path |
 | Share verify against public poly | External crypto audit |
-| Lagrange partial keys + reconstruction | Multi-process soak |
+| Lagrange partial keys + reconstruction | Real multi-wallet soak |
 | Coin id derivation (number + value) | Continuous fuzz CI |
 | LMDB + export AEAD-sealed (C-08); Debug redacts secrets | |
 | Multiparty Bulletproof (T1/T2/τ + verifiable τ) | |
@@ -337,9 +337,28 @@ grin-wallet multisig session-dkg-finalize -s <session-id> --delete
 
 Classic `dkg-start` / `dkg-export-shares` remains available as a non-session path.
 
+## Cross-epoch MultiTx (local)
+
+After re-DKG (C-13), the same roster holds shares under two public polys.
+Local sim:
+
+```rust
+// old_poly/old_quorum from ceremony A; new_* from ceremony B (same actor x-coords)
+let funding = create_multisig_output(secp, &old_poly, &old_q, &old_coin)?;
+let res = build_cross_epoch_spend(
+    secp, &old_poly, &old_q, &new_poly, &new_q,
+    &[funding], &[new_coin], fee, b"rotate",
+)?;
+// res.tx validates; outputs open under new_poly
+```
+
+CLI inventory remains `plan-epoch-sweep`; networked cross-epoch FROST session is residual.
+
 ## Wire format freeze (v1, experimental)
 
 **Decision:** keep **JSON envelopes** with magic-prefixed payload for v1.
+This section is the formal freeze text for wallet multisig wire (RFC-0023 wallet
+layer); consensus rules are unchanged.
 
 | Field | Rule |
 | --- | --- |
@@ -349,10 +368,30 @@ Classic `dkg-start` / `dkg-export-shares` remains available as a non-session pat
 | Caps | `MAX_ENVELOPE_JSON_BYTES` (256 KiB), list/hex field limits — C-12 |
 | Session bind | optional `session_id_hex` on every post-DKG message |
 | Replay | body content hash set per durable session |
+| Body types | `DkgContribution`, `DkgPartialShare`, `DkgPublicPoly`, `RpRound1/2/Final`, `KernelSigningCommit`, `KernelPartialSig`, `KernelFinal` |
+| Transport | plain JSON files and/or age-encrypted armored Slatepack |
+| At rest | AEAD (ChaCha20-Poly1305) for pending DKG, ceremony state, sessions |
 
 Fuzz targets: `libwallet/fuzz` (`multisig_envelope_json`, `multisig_envelope_payload`).
 
 Do **not** change the v1 schema without a version bump and dual-parse period.
+
+## C-finding → regression tests
+
+| ID | Topic | Primary tests |
+| --- | --- | --- |
+| C-01 | No chain-type footgun in demo | `run_demo_tx` / production path (no set_local in lib) |
+| C-02 | Encrypted share delivery | `encrypted_share_export_import_roundtrip`, address DKG session |
+| C-03 | Pending AEAD | `pending_seal_open_roundtrip`, tamper/wrong-key |
+| C-04 | Auth + replay | `envelope_sign_and_verify`, `dkg_exchange_authenticated_and_replay_safe`, DKG share replay |
+| C-05 | FROST + excess check | `frost_signature_verifies_as_kernel`, `partial_excess_matches_public_poly` |
+| C-06 | Verifiable τ | `bad_tau_rejected_with_actor_index`, `honest_tau_verifies` |
+| C-07 | Canonical quorum | `canonical_quorum_sorts_by_x`, reversed-quorum RP/kernel |
+| C-08 | Debug redaction + sealed state | `secret_share_debug_redacts`, sealed state tests |
+| C-09/C-10 | Public offset / view A | documented + commit derivation tests |
+| C-11 | PTE degree floor | `production_rejects_low_degree` |
+| C-12 | Envelope DoS caps | `rejects_oversized_payload`, fuzz targets |
+| C-13 | No public add-actor; re-DKG | `cross_epoch_spend_validates`, plan-epoch-sweep docs |
 
 ## Ops runbook (experimental)
 
@@ -388,5 +427,5 @@ A removed actor who still holds the old public poly can rewind old-epoch rangepr
 9. ~~Durable session negotiator + session CLI.~~
 10. ~~Owner RPC for session lifecycle.~~
 11. ~~UTXO track/select/refresh/assemble.~~
-12. Multi-process soak tests + address-roster DKG session (encrypted shares)
+12. Multi-process soak on real wallets; networked cross-epoch session
 13. External audit

@@ -289,7 +289,8 @@ Negotiator
 9. ✅ Tx assembly from completed Spend + proofs (`assemble_from_kernel_results` / `assemble-tx`); local `build_epoch_sweep_local` consolidation.
 10. ✅ Envelope fuzz targets under `libwallet/fuzz`; v1 JSON wire freeze notes + ops runbook in `doc/multisig.md`.
 11. ✅ DKG-as-session (index + address roster, signed contribs, age share export) + file harness crash-resume + share replay/equivocation tests.
-12. Residual: multi-process soak on real wallets; cross-epoch MultiTx; slate nesting in standard send flow.
+12. ✅ Cross-epoch MultiTx local builder (`build_cross_epoch_spend` / FROST with dual polys) + multiparty soak unit rounds.
+13. Residual: multi-process soak on real wallets; networked cross-epoch session kind; slate nesting in standard send flow.
 
 ### WS7 — Testing, audit, launch (4–8 weeks, gates G1/G3/G5)
 
@@ -311,16 +312,16 @@ Negotiator
 4. ✅ C-07 canonical quorum + mix/offset role; C-11 PTE floor; C-13 add-actor gated.
 5. ✅ C-05 FROST kernel (binding factors + excess poly check).
 6. ✅ C-06 verifiable multiparty τ (identifiable abort).
-7. ✅ C-09/C-10 v1 product decisions documented (public offset; strategy A view). Residual: formal RFC freeze text.
-8. ✅ WS4 negotiator + CLI + Owner RPC + DKG session (index). Residual: multi-process soak.
+7. ✅ C-09/C-10 v1 product decisions + formal wire freeze text in `doc/multisig.md`.
+8. ✅ WS4 negotiator + CLI + Owner RPC + DKG session. Residual: multi-process soak.
 9. ✅ C-12 envelope DoS caps.
 9b. ✅ Session TTL/deadline + expire path; updater light refresh.
 
 **P1 — before mainnet flag:**
-10. ✅ WS6 UTXO foundation + assemble-tx + local epoch sweep builder. Residual: cross-epoch MultiTx (old poly → new poly).
+10. ✅ WS6 UTXO foundation + assemble-tx + same-epoch sweep + **cross-epoch** local MultiTx.
 11. ✅ C-08 AEAD state + Debug redaction; restore/compromise runbook in `doc/multisig.md`.
-12. ✅ WS5: v1 JSON freeze notes + `libwallet/fuzz` envelope targets. Residual: continuous fuzz CI.
-13. External audit + malicious-peer suite + 30-day soak.
+12. ✅ WS5: v1 JSON freeze + C-finding regression map + `libwallet/fuzz`. Residual: continuous fuzz CI.
+13. External audit + expanded malicious suite + 30-day soak.
 
 **P2 — quality/optional:**
 11. Hardware-keykeeper interface design (Beam `private_key_keeper` pattern).

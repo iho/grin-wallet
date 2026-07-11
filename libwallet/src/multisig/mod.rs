@@ -59,11 +59,12 @@ pub use dkg::{
 	run_dkg_local, verify_pop, DealerContribution, DealerSecrets, PopProof,
 };
 pub use kernel::{
-	aggregate_frost, binding_factor, create_kernel_session, expected_pub_excess_for_actor,
-	kernel_aggregate_sigs, kernel_partial_sign, kernel_round1, partial_excess_for_actor,
-	plain_features, run_kernel_sign_local, verify_kernel_partial, verify_kernel_sig,
-	verify_partial_excess, ActorKernelSecrets, AggregatedKernelPubs, KernelSession,
-	SigningCommitment,
+	aggregate_frost, binding_factor, create_cross_epoch_kernel_session, create_kernel_session,
+	expected_pub_excess_for_actor, kernel_aggregate_sigs, kernel_partial_sign, kernel_round1,
+	partial_excess_cross_epoch, partial_excess_for_actor, plain_features,
+	run_kernel_sign_local, run_kernel_sign_local_cross_epoch, verify_kernel_partial,
+	verify_kernel_sig, verify_partial_excess, ActorKernelSecrets, AggregatedKernelPubs,
+	KernelSession, SigningCommitment,
 };
 pub use messages::{
 	build_dkg_contribution, build_dkg_partial_share, build_kernel_final, build_kernel_partial_sig,
@@ -112,9 +113,10 @@ pub use store::{
 	MULTISIG_PREFIX, PENDING_KEY_SIZE, STATE_KEY_SIZE, STATE_SEAL_MAGIC, STATE_SEAL_VERSION,
 };
 pub use tx::{
-	assemble_from_kernel_results, build_epoch_sweep_local, build_multisig_spend, build_self_send,
-	create_multisig_output, demo_fund_and_spend, quorum_from_state, quorum_from_states, run_demo_tx,
-	tx_from_hex, tx_to_hex, MultisigDemoTxResult, MultisigOutput, MultisigSpendResult,
+	assemble_from_kernel_results, build_cross_epoch_spend, build_epoch_sweep_local,
+	build_multisig_spend, build_self_send, create_multisig_output, demo_fund_and_spend,
+	quorum_from_state, quorum_from_states, run_demo_tx, tx_from_hex, tx_to_hex,
+	MultisigDemoTxResult, MultisigOutput, MultisigSpendResult,
 };
 pub use types::{
 	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,
