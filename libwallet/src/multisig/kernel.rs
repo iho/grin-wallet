@@ -115,9 +115,8 @@ pub fn plain_features(fee: u64) -> Result<KernelFeatures, Error> {
 	let fee_fields = if fee <= u32::MAX as u64 {
 		FeeFields::from(fee as u32)
 	} else {
-		FeeFields::try_from(fee).map_err(|e| {
-			Error::Multisig(format!("invalid fee fields: {:?}", e))
-		})?
+		FeeFields::try_from(fee)
+			.map_err(|e| Error::Multisig(format!("invalid fee fields: {:?}", e)))?
 	};
 	Ok(KernelFeatures::Plain { fee: fee_fields })
 }
@@ -185,34 +184,32 @@ pub fn partial_excess_for_actor(
 	// Start at "zero" via canceling self-add; use first term carefully
 	let mut acc: Option<SecretKey> = None;
 
-	let add_coin = |acc: &mut Option<SecretKey>,
-	                coin: &CoinId,
-	                sign_positive: bool|
-	 -> Result<(), Error> {
-		let mut part = coin_partial_poly_key(secp, quorum, j, coin)?;
-		if j == 0 {
-			let x = super::coin::coin_x(secp, coin)?;
-			let mix = view_mix(secp, &seed, &x)?;
-			part = sk_add(secp, &part, &mix)?;
-		}
-		match acc {
-			None => {
-				*acc = Some(if sign_positive {
-					part
-				} else {
-					super::scalar::sk_neg(secp, &part)?
-				});
+	let add_coin =
+		|acc: &mut Option<SecretKey>, coin: &CoinId, sign_positive: bool| -> Result<(), Error> {
+			let mut part = coin_partial_poly_key(secp, quorum, j, coin)?;
+			if j == 0 {
+				let x = super::coin::coin_x(secp, coin)?;
+				let mix = view_mix(secp, &seed, &x)?;
+				part = sk_add(secp, &part, &mix)?;
 			}
-			Some(a) => {
-				*a = if sign_positive {
-					sk_add(secp, a, &part)?
-				} else {
-					sk_sub(secp, a, &part)?
-				};
+			match acc {
+				None => {
+					*acc = Some(if sign_positive {
+						part
+					} else {
+						super::scalar::sk_neg(secp, &part)?
+					});
+				}
+				Some(a) => {
+					*a = if sign_positive {
+						sk_add(secp, a, &part)?
+					} else {
+						sk_sub(secp, a, &part)?
+					};
+				}
 			}
-		}
-		Ok(())
-	};
+			Ok(())
+		};
 
 	// Outputs positive, inputs negative (Grin BlindSum convention)
 	for c in &session.outputs {
@@ -222,9 +219,8 @@ pub fn partial_excess_for_actor(
 		add_coin(&mut acc, c, false)?;
 	}
 
-	let mut excess = acc.ok_or_else(|| {
-		Error::Multisig("kernel session has no inputs or outputs".into())
-	})?;
+	let mut excess =
+		acc.ok_or_else(|| Error::Multisig("kernel session has no inputs or outputs".into()))?;
 
 	// Subtract offset once (actor 0): excess = (out - in) - offset
 	if j == 0 {
@@ -265,10 +261,9 @@ pub fn kernel_prepare(
 	j: usize,
 	session: &KernelSession,
 ) -> Result<(ActorKernelSecrets, NonceCommitment), Error> {
-	let partial_excess =
-		partial_excess_for_actor(secp, public_poly, quorum, j, session)?;
-	let sec_nonce = aggsig::create_secnonce(secp)
-		.map_err(|e| Error::Multisig(format!("secnonce: {}", e)))?;
+	let partial_excess = partial_excess_for_actor(secp, public_poly, quorum, j, session)?;
+	let sec_nonce =
+		aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce: {}", e)))?;
 	let pub_nonce = PublicKey::from_secret_key(secp, &sec_nonce)?;
 	let pub_excess = PublicKey::from_secret_key(secp, &partial_excess)?;
 	let commitment = commit_nonce(secp, &pub_nonce);
@@ -360,14 +355,8 @@ pub fn verify_kernel_sig(
 	session: &KernelSession,
 ) -> Result<(), Error> {
 	let msg = kernel_message(&session.features)?;
-	aggsig::verify_completed_sig(
-		secp,
-		sig,
-		&agg.excess_sum,
-		Some(&agg.excess_sum),
-		&msg,
-	)
-	.map_err(|e| Error::Multisig(format!("completed sig verify: {}", e)))
+	aggsig::verify_completed_sig(secp, sig, &agg.excess_sum, Some(&agg.excess_sum), &msg)
+		.map_err(|e| Error::Multisig(format!("completed sig verify: {}", e)))
 }
 
 /// Excess as a Pedersen commitment (value 0): `C = X` as commit.
@@ -391,14 +380,7 @@ pub fn run_kernel_sign_local(
 	outputs: Vec<CoinId>,
 ) -> Result<(Signature, AggregatedKernelPubs, KernelSession), Error> {
 	let features = plain_features(fee)?;
-	let session = create_kernel_session(
-		secp,
-		public_poly,
-		session_id,
-		features,
-		inputs,
-		outputs,
-	)?;
+	let session = create_kernel_session(secp, public_poly, session_id, features, inputs, outputs)?;
 
 	// Prepare each actor
 	let mut secrets = Vec::new();
@@ -477,16 +459,8 @@ mod tests {
 		let inputs = vec![CoinId::new(1, 1_000_000_000)];
 		let outputs = vec![CoinId::new(2, 999_000_000)];
 		let fee = 1_000_000;
-		let (sig, agg, session) = run_kernel_sign_local(
-			&secp,
-			&pp,
-			&q,
-			b"test-session-1",
-			fee,
-			inputs,
-			outputs,
-		)
-		.unwrap();
+		let (sig, agg, session) =
+			run_kernel_sign_local(&secp, &pp, &q, b"test-session-1", fee, inputs, outputs).unwrap();
 		verify_kernel_sig(&secp, &sig, &agg, &session).unwrap();
 	}
 

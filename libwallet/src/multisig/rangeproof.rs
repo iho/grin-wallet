@@ -46,9 +46,7 @@ use crate::grin_util::secp::Secp256k1;
 use crate::Error;
 use rand::thread_rng;
 
-use super::coin::{
-	coin_blinding_factor, coin_x, view_mix, view_seed_from_public_poly, CoinId,
-};
+use super::coin::{coin_blinding_factor, coin_x, view_mix, view_seed_from_public_poly, CoinId};
 use super::poly::PublicPoly;
 use super::scalar::{hash_to_scalar, sk_add, HashDomain};
 use super::share::{partial_key_at, ActorPoint};
@@ -212,9 +210,7 @@ pub fn rangeproof_round1(
 	);
 	// step 1 returns None for the proof
 	if res.is_some() {
-		return Err(Error::Multisig(
-			"unexpected rangeproof on round1".into(),
-		));
+		return Err(Error::Multisig("unexpected rangeproof on round1".into()));
 	}
 
 	let secrets = ActorRpSecrets {
@@ -266,9 +262,7 @@ pub fn rangeproof_round2(
 		BP_STEP_TAU,
 	);
 	if res.is_some() {
-		return Err(Error::Multisig(
-			"unexpected rangeproof on round2".into(),
-		));
+		return Err(Error::Multisig("unexpected rangeproof on round2".into()));
 	}
 	Ok(tau_x)
 }
@@ -358,8 +352,7 @@ pub fn run_rangeproof_local(
 	coin: &CoinId,
 	extra_data: Option<Vec<u8>>,
 ) -> Result<(RangeProof, RangeproofParams), Error> {
-	let params =
-		rangeproof_params_for_coin(secp, public_poly, quorum, coin, extra_data)?;
+	let params = rangeproof_params_for_coin(secp, public_poly, quorum, coin, extra_data)?;
 	let blinds = quorum_partial_blinds(secp, public_poly, quorum, coin)?;
 
 	// Round 1
@@ -394,10 +387,7 @@ mod tests {
 
 	fn two_of_three_quorum(
 		secp: &Secp256k1,
-	) -> (
-		crate::multisig::types::MultisigWalletState,
-		Vec<ActorPoint>,
-	) {
+	) -> (crate::multisig::types::MultisigWalletState, Vec<ActorPoint>) {
 		let params = ThresholdParams::new(2, 3).unwrap();
 		let actors: Vec<_> = (0..3).map(ActorId::from_index).collect();
 		let states = run_dkg_local(secp, CeremonyId::new(), params, actors).unwrap();
@@ -426,14 +416,9 @@ mod tests {
 		let (state, q) = two_of_three_quorum(&secp);
 		let coin = CoinId::new(3, 42);
 		let extra = Some(b"grin-msig-extra".to_vec());
-		let (proof, params) = run_rangeproof_local(
-			&secp,
-			&state.config.public_poly,
-			&q,
-			&coin,
-			extra.clone(),
-		)
-		.unwrap();
+		let (proof, params) =
+			run_rangeproof_local(&secp, &state.config.public_poly, &q, &coin, extra.clone())
+				.unwrap();
 		verify_rangeproof(&secp, params.commit, proof, extra).unwrap();
 	}
 
@@ -442,14 +427,12 @@ mod tests {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let (state, q) = two_of_three_quorum(&secp);
 		let coin = CoinId::new(1, 999);
-		let blinds =
-			quorum_partial_blinds(&secp, &state.config.public_poly, &q, &coin).unwrap();
+		let blinds = quorum_partial_blinds(&secp, &state.config.public_poly, &q, &coin).unwrap();
 		let mut sum = blinds[0].clone();
 		for b in blinds.iter().skip(1) {
 			sum = sk_add(&secp, &sum, b).unwrap();
 		}
-		let full =
-			coin_blinding_factor(&secp, &state.config.public_poly, &q, &coin).unwrap();
+		let full = coin_blinding_factor(&secp, &state.config.public_poly, &q, &coin).unwrap();
 		assert_eq!(sum.0, full.0);
 	}
 
@@ -469,10 +452,8 @@ mod tests {
 			ActorPoint::from(&states[0].shares[0]),
 			ActorPoint::from(&states[2].shares[0]),
 		];
-		let c1 =
-			coin_pedersen_commit(&secp, &states[0].config.public_poly, &q01, &coin).unwrap();
-		let c2 =
-			coin_pedersen_commit(&secp, &states[0].config.public_poly, &q02, &coin).unwrap();
+		let c1 = coin_pedersen_commit(&secp, &states[0].config.public_poly, &q01, &coin).unwrap();
+		let c2 = coin_pedersen_commit(&secp, &states[0].config.public_poly, &q02, &coin).unwrap();
 		assert_eq!(c1, c2);
 	}
 

@@ -111,9 +111,7 @@ impl PublicPoly {
 	/// Sum two public polynomials (point-wise).
 	pub fn add(&self, secp: &Secp256k1, other: &PublicPoly) -> Result<PublicPoly, Error> {
 		if self.coefficients.len() != other.coefficients.len() {
-			return Err(Error::Multisig(
-				"public poly degree mismatch on add".into(),
-			));
+			return Err(Error::Multisig("public poly degree mismatch on add".into()));
 		}
 		let mut out = Vec::with_capacity(self.coefficients.len());
 		for m in 0..self.coefficients.len() {

@@ -243,11 +243,7 @@ pub fn run_dkg_local(
 					actor.label
 				)));
 			}
-			shares.push(SecretShare {
-				share_index,
-				x,
-				y,
-			});
+			shares.push(SecretShare { share_index, x, y });
 		}
 		states.push(MultisigWalletState {
 			config: config.clone(),
@@ -296,13 +292,16 @@ mod tests {
 		let params = ThresholdParams::new(2, 2).unwrap();
 		let ceremony = CeremonyId::new();
 		let actor = ActorId::from_index(0);
-		let (_s, mut c) =
-			generate_dealer_contribution(&secp, &ceremony, actor, &params).unwrap();
+		let (_s, mut c) = generate_dealer_contribution(&secp, &ceremony, actor, &params).unwrap();
 		// Simulate threshold inflation: extra bogus commitment
-		c.commitments.coefficients.push(c.commitments.coefficients[0].clone());
+		c.commitments
+			.coefficients
+			.push(c.commitments.coefficients[0].clone());
 		let err = verify_pop(&secp, &ceremony, &c, params.num_coefficients()).unwrap_err();
 		match err {
-			Error::Multisig(msg) => assert!(msg.contains("threshold inflation") || msg.contains("coeffs")),
+			Error::Multisig(msg) => {
+				assert!(msg.contains("threshold inflation") || msg.contains("coeffs"))
+			}
 			_ => panic!("unexpected error"),
 		}
 	}

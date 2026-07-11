@@ -215,9 +215,7 @@ mod tests {
 		let blob = seal_pending(&key, plaintext).unwrap();
 		// Ciphertext must not contain the plaintext and must be longer (nonce + tag).
 		assert!(blob.len() > plaintext.len() + PENDING_NONCE_SIZE);
-		assert!(blob
-			.windows(plaintext.len())
-			.all(|w| w != &plaintext[..]));
+		assert!(blob.windows(plaintext.len()).all(|w| w != &plaintext[..]));
 		let recovered = open_pending(&key, &blob).unwrap();
 		assert_eq!(recovered, plaintext);
 	}

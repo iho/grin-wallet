@@ -64,7 +64,11 @@ pub fn coin_x(secp: &Secp256k1, coin: &CoinId) -> Result<SecretKey, Error> {
 /// Derive mix scalar from public view seed material and x_coin.
 ///
 /// `view_seed` is typically the compressed encoding of S_0 (public).
-pub fn view_mix(secp: &Secp256k1, view_seed: &[u8], x_coin: &SecretKey) -> Result<SecretKey, Error> {
+pub fn view_mix(
+	secp: &Secp256k1,
+	view_seed: &[u8],
+	x_coin: &SecretKey,
+) -> Result<SecretKey, Error> {
 	let mut msg = view_seed.to_vec();
 	msg.extend_from_slice(&x_coin.0);
 	hash_to_scalar(secp, HashDomain::Hkdf, &msg)

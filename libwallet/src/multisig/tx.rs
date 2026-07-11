@@ -152,12 +152,8 @@ pub fn build_multisig_spend(
 		.collect();
 
 	let offset = BlindingFactor::from_secret_key(session.offset.clone());
-	let tx = Transaction::new(
-		Inputs::from(tx_inputs.as_slice()),
-		&tx_outputs,
-		&[kernel],
-	)
-	.with_offset(offset);
+	let tx = Transaction::new(Inputs::from(tx_inputs.as_slice()), &tx_outputs, &[kernel])
+		.with_offset(offset);
 
 	// Full validation (rangeproofs + kernel sigs + kernel sums)
 	tx.validate(Weighting::AsTransaction)
@@ -187,15 +183,7 @@ pub fn build_self_send(
 	}
 	let out_value = in_sum - fee;
 	let out = CoinId::new(output_number, out_value);
-	build_multisig_spend(
-		secp,
-		public_poly,
-		quorum,
-		inputs,
-		&[out],
-		fee,
-		session_id,
-	)
+	build_multisig_spend(secp, public_poly, quorum, inputs, &[out], fee, session_id)
 }
 
 /// Convenience: create a single funded output then spend it (local-sim E2E).
@@ -296,7 +284,11 @@ pub struct MultisigDemoTxResult {
 }
 
 /// Run E2E demo and return a serializable summary (for Owner API / CLI).
-pub fn run_demo_tx(threshold: usize, total: usize, fee: u64) -> Result<MultisigDemoTxResult, Error> {
+pub fn run_demo_tx(
+	threshold: usize,
+	total: usize,
+	fee: u64,
+) -> Result<MultisigDemoTxResult, Error> {
 	use crate::grin_util::secp::ContextFlag;
 	use crate::multisig::dkg::run_dkg_local;
 	use crate::multisig::types::{ActorId, CeremonyId, ThresholdParams};
@@ -315,8 +307,7 @@ pub fn run_demo_tx(threshold: usize, total: usize, fee: u64) -> Result<MultisigD
 	let q = quorum_from_states(&states)?;
 	let fund_value = 1_000_000_000u64;
 	let fund = CoinId::new(1, fund_value);
-	let (_funding, spend) =
-		demo_fund_and_spend(&secp, &states[0], &q, fund, 2, fee)?;
+	let (_funding, spend) = demo_fund_and_spend(&secp, &states[0], &q, fund, 2, fee)?;
 	Ok(MultisigDemoTxResult {
 		threshold,
 		total,
@@ -355,8 +346,7 @@ mod tests {
 		let (_pp, q, state) = setup_2of3(&secp);
 		let fund = CoinId::new(1, 1_000_000_000);
 		let fee = 1_000_000;
-		let (funding, spend) =
-			demo_fund_and_spend(&secp, &state, &q, fund, 2, fee).unwrap();
+		let (funding, spend) = demo_fund_and_spend(&secp, &state, &q, fund, 2, fee).unwrap();
 		assert_eq!(funding.coin.value, 1_000_000_000);
 		assert_eq!(spend.outputs.len(), 1);
 		assert_eq!(spend.outputs[0].coin.value, 1_000_000_000 - fee);
@@ -371,21 +361,15 @@ mod tests {
 	fn e2e_two_outputs_with_payment() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let (pp, q, _) = setup_2of3(&secp);
-		let funding = create_multisig_output(&secp, &pp, &q, &CoinId::new(10, 500_000_000)).unwrap();
+		let funding =
+			create_multisig_output(&secp, &pp, &q, &CoinId::new(10, 500_000_000)).unwrap();
 		// pay 100, change rest, fee 1
 		let fee = 1_000_000;
 		let pay = CoinId::new(11, 100_000_000);
 		let change = CoinId::new(12, 500_000_000 - 100_000_000 - fee);
-		let res = build_multisig_spend(
-			&secp,
-			&pp,
-			&q,
-			&[funding],
-			&[pay, change],
-			fee,
-			b"pay-sess",
-		)
-		.unwrap();
+		let res =
+			build_multisig_spend(&secp, &pp, &q, &[funding], &[pay, change], fee, b"pay-sess")
+				.unwrap();
 		assert_eq!(res.outputs.len(), 2);
 		res.tx.validate(Weighting::AsTransaction).unwrap();
 	}
@@ -430,8 +414,7 @@ mod tests {
 		let states = run_dkg_local(&secp, CeremonyId::new(), params, actors).unwrap();
 		let q = quorum_from_states(&states).unwrap();
 		let fund = CoinId::new(1, 10_000_000);
-		let (funding, spend) =
-			demo_fund_and_spend(&secp, &states[0], &q, fund, 2, 100).unwrap();
+		let (funding, spend) = demo_fund_and_spend(&secp, &states[0], &q, fund, 2, 100).unwrap();
 		assert!(funding.proof.plen > 0);
 		spend.tx.validate(Weighting::AsTransaction).unwrap();
 	}
