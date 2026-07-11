@@ -358,8 +358,10 @@ pub fn kernel_round1(
 	session: &KernelSession,
 ) -> Result<ActorKernelSecrets, Error> {
 	let partial_excess = partial_excess_for_actor(secp, public_poly, quorum, j, session)?;
-	let d = aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce d: {}", e)))?;
-	let e = aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce e: {}", e)))?;
+	let d =
+		aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce d: {}", e)))?;
+	let e =
+		aggsig::create_secnonce(secp).map_err(|e| Error::Multisig(format!("secnonce e: {}", e)))?;
 	let pub_d = PublicKey::from_secret_key(secp, &d)?;
 	let pub_e = PublicKey::from_secret_key(secp, &e)?;
 	let pub_excess = PublicKey::from_secret_key(secp, &partial_excess)?;
@@ -542,37 +544,36 @@ pub fn partial_excess_cross_epoch(
 	let seed_new = view_seed_from_public_poly(secp, new_poly)?;
 
 	let mut acc: Option<SecretKey> = None;
-	let add_coin =
-		|acc: &mut Option<SecretKey>,
-		 quorum: &[ActorPoint],
-		 seed: &[u8],
-		 coin: &CoinId,
-		 sign_positive: bool|
-		 -> Result<(), Error> {
-			let mut part = coin_partial_poly_key(secp, quorum, j, coin)?;
-			if j == 0 {
-				let x = coin_x(secp, coin)?;
-				let mix = view_mix(secp, seed, &x)?;
-				part = sk_add(secp, &part, &mix)?;
+	let add_coin = |acc: &mut Option<SecretKey>,
+	                quorum: &[ActorPoint],
+	                seed: &[u8],
+	                coin: &CoinId,
+	                sign_positive: bool|
+	 -> Result<(), Error> {
+		let mut part = coin_partial_poly_key(secp, quorum, j, coin)?;
+		if j == 0 {
+			let x = coin_x(secp, coin)?;
+			let mix = view_mix(secp, seed, &x)?;
+			part = sk_add(secp, &part, &mix)?;
+		}
+		match acc {
+			None => {
+				*acc = Some(if sign_positive {
+					part
+				} else {
+					sk_neg(secp, &part)?
+				});
 			}
-			match acc {
-				None => {
-					*acc = Some(if sign_positive {
-						part
-					} else {
-						sk_neg(secp, &part)?
-					});
-				}
-				Some(a) => {
-					*a = if sign_positive {
-						sk_add(secp, a, &part)?
-					} else {
-						sk_sub(secp, a, &part)?
-					};
-				}
+			Some(a) => {
+				*a = if sign_positive {
+					sk_add(secp, a, &part)?
+				} else {
+					sk_sub(secp, a, &part)?
+				};
 			}
-			Ok(())
-		};
+		}
+		Ok(())
+	};
 
 	for c in &session.outputs {
 		add_coin(&mut acc, &new_q, &seed_new, c, true)?;
@@ -586,6 +587,118 @@ pub fn partial_excess_cross_epoch(
 		excess = sk_sub(secp, &excess, &session.offset)?;
 	}
 	Ok(excess)
+}
+
+/// Expected **public** partial excess for actor `j` in a cross-epoch session,
+/// computed purely from both public polynomials (rogue-key guard, C-05).
+///
+/// Group-element analog of [`partial_excess_cross_epoch`]: outputs are
+/// evaluated under the **new** polynomial/quorum, inputs under the **old**,
+/// with the respective view mixes (and the offset) applied on canonical
+/// index 0.
+pub fn expected_pub_excess_cross_epoch(
+	secp: &Secp256k1,
+	old_poly: &PublicPoly,
+	old_quorum: &[ActorPoint],
+	new_poly: &PublicPoly,
+	new_quorum: &[ActorPoint],
+	j: usize,
+	session: &KernelSession,
+) -> Result<PublicKey, Error> {
+	let old_q = canonical_quorum(old_quorum)?;
+	let new_q = canonical_quorum(new_quorum)?;
+	if old_q.len() != new_q.len() {
+		return Err(Error::Multisig(
+			"cross-epoch quorums must have the same size".into(),
+		));
+	}
+	if j >= old_q.len() {
+		return Err(Error::Multisig("actor index out of range".into()));
+	}
+	for i in 0..old_q.len() {
+		if old_q[i].x.0 != new_q[i].x.0 {
+			return Err(Error::Multisig(
+				"cross-epoch quorums must share actor x-coordinates (same roster)".into(),
+			));
+		}
+	}
+	let seed_old = view_seed_from_public_poly(secp, old_poly)?;
+	let seed_new = view_seed_from_public_poly(secp, new_poly)?;
+	let minus_one = sk_neg(secp, &sk_from_u64(secp, 1)?)?;
+
+	let mut pos: Vec<PublicKey> = Vec::new();
+	let mut neg: Vec<PublicKey> = Vec::new();
+
+	let mut add_coin = |poly: &PublicPoly,
+	                    quorum: &[ActorPoint],
+	                    seed: &[u8],
+	                    coin: &CoinId,
+	                    positive: bool|
+	 -> Result<(), Error> {
+		let x_coin = coin_x(secp, coin)?;
+		let xs: Vec<SecretKey> = quorum.iter().map(|p| p.x.clone()).collect();
+		let lambda = lagrange_coefficient(secp, &xs, j, &x_coin)?;
+		let mut term = eval_public_poly(secp, poly, &quorum[j].x)?;
+		term.mul_assign(secp, &lambda)?;
+		if positive {
+			pos.push(term);
+		} else {
+			neg.push(term);
+		}
+		if j == 0 {
+			let mix = view_mix(secp, seed, &x_coin)?;
+			let g_mix = PublicKey::from_secret_key(secp, &mix)?;
+			if positive {
+				pos.push(g_mix);
+			} else {
+				neg.push(g_mix);
+			}
+		}
+		Ok(())
+	};
+
+	for c in &session.outputs {
+		add_coin(new_poly, &new_q, &seed_new, c, true)?;
+	}
+	for c in &session.inputs {
+		add_coin(old_poly, &old_q, &seed_old, c, false)?;
+	}
+	if j == 0 {
+		neg.push(PublicKey::from_secret_key(secp, &session.offset)?);
+	}
+
+	let mut terms: Vec<PublicKey> = pos;
+	for mut n in neg {
+		n.mul_assign(secp, &minus_one)?;
+		terms.push(n);
+	}
+	let refs: Vec<&PublicKey> = terms.iter().collect();
+	PublicKey::from_combination(secp, refs)
+		.map_err(|e| Error::Multisig(format!("expected cross-epoch excess combine: {}", e)))
+}
+
+/// Verify a claimed cross-epoch partial excess pubkey against the dual-poly
+/// prediction.
+pub fn verify_partial_excess_cross_epoch(
+	secp: &Secp256k1,
+	old_poly: &PublicPoly,
+	old_quorum: &[ActorPoint],
+	new_poly: &PublicPoly,
+	new_quorum: &[ActorPoint],
+	j: usize,
+	session: &KernelSession,
+	claimed: &PublicKey,
+) -> Result<(), Error> {
+	let expected = expected_pub_excess_cross_epoch(
+		secp, old_poly, old_quorum, new_poly, new_quorum, j, session,
+	)?;
+	if expected != *claimed {
+		return Err(Error::Multisig(format!(
+			"cross-epoch partial excess pubkey mismatch for actor {} (rogue key?)",
+			j
+		)));
+	}
+	Ok(())
 }
 
 /// Kernel session for cross-epoch spends: offset binds **both** view seeds.
@@ -659,15 +772,15 @@ pub fn run_kernel_sign_local_cross_epoch(
 	sid.extend_from_slice(&quorum_transcript(&new_q)?);
 
 	let features = plain_features(fee)?;
-	let session =
-		create_cross_epoch_kernel_session(secp, old_poly, new_poly, &sid, features, inputs, outputs)?;
+	let session = create_cross_epoch_kernel_session(
+		secp, old_poly, new_poly, &sid, features, inputs, outputs,
+	)?;
 
 	let mut secrets = Vec::new();
 	let mut commitments = Vec::new();
 	for j in 0..old_q.len() {
-		let partial_excess = partial_excess_cross_epoch(
-			secp, old_poly, &old_q, new_poly, &new_q, j, &session,
-		)?;
+		let partial_excess =
+			partial_excess_cross_epoch(secp, old_poly, &old_q, new_poly, &new_q, j, &session)?;
 		let d = aggsig::create_secnonce(secp)
 			.map_err(|e| Error::Multisig(format!("secnonce d: {}", e)))?;
 		let e = aggsig::create_secnonce(secp)
@@ -685,6 +798,16 @@ pub fn run_kernel_sign_local_cross_epoch(
 				pub_excess,
 			},
 		};
+		verify_partial_excess_cross_epoch(
+			secp,
+			old_poly,
+			&old_q,
+			new_poly,
+			&new_q,
+			j,
+			&session,
+			&sec.commitment.pub_excess,
+		)?;
 		commitments.push(sec.commitment.clone());
 		secrets.push(sec);
 	}
@@ -857,8 +980,12 @@ mod tests {
 			vec![CoinId::new(2, 95)],
 		)
 		.unwrap();
-		let c0 = kernel_round1(&secp, &pp, &q, 0, &session).unwrap().commitment;
-		let c1 = kernel_round1(&secp, &pp, &q, 1, &session).unwrap().commitment;
+		let c0 = kernel_round1(&secp, &pp, &q, 0, &session)
+			.unwrap()
+			.commitment;
+		let c1 = kernel_round1(&secp, &pp, &q, 1, &session)
+			.unwrap()
+			.commitment;
 		let commitments = vec![c0, c1];
 		let r0 = binding_factor(&secp, &session, &commitments, 0).unwrap();
 		let r1 = binding_factor(&secp, &session, &commitments, 1).unwrap();
@@ -945,7 +1072,8 @@ mod tests {
 		verify_kernel_partial(&secp, &good, &sec0.commitment.pub_excess, &agg, &session).unwrap();
 		// ...but not against another actor's excess pubkey.
 		assert!(
-			verify_kernel_partial(&secp, &good, &sec1.commitment.pub_excess, &agg, &session).is_err()
+			verify_kernel_partial(&secp, &good, &sec1.commitment.pub_excess, &agg, &session)
+				.is_err()
 		);
 	}
 

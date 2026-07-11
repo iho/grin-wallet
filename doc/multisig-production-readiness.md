@@ -34,7 +34,7 @@ Multisig is production ready when **all** of the following gates pass. Everythin
 
 ### Gate G3 — Protocol robustness
 - [ ] Durable session state machine: crash mid-round → resume or safe abort, never a stuck half-signed state that leaks nonce reuse.
-- [ ] All wire messages authenticated (sender-signed), replay-protected (session + round + sequence), and size-bounded.
+- [x] All wire messages authenticated (sender-signed) for address-based rosters — DKG *and* transaction sessions — replay-protected (body-hash cache + per-sender `seq` in the signed transcript), and size-bounded. Index/dev rosters remain unauthenticated by construction.
 - [ ] Malicious-peer test suite passes: bad PoP, bad share, bad τ, bad partial sig, duplicate/equivocating messages, threshold inflation, abort-at-every-round.
 
 ### Gate G4 — Wallet integration
@@ -104,7 +104,8 @@ These are **new findings from reading the working-tree code**, complementary to 
 - **Equivocation:** a second, *different* contribution from an actor is rejected (identical re-import is idempotent).
 - **Replay:** `PendingDkg.applied_share_dealers` tracks which dealer indices have been summed per share; a duplicate/replayed share is refused instead of double-counted.
 Verified by unit tests (sign/verify, tamper, wrong-sender, key-mismatch) and a full 2-of-2 authenticated DKG exchange over the file API that also asserts replay rejection (41/41 multisig tests).
-**Residual (WS2/WS5):** transcript binds sender+ceremony+session+body but not an explicit round/sequence counter (contribution/share replay is covered structurally; kernel/rangeproof round messages will need per-round sequence binding when the session engine lands). δ-masking of delivered shares (F-03) is still open.
+- **Transaction sessions (RP/kernel/MultiTx/CrossEpoch):** `Negotiator::apply` enforces the same rule centrally — the sender must be on the session roster, and address-based senders must carry a valid signature on **every** envelope (index/dev rosters stay unsigned). The transcript includes the per-session `seq`, which the ops layer (`finalize_session_outbound`) stamps and signs on every outbound envelope (create + apply paths), persisting `next_out_seq`. Regression test: `unsigned_tx_session_envelope_rejected_for_address_roster` (unsigned rejected, wrong-key sign rejected, correctly signed accepted).
+**Residual (WS2/WS5):** δ-masking of delivered shares (F-03) is still open.
 
 ### C-05 — Kernel nonce commitment binds too little — **High** — ✅ FIXED (FROST)
 The prior additive aggsig path used a weak hash commit to a single nonce and did not bind claimed `pub_excess` (rogue-key / adaptive last-mover risk).
@@ -112,7 +113,8 @@ The prior additive aggsig path used a weak hash commit to a single nonce and did
 - Each actor samples **two** nonces `(d_j, e_j)` and broadcasts `SigningCommitment = (D_j, E_j, X_j)` in one round (`kernel_round1`).
 - Per-actor **binding factor** `ρ_j = H_s("grin-msig/frost-rho" ‖ session ‖ offset ‖ all commitments ‖ j)` (`binding_factor`) feeds group nonce `R = Σ (D_j + ρ_j·E_j)` (`aggregate_frost`).
 - Partial sign uses effective nonce `k_j = d_j + ρ_j·e_j`; aggregates via existing `aggsig` into a normal Grin kernel signature.
-- **Rogue-key guard retained:** `expected_pub_excess_for_actor` / `verify_partial_excess` check every claimed `X_j` against the public polynomial before signing.
+- **Rogue-key guard retained:** `expected_pub_excess_for_actor` / `verify_partial_excess` check every claimed `X_j` against the public polynomial before signing. Cross-epoch sessions are covered too: `expected_pub_excess_cross_epoch` / `verify_partial_excess_cross_epoch` predict `X_j` from **both** epochs' public polynomials (regression test: `cross_epoch_rogue_commit_rejected`).
+- **Session-final binding:** `apply_kern_partial` only accepts a partial whose `pub_excess` matches the actor's own round-1 commitment (equivocation otherwise), and `apply_kern_final` recomputes the FROST aggregate from *this session's* stored commitments and rejects any final whose excess/nonce differs — an internally consistent but foreign `(sig, excess)` pair can no longer complete a session, wipe its secrets, or mark inputs spent. Regression tests: `forged_kernel_final_rejected`, `kernel_partial_excess_mismatch_rejected`.
 - Wire: `KernelSigningCommit` replaces `KernelNonceCommit` / `KernelNonceReveal`.
 Verified by multiparty sign, binding-factor context tests, bad-partial rejection, and `TxKernel::verify()` on the aggregated sig.
 **Residual:** external specialist review of FROST composition with multiparty BP over the same shares; concurrent multi-session stress tests.

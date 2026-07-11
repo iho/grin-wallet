@@ -881,18 +881,10 @@ where
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let commit =
 		super::rangeproof::coin_pedersen_commit_public(&secp, &state.config.public_poly, &coin)?;
-	let mut utxo = MultisigUtxo::new_unconfirmed(
-		ceremony_id.clone(),
-		coin,
-		&commit,
-		None,
-		None,
-	);
+	let mut utxo = MultisigUtxo::new_unconfirmed(ceremony_id.clone(), coin, &commit, None, None);
 	utxo.status = MultisigUtxoStatus::Reserved;
 	utxo.label = label;
-	let new_meta = CoinNumberMeta {
-		high_water: number,
-	};
+	let new_meta = CoinNumberMeta { high_water: number };
 	{
 		let mut batch = w.batch(keychain_mask)?;
 		batch.save_multisig_utxo(&utxo)?;
@@ -1004,13 +996,7 @@ where
 	ca.copy_from_slice(&commit_bytes);
 	let commit = crate::grin_util::secp::pedersen::Commitment(ca);
 	let proof = super::messages::proof_from_hex(proof_hex)?;
-	let rec = try_recognize_output(
-		&secp,
-		&state.config.public_poly,
-		commit,
-		proof,
-		None,
-	)?;
+	let rec = try_recognize_output(&secp, &state.config.public_poly, commit, proof, None)?;
 	if let Some(ref r) = rec {
 		if register {
 			let proof2 = super::messages::proof_from_hex(proof_hex)?;
@@ -1040,16 +1026,72 @@ where
 // Session lifecycle (WS4 CLI / API surface)
 // ---------------------------------------------------------------------------
 
+use super::coin::CoinId;
 use super::session::{
 	delete_session, list_session_ids, load_session, quorum_points_from_state, save_session,
 	Negotiator, SessionKey, SessionStatus,
 };
 use super::store::derive_state_key;
-use super::coin::CoinId;
 
 /// Derive the session AEAD key (reuses state-key domain material).
 pub fn derive_session_key<K: Keychain>(keychain: &K) -> Result<SessionKey, Error> {
 	derive_state_key(keychain)
+}
+
+/// Derive this wallet's ed25519 Slatepack signing key (address index 0 —
+/// the identity used in `multisig init --addresses` rosters).
+fn wallet_sign_key<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+) -> Result<EdSecretKey, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	let parent_key_id = w.parent_key_id();
+	let k = w.keychain(keychain_mask)?;
+	let sec_addr_key = crate::address::address_from_derivation_path(&k, &parent_key_id, 0)?;
+	EdSecretKey::from_bytes(&sec_addr_key.0)
+		.map_err(|e| Error::Multisig(format!("slatepack signing key: {}", e)))
+}
+
+/// Stamp per-session `seq` and sign outbound session envelopes (C-04).
+///
+/// Address-based actors sign every outbound envelope with the wallet's
+/// Slatepack key; index-based dev rosters cannot be authenticated and are
+/// left unsigned. The updated `next_out_seq` must be persisted by the caller
+/// (via `save_session`) after this returns.
+fn finalize_session_outbound<'a, T: ?Sized, C, K>(
+	w: &mut T,
+	keychain_mask: Option<&SecretKey>,
+	neg: &mut Negotiator,
+	envs: Vec<MultisigEnvelope>,
+) -> Result<Vec<MultisigEnvelope>, Error>
+where
+	T: WalletBackend<'a, C, K>,
+	C: crate::types::NodeClient + 'a,
+	K: Keychain + 'a,
+{
+	if envs.is_empty() {
+		return Ok(envs);
+	}
+	let sign_key = if neg.record.my_actor.slatepack_address().is_ok() {
+		Some(wallet_sign_key(w, keychain_mask)?)
+	} else {
+		None
+	};
+	let mut out = Vec::with_capacity(envs.len());
+	for env in envs {
+		let seq = neg.record.next_out_seq;
+		neg.record.next_out_seq = neg.record.next_out_seq.saturating_add(1);
+		let mut env = env.with_seq(seq);
+		if let Some(ref k) = sign_key {
+			env.sign(k)?;
+		}
+		out.push(env);
+	}
+	Ok(out)
 }
 
 /// Result of starting a multiparty session (CreateOutput / Spend).
@@ -1092,7 +1134,7 @@ where
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let quorum = quorum_points_from_state(&secp, &state, quorum_indices)?;
 	let coin = CoinId::new(coin_number, coin_value);
-	let (neg, env) = Negotiator::create_output(
+	let (mut neg, env) = Negotiator::create_output(
 		&secp,
 		&state.config.public_poly,
 		&quorum,
@@ -1102,6 +1144,7 @@ where
 		coin,
 		session_tag.as_bytes(),
 	)?;
+	let env = finalize_session_outbound(w, keychain_mask, &mut neg, vec![env])?.remove(0);
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	// Link/allocate UTXO row for this coin + session (WS6).
 	link_create_output_utxo(
@@ -1174,7 +1217,7 @@ where
 	let session_key = derive_session_key(&keychain)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let quorum = quorum_points_from_state(&secp, &state, quorum_indices)?;
-	let (neg, env) = Negotiator::create_spend(
+	let (mut neg, env) = Negotiator::create_spend(
 		&secp,
 		&state.config.public_poly,
 		&quorum,
@@ -1186,16 +1229,11 @@ where
 		fee,
 		session_tag.as_bytes(),
 	)?;
+	let env = finalize_session_outbound(w, keychain_mask, &mut neg, vec![env])?.remove(0);
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	// Lock input UTXOs for this spend session (WS6).
 	let sid = neg.record.session_id.to_hex();
-	lock_spend_inputs(
-		w,
-		keychain_mask,
-		ceremony_id,
-		&neg.record.inputs,
-		&sid,
-	)?;
+	lock_spend_inputs(w, keychain_mask, ceremony_id, &neg.record.inputs, &sid)?;
 	let envelope_json = serde_json::to_string_pretty(&env)
 		.map_err(|e| Error::Multisig(format!("ser envelope: {}", e)))?;
 	Ok(MultisigSessionStartResult {
@@ -1229,7 +1267,7 @@ where
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let old_q = quorum_points_from_state(&secp, &old_state, quorum_indices)?;
 	let new_q = quorum_points_from_state(&secp, &new_state, quorum_indices)?;
-	let (neg, env) = Negotiator::create_cross_epoch(
+	let (mut neg, env) = Negotiator::create_cross_epoch(
 		&secp,
 		&old_state.config.public_poly,
 		&old_q,
@@ -1244,6 +1282,7 @@ where
 		fee,
 		session_tag.as_bytes(),
 	)?;
+	let env = finalize_session_outbound(w, keychain_mask, &mut neg, vec![env])?.remove(0);
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	let sid = neg.record.session_id.to_hex();
 	lock_spend_inputs(w, keychain_mask, old_ceremony_id, &neg.record.inputs, &sid)?;
@@ -1280,7 +1319,7 @@ where
 	let session_key = derive_session_key(&keychain)?;
 	let secp = Secp256k1::with_caps(ContextFlag::Commit);
 	let quorum = quorum_points_from_state(&secp, &state, quorum_indices)?;
-	let (neg, env) = Negotiator::create_multitx(
+	let (mut neg, env) = Negotiator::create_multitx(
 		&secp,
 		&state.config.public_poly,
 		&quorum,
@@ -1292,15 +1331,10 @@ where
 		fee,
 		session_tag.as_bytes(),
 	)?;
+	let env = finalize_session_outbound(w, keychain_mask, &mut neg, vec![env])?.remove(0);
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	let sid = neg.record.session_id.to_hex();
-	lock_spend_inputs(
-		w,
-		keychain_mask,
-		ceremony_id,
-		&neg.record.inputs,
-		&sid,
-	)?;
+	lock_spend_inputs(w, keychain_mask, ceremony_id, &neg.record.inputs, &sid)?;
 	// Link each output coin as Unconfirmed.
 	for coin in &neg.record.outputs {
 		link_create_output_utxo(w, keychain_mask, ceremony_id, coin, &sid)?;
@@ -1438,6 +1472,8 @@ where
 			return Err(e);
 		}
 	};
+	// Stamp seq + sign outbound (C-04) before persisting next_out_seq.
+	let outbound = finalize_session_outbound(w, keychain_mask, &mut neg, outbound)?;
 	save_session(wallet_data_dir, &session_key, &neg.record)?;
 	// UTXO side-effects on Complete / still mid-flight (WS6).
 	if neg.record.kind != SessionKind::Dkg {
@@ -1593,8 +1629,7 @@ where
 		};
 		let rcpt_addr = recipient.slatepack_address()?;
 		env.sign(sign_key)?;
-		let armored =
-			env.to_armored_string(Some(sender_address.clone()), vec![rcpt_addr])?;
+		let armored = env.to_armored_string(Some(sender_address.clone()), vec![rcpt_addr])?;
 		let share_index = match &env.body {
 			MultisigBody::DkgPartialShare(m) => m.share_index,
 			_ => 0,
@@ -1609,8 +1644,8 @@ where
 			"share_to_actor{}_s{}.slatepack",
 			actor_idx, share_index
 		));
-		let mut f = File::create(&path)
-			.map_err(|e| Error::Multisig(format!("create share: {}", e)))?;
+		let mut f =
+			File::create(&path).map_err(|e| Error::Multisig(format!("create share: {}", e)))?;
 		f.write_all(armored.as_bytes())
 			.map_err(|e| Error::Multisig(format!("write share: {}", e)))?;
 		paths.push(path.display().to_string());
@@ -1674,14 +1709,8 @@ where
 	let mut s = String::new();
 	f.read_to_string(&mut s)
 		.map_err(|e| Error::Multisig(format!("read peer envelope: {}", e)))?;
-	let res = session_apply_raw_with_key(
-		w,
-		keychain_mask,
-		wallet_data_dir,
-		session_id_hex,
-		&s,
-		None,
-	)?;
+	let res =
+		session_apply_raw_with_key(w, keychain_mask, wallet_data_dir, session_id_hex, &s, None)?;
 	fs::create_dir_all(out_dir).map_err(|e| Error::Multisig(format!("mkdir out: {}", e)))?;
 	let mut paths = Vec::new();
 	for (i, json) in res.outbound_json.iter().enumerate() {
@@ -1995,9 +2024,8 @@ where
 						ceremony_id.clone(),
 						coin.clone(),
 						&{
-							let b = crate::grin_util::from_hex(commit_hex).map_err(|e| {
-								Error::Multisig(format!("commit hex: {}", e))
-							})?;
+							let b = crate::grin_util::from_hex(commit_hex)
+								.map_err(|e| Error::Multisig(format!("commit hex: {}", e)))?;
 							let mut a = [0u8; 33];
 							if b.len() != 33 {
 								return Err(Error::Multisig("commit must be 33 bytes".into()));
@@ -2048,9 +2076,8 @@ where
 							ceremony_id.clone(),
 							p.coin.clone(),
 							&{
-								let b = crate::grin_util::from_hex(&p.commit_hex).map_err(
-									|e| Error::Multisig(format!("commit hex: {}", e)),
-								)?;
+								let b = crate::grin_util::from_hex(&p.commit_hex)
+									.map_err(|e| Error::Multisig(format!("commit hex: {}", e)))?;
 								let mut a = [0u8; 33];
 								if b.len() != 33 {
 									return Err(Error::Multisig("commit must be 33 bytes".into()));
@@ -2179,16 +2206,11 @@ where
 		for (commit, proof, _is_cb, height, mmr_index) in outputs {
 			// RangeProof is Copy; capture hex before rewind for storage.
 			let proof_hex = super::messages::proof_to_hex(&proof);
-			let rec = match try_recognize_output(
-				&secp,
-				&state.config.public_poly,
-				commit,
-				proof,
-				None,
-			) {
-				Ok(Some(r)) => r,
-				_ => continue,
-			};
+			let rec =
+				match try_recognize_output(&secp, &state.config.public_poly, commit, proof, None) {
+					Ok(Some(r)) => r,
+					_ => continue,
+				};
 			let mut utxo = MultisigUtxo::new_unconfirmed(
 				ceremony_id.clone(),
 				rec.coin.clone(),
@@ -2490,12 +2512,12 @@ where
 	C: crate::types::NodeClient + 'a,
 	K: Keychain + 'a,
 {
+	use super::kernel::AggregatedKernelPubs;
+	use super::messages::pubkey_from_hex;
 	use super::messages::{proof_from_hex, sig_from_hex};
 	use super::rangeproof::coin_pedersen_commit_public;
 	use super::session::{SessionKind, SessionPhase};
 	use super::tx::{assemble_from_kernel_results, tx_to_hex, MultisigOutput};
-	use super::kernel::AggregatedKernelPubs;
-	use super::messages::pubkey_from_hex;
 
 	let session_id = crate::grin_util::from_hex(session_id_hex)
 		.map_err(|e| Error::Multisig(format!("session id hex: {}", e)))?;
@@ -2561,15 +2583,12 @@ where
 	let mut outputs = Vec::new();
 	for coin in &record.outputs {
 		let utxo = w.get_multisig_utxo(&record.ceremony_id, coin.number)?;
-		let proof_hex = utxo
-			.proof_hex
-			.as_ref()
-			.ok_or_else(|| {
-				Error::Multisig(format!(
-					"output coin #{} missing rangeproof (run CreateOutput first)",
-					coin.number
-				))
-			})?;
+		let proof_hex = utxo.proof_hex.as_ref().ok_or_else(|| {
+			Error::Multisig(format!(
+				"output coin #{} missing rangeproof (run CreateOutput first)",
+				coin.number
+			))
+		})?;
 		let proof = proof_from_hex(proof_hex)?;
 		let commit = utxo.commitment()?;
 		outputs.push(MultisigOutput {

@@ -56,21 +56,18 @@ use std::path::{Path, PathBuf};
 use zeroize::Zeroize;
 
 use super::coin::CoinId;
+use super::dkg::{dealer_partial_share, generate_dealer_contribution, verify_pop, DealerSecrets};
 use super::kernel::{
 	aggregate_frost, create_kernel_session, excess_commitment, kernel_aggregate_sigs,
 	kernel_partial_sign, kernel_round1, plain_features, verify_kernel_partial, verify_kernel_sig,
-	verify_partial_excess, ActorKernelSecrets, AggregatedKernelPubs, KernelSession,
-	SigningCommitment,
-};
-use super::dkg::{
-	dealer_partial_share, generate_dealer_contribution, verify_pop, DealerSecrets,
+	verify_partial_excess, verify_partial_excess_cross_epoch, ActorKernelSecrets,
+	AggregatedKernelPubs, KernelSession, SigningCommitment,
 };
 use super::messages::{
-	build_dkg_contribution, build_dkg_partial_share, build_kernel_final,
-	build_kernel_partial_sig, build_kernel_signing_commit, build_rp_final, build_rp_round1,
-	build_rp_round2, parse_dkg_contribution, parse_kernel_signing_commit, parse_rp_round1,
-	proof_from_hex, proof_to_hex, pubkey_from_hex, seckey_from_hex, seckey_to_hex, MultisigBody,
-	MultisigEnvelope,
+	build_dkg_contribution, build_dkg_partial_share, build_kernel_final, build_kernel_partial_sig,
+	build_kernel_signing_commit, build_rp_final, build_rp_round1, build_rp_round2,
+	parse_dkg_contribution, parse_kernel_signing_commit, parse_rp_round1, proof_from_hex,
+	proof_to_hex, pubkey_from_hex, seckey_from_hex, seckey_to_hex, MultisigBody, MultisigEnvelope,
 };
 use super::poly::{verify_share, PublicPoly, SecretPoly};
 use super::rangeproof::{
@@ -78,12 +75,12 @@ use super::rangeproof::{
 	rangeproof_params_for_coin, rangeproof_round1, rangeproof_round2, verify_rangeproof,
 	ActorRpSecrets, AggregatedT, Round1Share,
 };
+use super::scalar::sk_from_u64;
 use super::share::{canonical_quorum, quorum_transcript, ActorPoint};
 use super::store::{open_pending, seal_pending};
 use super::types::{
 	ActorId, CeremonyId, MultisigConfig, MultisigWalletState, SecretShare, ThresholdParams,
 };
-use super::scalar::sk_from_u64;
 
 /// Max envelope JSON size accepted by the negotiator (C-12 lite).
 pub const MAX_ENVELOPE_BYTES: usize = 256 * 1024;
@@ -371,10 +368,7 @@ pub struct SessionRecord {
 impl SessionRecord {
 	/// Whether this open session is past its deadline at `now_unix`.
 	pub fn is_expired(&self, now_unix: u64) -> bool {
-		if matches!(
-			self.phase,
-			SessionPhase::Complete | SessionPhase::Aborted
-		) {
+		if matches!(self.phase, SessionPhase::Complete | SessionPhase::Aborted) {
 			return false;
 		}
 		match self.deadline_unix {
@@ -450,7 +444,9 @@ pub struct KernCommitWire {
 const SESSIONS_DIR: &str = "sessions";
 
 fn sessions_dir(wallet_data_dir: &str) -> PathBuf {
-	Path::new(wallet_data_dir).join("multisig").join(SESSIONS_DIR)
+	Path::new(wallet_data_dir)
+		.join("multisig")
+		.join(SESSIONS_DIR)
 }
 
 fn session_path(wallet_data_dir: &str, session_id: &[u8]) -> PathBuf {
@@ -609,8 +605,13 @@ impl Negotiator {
 		}
 		let my_index = find_my_index(secp, &quorum, &my_actor)?;
 		// Only this actor's y is required for the partial blind (networked-safe).
-		let my_blind =
-			super::rangeproof::partial_blind_for_actor(secp, public_poly, &quorum, my_index, &coin)?;
+		let my_blind = super::rangeproof::partial_blind_for_actor(
+			secp,
+			public_poly,
+			&quorum,
+			my_index,
+			&coin,
+		)?;
 		let params = rangeproof_params_for_coin(secp, public_poly, &coin, None)?;
 		let (secrets, share) = rangeproof_round1(secp, &params, &my_blind)?;
 
@@ -1233,6 +1234,25 @@ impl Negotiator {
 			)));
 		}
 
+		// C-04: the sender must be on the session roster, and address-based
+		// senders must carry a valid detached signature over the envelope
+		// transcript (which binds sender, ceremony, session, seq, and body).
+		// Index-based dev rosters cannot be authenticated and stay unsigned.
+		match self.record.roster.iter().find(|a| a.id == env.sender.id) {
+			Some(entry) => {
+				if entry.slatepack_address().is_ok() {
+					env.verify_signature()?;
+				}
+			}
+			None => {
+				if !self.record.roster.is_empty() {
+					return Err(Error::Multisig(
+						"envelope sender not on session roster".into(),
+					));
+				}
+			}
+		}
+
 		let body_hash = envelope_body_hash(env);
 		if self.record.seen_body_hashes.contains(&body_hash) {
 			return Ok(Vec::new());
@@ -1314,9 +1334,7 @@ impl Negotiator {
 
 	fn rp_poly(&self) -> &PublicPoly {
 		if matches!(self.record.kind, SessionKind::CrossEpoch) {
-			self.new_public_poly
-				.as_ref()
-				.unwrap_or(&self.public_poly)
+			self.new_public_poly.as_ref().unwrap_or(&self.public_poly)
 		} else {
 			&self.public_poly
 		}
@@ -1349,9 +1367,7 @@ impl Negotiator {
 	}
 
 	/// Final kernel signature if Spend completed.
-	pub fn result_kernel(
-		&self,
-	) -> Result<Option<(Signature, AggregatedKernelPubs)>, Error> {
+	pub fn result_kernel(&self) -> Result<Option<(Signature, AggregatedKernelPubs)>, Error> {
 		match (
 			&self.record.result_sig_hex,
 			&self.record.result_excess_hex,
@@ -1395,7 +1411,9 @@ impl Negotiator {
 		msg: &super::messages::RpRound1Msg,
 	) -> Result<(), Error> {
 		if !self.allows_rp() {
-			return Err(Error::Multisig("RpRound1 not valid for this session kind".into()));
+			return Err(Error::Multisig(
+				"RpRound1 not valid for this session kind".into(),
+			));
 		}
 		if self.record.phase != SessionPhase::RpRound1
 			&& self.record.phase != SessionPhase::RpRound2
@@ -1403,7 +1421,9 @@ impl Negotiator {
 			// Allow late delivery only while still collecting r1 or if we already moved on
 			// with a full set (ignore extras via seen hash).
 			if self.record.phase != SessionPhase::RpRound1 {
-				return Err(Error::Multisig("RpRound1 not expected in this phase".into()));
+				return Err(Error::Multisig(
+					"RpRound1 not expected in this phase".into(),
+				));
 			}
 		}
 		let idx = msg.actor_index;
@@ -1435,10 +1455,14 @@ impl Negotiator {
 		msg: &super::messages::RpRound2Msg,
 	) -> Result<(), Error> {
 		if !self.allows_rp() {
-			return Err(Error::Multisig("RpRound2 not valid for this session kind".into()));
+			return Err(Error::Multisig(
+				"RpRound2 not valid for this session kind".into(),
+			));
 		}
 		if self.record.phase != SessionPhase::RpRound2 {
-			return Err(Error::Multisig("RpRound2 not expected in this phase".into()));
+			return Err(Error::Multisig(
+				"RpRound2 not expected in this phase".into(),
+			));
 		}
 		let idx = msg.actor_index;
 		self.check_actor_index(idx, env)?;
@@ -1463,7 +1487,9 @@ impl Negotiator {
 		msg: &super::messages::RpFinalMsg,
 	) -> Result<(), Error> {
 		if !self.allows_rp() {
-			return Err(Error::Multisig("RpFinal not valid for this session kind".into()));
+			return Err(Error::Multisig(
+				"RpFinal not valid for this session kind".into(),
+			));
 		}
 		// MultiTx/CrossEpoch may already be past RP (local finalize advanced); accept as no-op.
 		if matches!(
@@ -1482,8 +1508,7 @@ impl Negotiator {
 			.coin
 			.as_ref()
 			.ok_or_else(|| Error::Multisig("missing coin".into()))?;
-		let params =
-			rangeproof_params_for_coin(&self.secp, self.rp_poly(), coin, None)?;
+		let params = rangeproof_params_for_coin(&self.secp, self.rp_poly(), coin, None)?;
 		if commit != params.commit {
 			return Err(Error::Multisig("RpFinal commit mismatch".into()));
 		}
@@ -1530,8 +1555,7 @@ impl Negotiator {
 			.coin
 			.clone()
 			.ok_or_else(|| Error::Multisig("missing coin".into()))?;
-		let params =
-			rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
+		let params = rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
 		let agg = self.rp_agg()?;
 		let secrets = self.rp_secrets_from_wire()?;
 		let tau = rangeproof_round2(&self.secp, &params, &secrets, &agg)?;
@@ -1555,8 +1579,7 @@ impl Negotiator {
 			.coin
 			.clone()
 			.ok_or_else(|| Error::Multisig("missing coin".into()))?;
-		let params =
-			rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
+		let params = rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
 		let agg = self.rp_agg()?;
 		let secrets = self.rp_secrets_from_wire()?;
 
@@ -1598,12 +1621,7 @@ impl Negotiator {
 			&pub_blinds,
 		)?;
 		let proof = rangeproof_finalize(&self.secp, &params, &secrets, &agg, &tau_sum)?;
-		verify_rangeproof(
-			&self.secp,
-			params.commit,
-			proof,
-			params.extra_data.clone(),
-		)?;
+		verify_rangeproof(&self.secp, params.commit, proof, params.extra_data.clone())?;
 
 		let commit_hex = params.commit.0.to_vec().to_hex();
 		let proof_hex = proof_to_hex(&proof);
@@ -1662,8 +1680,7 @@ impl Negotiator {
 			self.record.my_index,
 			&coin,
 		)?;
-		let params =
-			rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
+		let params = rangeproof_params_for_coin(&self.secp, self.rp_poly(), &coin, None)?;
 		let (secrets, share) = rangeproof_round1(&self.secp, &params, &my_blind)?;
 		self.record.secrets = Some(SessionSecretsWire {
 			partial_hex: seckey_to_hex(&secrets.partial_blind),
@@ -1696,9 +1713,7 @@ impl Negotiator {
 
 	/// After all MultiTx/CrossEpoch RPs, open kernel round-1 and emit our FROST commit.
 	fn start_multitx_kernel(&mut self) -> Result<MultisigEnvelope, Error> {
-		use super::kernel::{
-			create_cross_epoch_kernel_session, partial_excess_cross_epoch,
-		};
+		use super::kernel::{create_cross_epoch_kernel_session, partial_excess_cross_epoch};
 		use crate::grin_core::libtx::aggsig;
 		let fee = self
 			.record
@@ -1738,8 +1753,10 @@ impl Negotiator {
 				.map_err(|e| Error::Multisig(format!("secnonce e: {}", e)))?;
 			let pub_d = crate::grin_util::secp::key::PublicKey::from_secret_key(&self.secp, &d)?;
 			let pub_e = crate::grin_util::secp::key::PublicKey::from_secret_key(&self.secp, &e)?;
-			let pub_excess =
-				crate::grin_util::secp::key::PublicKey::from_secret_key(&self.secp, &partial_excess)?;
+			let pub_excess = crate::grin_util::secp::key::PublicKey::from_secret_key(
+				&self.secp,
+				&partial_excess,
+			)?;
 			let secrets = ActorKernelSecrets {
 				partial_excess,
 				d,
@@ -1829,10 +1846,29 @@ impl Negotiator {
 		let idx = msg.actor_index;
 		self.check_actor_index(idx, env)?;
 		let commit = parse_kernel_signing_commit(&self.secp, msg)?;
-		// Rogue-key check against public poly (same-epoch). CrossEpoch uses dual
-		// polys; peer X_j is still checked by FROST partial-sig verify later.
-		if self.record.kind != SessionKind::CrossEpoch {
-			let session = self.kernel_session()?;
+		// Rogue-key check: every claimed X_j must match the public-poly
+		// prediction. CrossEpoch verifies against both epochs' polynomials.
+		let session = self.kernel_session()?;
+		if self.record.kind == SessionKind::CrossEpoch {
+			let new_pp = self
+				.new_public_poly
+				.as_ref()
+				.ok_or_else(|| Error::Multisig("CrossEpoch missing new poly".into()))?;
+			let new_q = self
+				.new_quorum
+				.as_ref()
+				.ok_or_else(|| Error::Multisig("CrossEpoch missing new quorum".into()))?;
+			verify_partial_excess_cross_epoch(
+				&self.secp,
+				&self.public_poly,
+				&self.quorum,
+				new_pp,
+				new_q,
+				idx,
+				&session,
+				&commit.pub_excess,
+			)?;
+		} else {
 			verify_partial_excess(
 				&self.secp,
 				&self.public_poly,
@@ -1891,12 +1927,27 @@ impl Negotiator {
 			}
 			return Ok(());
 		}
+		// Bind the partial to the actor's *committed* X_j (identifiable abort):
+		// a partial claiming a different excess than its round-1 commitment is
+		// equivocation, not something to verify against.
+		let stored = self.record.kern_commits.get(&idx).ok_or_else(|| {
+			Error::Multisig(format!(
+				"kernel partial before signing commit from actor {}",
+				idx
+			))
+		})?;
+		if stored.pub_excess_hex != msg.pub_excess_hex {
+			return Err(Error::Multisig(format!(
+				"kernel partial pub_excess does not match signing commit from actor {}",
+				idx
+			)));
+		}
 		// Verify partial against commitments.
 		let session = self.kernel_session()?;
 		let commitments = self.frost_commitments()?;
 		let agg = aggregate_frost(&self.secp, &session, &commitments)?;
 		let partial = sig_from_hex(&self.secp, &msg.partial_sig_hex)?;
-		let pub_excess = pubkey_from_hex(&self.secp, &msg.pub_excess_hex)?;
+		let pub_excess = pubkey_from_hex(&self.secp, &stored.pub_excess_hex)?;
 		verify_kernel_partial(&self.secp, &partial, &pub_excess, &agg, &session)?;
 		self.record
 			.kern_partials
@@ -1914,11 +1965,25 @@ impl Negotiator {
 				"KernelFinal not valid for this session kind".into(),
 			));
 		}
+		if self.record.phase != SessionPhase::KernelRound2 {
+			return Err(Error::Multisig(
+				"KernelFinal not expected before all signing commitments are collected".into(),
+			));
+		}
 		let session = self.kernel_session()?;
-		let agg = AggregatedKernelPubs {
-			nonce_sum: pubkey_from_hex(&self.secp, &msg.nonce_sum_hex)?,
-			excess_sum: pubkey_from_hex(&self.secp, &msg.excess_sum_hex)?,
-		};
+		// Recompute the aggregate from *our* stored round-1 commitments: a final
+		// that is internally consistent but does not match this session's own
+		// transcript must not complete the session (it would wipe secrets and
+		// mark inputs spent on an attacker-chosen excess).
+		let commitments = self.frost_commitments()?;
+		let agg = aggregate_frost(&self.secp, &session, &commitments)?;
+		let claimed_nonce = pubkey_from_hex(&self.secp, &msg.nonce_sum_hex)?;
+		let claimed_excess = pubkey_from_hex(&self.secp, &msg.excess_sum_hex)?;
+		if claimed_excess != agg.excess_sum || claimed_nonce != agg.nonce_sum {
+			return Err(Error::Multisig(
+				"KernelFinal excess/nonce does not match this session's commitments".into(),
+			));
+		}
 		let sig = sig_from_hex(&self.secp, &msg.sig_hex)?;
 		verify_kernel_sig(&self.secp, &sig, &agg, &session)?;
 		self.record.result_sig_hex = Some(msg.sig_hex.clone());
@@ -2140,7 +2205,9 @@ impl Negotiator {
 			}
 		}
 		if inputs.is_empty() || outputs.is_empty() {
-			return Err(Error::Multisig("CrossEpoch needs inputs and outputs".into()));
+			return Err(Error::Multisig(
+				"CrossEpoch needs inputs and outputs".into(),
+			));
 		}
 		let in_sum: u64 = inputs.iter().map(|c| c.value).sum();
 		let out_sum: u64 = outputs.iter().map(|c| c.value).sum();
@@ -2152,9 +2219,8 @@ impl Negotiator {
 		}
 		let my_index = find_my_index(secp, &old_q, &my_actor)?;
 		let first = outputs[0].clone();
-		let my_blind = super::rangeproof::partial_blind_for_actor(
-			secp, new_poly, &new_q, my_index, &first,
-		)?;
+		let my_blind =
+			super::rangeproof::partial_blind_for_actor(secp, new_poly, &new_q, my_index, &first)?;
 		let params = rangeproof_params_for_coin(secp, new_poly, &first, None)?;
 		let (secrets, share) = rangeproof_round1(secp, &params, &my_blind)?;
 
@@ -2171,11 +2237,8 @@ impl Negotiator {
 			pub_b_hex: pubkey_to_hex_local(secp, &secrets.t_two),
 			pub_excess_hex: String::new(),
 		};
-		let new_poly_hexes: Vec<String> = new_poly
-			.coefficients
-			.iter()
-			.map(|c| c.to_hex())
-			.collect();
+		let new_poly_hexes: Vec<String> =
+			new_poly.coefficients.iter().map(|c| c.to_hex()).collect();
 
 		let now = unix_now();
 		let mut record = SessionRecord {
@@ -2632,8 +2695,8 @@ fn sig_to_hex_local(secp: &Secp256k1, sig: &Signature) -> String {
 }
 
 fn sig_from_hex(secp: &Secp256k1, hex: &str) -> Result<Signature, Error> {
-	let bytes = crate::grin_util::from_hex(hex)
-		.map_err(|e| Error::Multisig(format!("sig hex: {}", e)))?;
+	let bytes =
+		crate::grin_util::from_hex(hex).map_err(|e| Error::Multisig(format!("sig hex: {}", e)))?;
 	if bytes.len() != 64 {
 		return Err(Error::Multisig("sig must be 64 bytes".into()));
 	}
@@ -2924,15 +2987,8 @@ mod tests {
 			b"dkg-sess",
 		)
 		.unwrap();
-		let (mut n1, e1) = Negotiator::create_dkg(
-			&secp,
-			ceremony,
-			params,
-			roster,
-			1,
-			b"dkg-sess",
-		)
-		.unwrap();
+		let (mut n1, e1) =
+			Negotiator::create_dkg(&secp, ceremony, params, roster, 1, b"dkg-sess").unwrap();
 		// Exchange contributions
 		let mut o0 = n0.apply(&e1).unwrap();
 		let mut o1 = n1.apply(&e0).unwrap();
@@ -2963,7 +3019,10 @@ mod tests {
 		assert_eq!(n1.record.phase, SessionPhase::Complete);
 		let s0 = n0.finalize_dkg_state().unwrap();
 		let s1 = n1.finalize_dkg_state().unwrap();
-		assert_eq!(s0.config.public_poly.coefficients, s1.config.public_poly.coefficients);
+		assert_eq!(
+			s0.config.public_poly.coefficients,
+			s1.config.public_poly.coefficients
+		);
 		assert!(!s0.shares.is_empty());
 	}
 
@@ -2983,9 +3042,15 @@ mod tests {
 		)
 		.unwrap();
 		// Two different contributions from actor 1
-		let (_n1a, e1a) =
-			Negotiator::create_dkg(&secp, ceremony.clone(), params.clone(), roster.clone(), 1, b"dkg-eq-a")
-				.unwrap();
+		let (_n1a, e1a) = Negotiator::create_dkg(
+			&secp,
+			ceremony.clone(),
+			params.clone(),
+			roster.clone(),
+			1,
+			b"dkg-eq-a",
+		)
+		.unwrap();
 		let (_n1b, e1b) =
 			Negotiator::create_dkg(&secp, ceremony, params, roster, 1, b"dkg-eq-b").unwrap();
 		// Force same session id on second so it is a different body from same actor
@@ -3202,8 +3267,7 @@ mod tests {
 		])
 		.unwrap();
 		let roster = vec![actors[0].clone(), actors[1].clone()];
-		let funding =
-			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 2_000_000)).unwrap();
+		let funding = create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 2_000_000)).unwrap();
 		let fee = 1_000u64;
 		let key = [3u8; 32];
 		let dir = std::env::temp_dir().join(format!("msig_soak_{}", uuid::Uuid::new_v4()));
@@ -3320,8 +3384,7 @@ mod tests {
 		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let (pp, q, roster, ceremony) = setup_2of2(&secp);
-		let funding =
-			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
+		let funding = create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
 		let fee = 1_000u64;
 		let outs = vec![
 			CoinId::new(2, 400_000),
@@ -3430,8 +3493,7 @@ mod tests {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
 		let (pp, q, roster, ceremony) = setup_2of2(&secp);
 		// Real funded input under the poly
-		let funding =
-			create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
+		let funding = create_multisig_output(&secp, &pp, &q, &CoinId::new(1, 1_000_000)).unwrap();
 		let fee = 1_000u64;
 		let out_coin = CoinId::new(2, 1_000_000 - fee);
 		let mut negs = Vec::new();
@@ -3526,6 +3588,299 @@ mod tests {
 		}
 	}
 
+	/// Two spend negotiators for the same quorum/io/fee, advanced to
+	/// KernelRound2 (commits exchanged, partials emitted but not delivered).
+	fn spend_pair_at_round2(
+		secp: &Secp256k1,
+		pp: &PublicPoly,
+		q: &[ActorPoint],
+		roster: &[ActorId],
+		ceremony: &CeremonyId,
+		tag: &[u8],
+	) -> (
+		Negotiator,
+		Negotiator,
+		Vec<MultisigEnvelope>,
+		Vec<MultisigEnvelope>,
+	) {
+		let inputs = vec![CoinId::new(1, 1_000_000)];
+		let outputs = vec![CoinId::new(2, 999_000)];
+		let fee = 1_000;
+		let (mut n0, e0) = Negotiator::create_spend(
+			secp,
+			pp,
+			q,
+			ceremony.clone(),
+			roster.to_vec(),
+			roster[0].clone(),
+			inputs.clone(),
+			outputs.clone(),
+			fee,
+			tag,
+		)
+		.unwrap();
+		let (mut n1, e1) = Negotiator::create_spend(
+			secp,
+			pp,
+			q,
+			ceremony.clone(),
+			roster.to_vec(),
+			roster[1].clone(),
+			inputs,
+			outputs,
+			fee,
+			tag,
+		)
+		.unwrap();
+		let o0 = n0.apply(&e1).unwrap();
+		let o1 = n1.apply(&e0).unwrap();
+		assert_eq!(n0.record.phase, SessionPhase::KernelRound2);
+		assert_eq!(n1.record.phase, SessionPhase::KernelRound2);
+		(n0, n1, o0, o1)
+	}
+
+	#[test]
+	fn forged_kernel_final_rejected() {
+		// A KernelFinal that is internally consistent (valid sig over its own
+		// excess/nonce) but does not match THIS session's commitments must not
+		// complete the session (it would wipe secrets and mark inputs spent).
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, roster, ceremony) = setup_2of2(&secp);
+
+		// Complete an unrelated session B with the same quorum/io/fee: its final
+		// verifies under the same kernel message but a different excess.
+		let inputs = vec![CoinId::new(1, 1_000_000)];
+		let outputs = vec![CoinId::new(2, 999_000)];
+		let fee = 1_000;
+		let mut negs_b = Vec::new();
+		let mut first_b = Vec::new();
+		for actor in roster.iter() {
+			let (n, env) = Negotiator::create_spend(
+				&secp,
+				&pp,
+				&q,
+				ceremony.clone(),
+				roster.clone(),
+				actor.clone(),
+				inputs.clone(),
+				outputs.clone(),
+				fee,
+				b"forged-final-b",
+			)
+			.unwrap();
+			negs_b.push(n);
+			first_b.push(env);
+		}
+		let mut pending = VecDeque::new();
+		for env in first_b {
+			broadcast(&mut negs_b, env, &mut pending);
+		}
+		drain(&mut negs_b, &mut pending);
+		let (sig_b, agg_b) = negs_b[0].result_kernel().unwrap().unwrap();
+
+		// Session A at KernelRound2; inject B's final.
+		let (mut na0, _na1, _o0, _o1) =
+			spend_pair_at_round2(&secp, &pp, &q, &roster, &ceremony, b"forged-final-a");
+		let forged = build_kernel_final(
+			&secp,
+			ceremony.clone(),
+			roster[1].clone(),
+			&na0.record.session_id,
+			&sig_b,
+			&agg_b.excess_sum,
+			&agg_b.nonce_sum,
+		);
+		let err = na0.apply(&forged).unwrap_err();
+		assert!(
+			format!("{}", err).contains("does not match this session's commitments"),
+			"got {}",
+			err
+		);
+		// Session must remain live (secrets intact, not complete).
+		assert_eq!(na0.record.phase, SessionPhase::KernelRound2);
+		assert!(na0.record.secrets.is_some());
+	}
+
+	#[test]
+	fn kernel_partial_excess_mismatch_rejected() {
+		// A partial claiming a different pub_excess than the actor's own round-1
+		// commitment is equivocation and must be rejected with attribution.
+		use crate::grin_util::secp::key::SecretKey;
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let (pp, q, roster, ceremony) = setup_2of2(&secp);
+		let (mut n0, _n1, _o0, o1) =
+			spend_pair_at_round2(&secp, &pp, &q, &roster, &ceremony, b"partial-mismatch");
+		let mut env = o1
+			.into_iter()
+			.find(|e| matches!(e.body, MultisigBody::KernelPartialSig(_)))
+			.expect("n1 partial");
+		let rogue =
+			PublicKey::from_secret_key(&secp, &SecretKey::new(&secp, &mut rand::thread_rng()))
+				.unwrap();
+		if let MultisigBody::KernelPartialSig(ref mut m) = env.body {
+			m.pub_excess_hex = pubkey_to_hex_local(&secp, &rogue);
+		}
+		let err = n0.apply(&env).unwrap_err();
+		assert!(
+			format!("{}", err).contains("does not match signing commit"),
+			"got {}",
+			err
+		);
+	}
+
+	#[test]
+	fn unsigned_tx_session_envelope_rejected_for_address_roster() {
+		// C-04 for transaction sessions: address-based roster members must sign
+		// every envelope; an unsigned (spoofable) envelope is rejected.
+		use crate::grin_core::global;
+		use crate::slatepack::SlatepackAddress;
+		use ed25519_dalek::SecretKey as EdSecretKey;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let sk0 = EdSecretKey::from_bytes(&[41u8; 32]).unwrap();
+		let sk1 = EdSecretKey::from_bytes(&[42u8; 32]).unwrap();
+		let a0 = ActorId::from_slatepack_address(&SlatepackAddress::new(
+			&ed25519_dalek::PublicKey::from(&sk0),
+		))
+		.unwrap();
+		let a1 = ActorId::from_slatepack_address(&SlatepackAddress::new(
+			&ed25519_dalek::PublicKey::from(&sk1),
+		))
+		.unwrap();
+		let roster = vec![a0, a1];
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let ceremony = CeremonyId::new();
+		let states = run_dkg_local(&secp, ceremony.clone(), params, roster.clone()).unwrap();
+		let q = canonical_quorum(
+			&states
+				.iter()
+				.map(|s| ActorPoint::from(&s.shares[0]))
+				.collect::<Vec<_>>(),
+		)
+		.unwrap();
+		let (mut n0, _e0) = Negotiator::create_spend(
+			&secp,
+			&states[0].config.public_poly,
+			&q,
+			ceremony.clone(),
+			roster.clone(),
+			roster[0].clone(),
+			vec![CoinId::new(1, 10_000)],
+			vec![CoinId::new(2, 9_000)],
+			1_000,
+			b"addr-spend",
+		)
+		.unwrap();
+		let (_n1, mut e1) = Negotiator::create_spend(
+			&secp,
+			&states[1].config.public_poly,
+			&q,
+			ceremony,
+			roster.clone(),
+			roster[1].clone(),
+			vec![CoinId::new(1, 10_000)],
+			vec![CoinId::new(2, 9_000)],
+			1_000,
+			b"addr-spend",
+		)
+		.unwrap();
+		// Unsigned envelope from an address-based sender must be rejected.
+		let err = n0.apply(&e1).unwrap_err();
+		assert!(format!("{}", err).contains("not signed"), "got {}", err);
+		// Signed by the wrong key: rejected. Signed correctly: accepted.
+		assert!(e1.sign(&sk0).is_err());
+		e1.sign(&sk1).unwrap();
+		n0.apply(&e1).unwrap();
+	}
+
+	#[test]
+	fn cross_epoch_rogue_commit_rejected() {
+		// CrossEpoch kernel commits are checked against BOTH epochs' public
+		// polynomials; a tampered X_j must be rejected with attribution.
+		use crate::grin_core::global;
+		use crate::grin_util::secp::key::SecretKey;
+		use crate::multisig::tx::create_multisig_output;
+		global::set_local_chain_type(global::ChainTypes::AutomatedTesting);
+		let secp = Secp256k1::with_caps(ContextFlag::Commit);
+		let params = ThresholdParams::new_allow_low_degree(2, 2).unwrap();
+		let actors: Vec<_> = (0..2).map(ActorId::from_index).collect();
+		let old_c = CeremonyId::new();
+		let new_c = CeremonyId::new();
+		let old_states =
+			run_dkg_local(&secp, old_c.clone(), params.clone(), actors.clone()).unwrap();
+		let new_states = run_dkg_local(&secp, new_c.clone(), params, actors.clone()).unwrap();
+		let old_pp = old_states[0].config.public_poly.clone();
+		let new_pp = new_states[0].config.public_poly.clone();
+		let old_q = canonical_quorum(&[
+			ActorPoint::from(&old_states[0].shares[0]),
+			ActorPoint::from(&old_states[1].shares[0]),
+		])
+		.unwrap();
+		let new_q = canonical_quorum(&[
+			ActorPoint::from(&new_states[0].shares[0]),
+			ActorPoint::from(&new_states[1].shares[0]),
+		])
+		.unwrap();
+		let funding =
+			create_multisig_output(&secp, &old_pp, &old_q, &CoinId::new(1, 500_000)).unwrap();
+		let fee = 1_000u64;
+		let out = CoinId::new(10, 500_000 - fee);
+		let mut negs = Vec::new();
+		let mut first = Vec::new();
+		for actor in actors.iter() {
+			let (n, env) = Negotiator::create_cross_epoch(
+				&secp,
+				&old_pp,
+				&old_q,
+				&new_pp,
+				&new_q,
+				old_c.clone(),
+				new_c.clone(),
+				actors.clone(),
+				actor.clone(),
+				vec![funding.coin.clone()],
+				vec![out.clone()],
+				fee,
+				b"xe-rogue",
+			)
+			.unwrap();
+			negs.push(n);
+			first.push(env);
+		}
+		let mut pending = VecDeque::new();
+		for env in first {
+			broadcast(&mut negs, env, &mut pending);
+		}
+		// Pump manually; on the first kernel commit, also try a tampered copy.
+		let mut tamper_checked = false;
+		while let Some((i, env)) = pending.pop_front() {
+			if !tamper_checked {
+				if matches!(env.body, MultisigBody::KernelSigningCommit(_)) {
+					let mut bad = env.clone();
+					if let MultisigBody::KernelSigningCommit(ref mut m) = bad.body {
+						let rogue = PublicKey::from_secret_key(
+							&secp,
+							&SecretKey::new(&secp, &mut rand::thread_rng()),
+						)
+						.unwrap();
+						m.pub_excess_hex = pubkey_to_hex_local(&secp, &rogue);
+					}
+					let err = negs[i].apply(&bad).unwrap_err();
+					assert!(format!("{}", err).contains("rogue key"), "got {}", err);
+					tamper_checked = true;
+				}
+			}
+			let more = negs[i].apply(&env).unwrap();
+			for m in more {
+				broadcast(&mut negs, m, &mut pending);
+			}
+		}
+		assert!(tamper_checked, "no kernel commit was exchanged");
+		// Honest run still completes after the rejected tamper attempt.
+		assert_eq!(negs[0].record.phase, SessionPhase::Complete);
+		assert!(negs[0].record.result_sig_hex.is_some());
+	}
+
 	#[test]
 	fn abort_wipes_secrets() {
 		let secp = Secp256k1::with_caps(ContextFlag::Commit);
@@ -3545,16 +3900,17 @@ mod tests {
 		n.abort("test abort");
 		assert_eq!(n.record.phase, SessionPhase::Aborted);
 		assert!(n.record.secrets.is_none());
-		assert!(n.apply(&MultisigEnvelope::new(
-			n.record.ceremony_id.clone(),
-			roster[1].clone(),
-			MultisigBody::RpRound2(super::super::messages::RpRound2Msg {
-				coin: CoinId::new(1, 10),
-				actor_index: 1,
-				tau_hex: "00".repeat(32),
-			}),
-		))
-		.is_err());
+		assert!(n
+			.apply(&MultisigEnvelope::new(
+				n.record.ceremony_id.clone(),
+				roster[1].clone(),
+				MultisigBody::RpRound2(super::super::messages::RpRound2Msg {
+					coin: CoinId::new(1, 10),
+					actor_index: 1,
+					tau_hex: "00".repeat(32),
+				}),
+			))
+			.is_err());
 	}
 
 	#[test]
